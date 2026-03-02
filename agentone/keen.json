@@ -1,0 +1,9 @@
+{
+    "project_name": "agentone",
+    "keen_server": "https://sandbox-004.keenbot.ai/ms/deployment",
+    "entry": "src",
+    "dist": "dist",
+    "agents": [
+   
+    ]
+}

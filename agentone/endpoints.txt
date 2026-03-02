@@ -1,0 +1,42 @@
+AgentOne Bridge — All Endpoints (localhost:3222)
+Auth: x-api-token: b3d6d5c1a50155e207c503102f7bc610 (all endpoints except GET /debug)
+
+=== SYSTEM ===
+GET  /                          Health check, returns service status and time
+GET  /api/config                Returns current working directory (baseDir)
+POST /api/config                Change working directory — body: {baseDir}
+POST /api/ping                  Health check with session summary — returns total, running, tracked PIDs
+POST /api/command               Run a one-shot shell command — body: {command} — returns {stdout, stderr, error}
+
+=== FILES ===
+POST /api/file/list             List files in a directory — body: {path} — path relative to baseDir
+POST /api/file/read             Read a file as UTF-8 — body: {path}
+POST /api/file/write            Write a file (auto-creates parent dirs) — body: {path, content}
+
+=== CLI SESSIONS ===
+POST /api/cli/spawn             Spawn a CLI process — body: {cli, args[], cwd, closeStdin, metadata: {pipelineRunId, agentType, subtaskId, parentSessionId, label, ttl}} — returns {sessionId, pid}
+POST /api/cli/send              Send input to a running session's stdin (logged with timestamp) — body: {sessionId, input}
+POST /api/cli/output            Read session output — body: {sessionId, full: true|false} — full=false returns only new output since last read
+POST /api/cli/history           Get conversation history as user/assistant pairs — body: {sessionId} — 3 modes: parsed (Claude JSON), stdinLog (interactive), raw (fallback)
+POST /api/cli/wait              Block until session exits or timeout — body: {sessionId, timeout}
+POST /api/cli/poll              Server-side polling (bridge sleeps before responding) — body: {sessionId, interval}
+POST /api/cli/cleanup           Remove all finished sessions from memory
+
+=== PID MANAGEMENT ===
+GET  /api/cli/list              List all sessions with full metadata, PID, runtime, output size, TTL
+POST /api/cli/status            Rich status — body: {sessionId} for one, or {} for all (grouped by running/finished)
+POST /api/cli/find-by-pid       Lookup session by OS PID — body: {pid}
+POST /api/cli/kill              Kill one session — body: {sessionId}
+POST /api/cli/kill-by-pid       Kill session by OS PID (find + kill in one call) — body: {pid}
+POST /api/cli/kill-all          Kill every running session
+POST /api/cli/kill-by-filter    Kill sessions matching filter — body: {pipelineRunId?, agentType?, subtaskId?, olderThanSeconds?}
+
+=== WEB & MEDIA ===
+POST /api/web/scrape            Scrape a URL to plain text — body: {url, maxLength?, timeout?}
+POST /api/web/search            DuckDuckGo search — body: {query, maxResults?}
+POST /api/web/news              RSS news from BBC, CNN, HN, TechCrunch, etc. — body: {sources[]?, maxPerSource?}
+POST /api/web/multi-scrape      Parallel scrape up to 10 URLs — body: {urls[], maxLength?, timeout?}
+POST /api/image/generate        AI image generation (OpenAI, Stability, Replicate, local SD) — body: {prompt, provider?, width?, height?, style?, count?}
+
+=== DEBUG ===
+GET  /debug                     HTML debug dashboard (no auth) — session list, agent badges, filters, kill buttons, conversation history viewer, auto-refresh 5s

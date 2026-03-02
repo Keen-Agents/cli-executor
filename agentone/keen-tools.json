@@ -1,0 +1,7 @@
+[
+    {
+        "name": "CLI Executor",
+        "type": "script",
+        "entry": "tools/cli-executor.js"
+    }
+]

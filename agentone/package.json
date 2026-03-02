@@ -1,0 +1,17 @@
+{
+    "name": "MyFirstProject",
+    "version": "1.0.0",
+    "main": "index.js",
+    "type": "module",
+    "scripts": {
+        "dev": "keen-builder"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "description": "",
+    "dependencies": {
+        "keen-builder": "^1.0.13",
+        "prettier": "^3.6.2"
+    }
+}

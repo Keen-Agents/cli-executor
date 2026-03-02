@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Attach to Keen",
+            "type": "node",
+            "request": "attach",
+            "address": "sandbox-001.keenbot.ai",
+            "port": 7000,
+            "timeout": 30000,
+            "skipFiles": ["<node_internals>/**"],
+            "sourceMaps": true,
+            "localRoot": "${workspaceFolder}/src",
+            "remoteRoot": "/app/projects/cmlzbd4vm0000mx01g0tyamyh"
+        }
+    ]
+}
