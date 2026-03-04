@@ -10,6 +10,7 @@ import { PROFILES, TIMEOUTS, budgetThresholds } from './pipeline-config.js';
 import { run as intake } from './stages/intake.js';
 import { run as classify } from './stages/classify.js';
 import { run as plan } from './stages/plan.js';
+import { run as dualPlan } from './stages/dual-plan.js';
 import { run as crossCritique } from './stages/cross-critique.js';
 import { run as humanGate } from './stages/human-gate.js';
 import { run as implement } from './stages/implement.js';
@@ -20,6 +21,7 @@ import { run as jiraClose } from './stages/jira-close.js';
 
 const STAGE_MAP = {
   intake, classify, plan,
+  'dual-plan': dualPlan,
   'cross-critique': crossCritique,
   'human-gate': humanGate,
   implement, verify,

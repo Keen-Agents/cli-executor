@@ -59,9 +59,10 @@ export async function run(context) {
   context.logger?.log({ type: 'STAGE_STARTED', stage: STAGE_NAME });
 
   try {
-    const planOutput = context.state.getStageOutput('plan');
+    const planOutput = context.state.getStageOutput('dual-plan')
+                    || context.state.getStageOutput('plan');
     if (!planOutput || typeof planOutput !== 'object') {
-      throw new Error('Cross-critique stage requires plan output from stage "plan".');
+      throw new Error('Cross-critique stage requires plan output from stage "plan" or "dual-plan".');
     }
 
     const intakeOutput = context.state.getStageOutput('intake');
