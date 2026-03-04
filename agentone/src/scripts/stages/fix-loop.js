@@ -4,6 +4,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { runAgent } from '../lib/agent-runner.js';
 import { CostTracker } from '../lib/cost-tracker.js';
+import { assembleContext } from '../lib/context-assembler.js';
 import { TIMEOUTS } from '../pipeline-config.js';
 
 const STAGE_NAME = 'fix-loop';
@@ -87,7 +88,9 @@ export async function run(context) {
     }
 
     const implement = context.state.getStageOutput('implement');
-    const plan = context.state.getStageOutput('plan');
+    const critiqueOutput = context.state.getStageOutput('cross-critique');
+    const plan = context.state.getStageOutput('dual-plan')
+              || context.state.getStageOutput('plan');
 
     const ticketKey = toText(context.ticketKey || implement?.ticketKey || 'UNKNOWN-TICKET').trim() || 'UNKNOWN-TICKET';
     const maxAttempts = Number(context.config?.maxFixAttempts) || 1;
@@ -114,14 +117,19 @@ export async function run(context) {
 
       const testFailures = `${currentTestOutput}\n\nVerify notes:\n${verifyNotes}`;
 
-      const assembledPrompt = renderTemplate(promptTemplate, {
+      let assembledPrompt = renderTemplate(promptTemplate, {
         '{{TICKET_KEY}}': ticketKey,
         '{{TEST_FAILURES}}': testFailures,
-        '{{PLAN}}': toText(plan?.plan || ''),
+        '{{PLAN}}': toText(critiqueOutput?.finalPlan || plan?.plan || ''),
         '{{ATTEMPT}}': String(attempt),
         '{{MAX_ATTEMPTS}}': String(maxAttempts),
         '{{PRIOR_FIXES}}': priorFixes
       });
+
+      const contextBlock = assembleContext(context.state, 'fix-loop', 100000, { priorFixAttempts: priorFixes, testFailures: currentTestOutput });
+      if (contextBlock) {
+        assembledPrompt += '\n\n## Additional Context\n' + contextBlock;
+      }
 
       context.logger?.log({
         type: 'SESSION_SPAWNED',

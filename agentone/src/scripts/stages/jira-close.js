@@ -1,3 +1,5 @@
+import { executeSideEffect, getSideEffects, writeCompensationFile } from '../lib/side-effects.js';
+
 const STAGE_NAME = 'jira-close';
 
 const PREFERRED_TRANSITION_NAMES = ['In Review', 'Review', 'Done', 'Closed', 'Resolved'];
@@ -192,31 +194,43 @@ export async function run(context) {
   }
 
   try {
-    const transitionsResponse = await jiraRequest(
-      credentials,
-      'GET',
-      `/rest/api/2/issue/${issueKey}/transitions`
-    );
-    const transitions = Array.isArray(transitionsResponse.data?.transitions)
-      ? transitionsResponse.data.transitions
-      : [];
-
-    const selected = chooseTransition(transitions);
-    if (!selected?.id) {
-      warn(
-        context,
-        `No suitable Jira transition found for ${ticketKey}`,
-        `Available: ${transitions.map((t) => t?.name).filter(Boolean).join(', ') || 'none'}`
+    const transitionEffect = await executeSideEffect(context.state, 'jira-transition', { ticketKey }, async () => {
+      const transitionsResponse = await jiraRequest(
+        credentials,
+        'GET',
+        `/rest/api/2/issue/${issueKey}/transitions`
       );
-    } else {
-      await jiraRequest(credentials, 'POST', `/rest/api/2/issue/${issueKey}/transitions`, {
-        transition: { id: String(selected.id) },
-      });
+      const transitions = Array.isArray(transitionsResponse.data?.transitions)
+        ? transitionsResponse.data.transitions
+        : [];
+
+      const selected = chooseTransition(transitions);
+      if (!selected?.id) {
+        warn(
+          context,
+          `No suitable Jira transition found for ${ticketKey}`,
+          `Available: ${transitions.map((t) => t?.name).filter(Boolean).join(', ') || 'none'}`
+        );
+        return { transitioned: false };
+      } else {
+        await jiraRequest(credentials, 'POST', `/rest/api/2/issue/${issueKey}/transitions`, {
+          transition: { id: String(selected.id) },
+        });
+        return { transitioned: true, name: selected.name };
+      }
+    });
+
+    if (!transitionEffect.alreadyDone && transitionEffect.result?.transitioned) {
       output.transitioned = true;
-      output.transitionName = String(selected.name || '').trim() || null;
+      output.transitionName = String(transitionEffect.result.name || '').trim() || null;
     }
   } catch (error) {
     warn(context, `Failed to transition Jira ticket ${ticketKey}`, error instanceof Error ? error.message : String(error));
+  }
+
+  const effects = getSideEffects(context.state);
+  if (effects.length > 0) {
+    writeCompensationFile(context.runDir || context.state.getRunDir?.() || '.', effects);
   }
 
   context.state.checkpoint(STAGE_NAME, output);
@@ -224,6 +238,10 @@ export async function run(context) {
 
   return output;
   } catch (error) {
+    const effects = getSideEffects(context.state);
+    if (effects.length > 0) {
+      writeCompensationFile(context.runDir || context.state.getRunDir?.() || '.', effects);
+    }
     context.logger?.log({
       type: 'STAGE_FAILED',
       stage: STAGE_NAME,

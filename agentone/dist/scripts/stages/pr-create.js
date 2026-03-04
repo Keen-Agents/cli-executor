@@ -1,6 +1,7 @@
 import { execSync } from 'child_process';
 import { writeFileSync, unlinkSync } from 'fs';
 import path from 'node:path';
+import { executeSideEffect, getSideEffects, writeCompensationFile } from '../lib/side-effects.js';
 
 const STAGE_NAME = 'pr-create';
 
@@ -121,7 +122,8 @@ export async function run(context) {
       throw new Error('PR create stage requires intake output from stage "intake".');
     }
 
-    const plan = context.state.getStageOutput('plan') || {};
+    const plan = context.state.getStageOutput('dual-plan')
+              || context.state.getStageOutput('plan') || {};
     const implement = context.state.getStageOutput('implement') || {};
     const verifyResult = context.state.getStageOutput('verify') || null;
     const ticketKey = toText(ticket.key).trim();
@@ -186,12 +188,15 @@ export async function run(context) {
       return output;
     }
 
-    const existingBranch = runCommand(`git branch --list ${branchArg}`, cwd).trim();
-    if (existingBranch) {
-      runCommand(`git checkout ${branchArg}`, cwd, `Failed to checkout existing branch "${branchName}".`);
-    } else {
-      runCommand(`git checkout -b ${branchArg}`, cwd, `Failed to create branch "${branchName}".`);
-    }
+    await executeSideEffect(context.state, 'git-branch', { branchName }, async () => {
+      const existingBranch = runCommand(`git branch --list ${branchArg}`, cwd).trim();
+      if (existingBranch) {
+        runCommand(`git checkout ${branchArg}`, cwd, `Failed to checkout existing branch "${branchName}".`);
+      } else {
+        runCommand(`git checkout -b ${branchArg}`, cwd, `Failed to create branch "${branchName}".`);
+      }
+      return { branchName };
+    });
 
     runCommand('git add -A', cwd, 'Failed to stage changes with git add -A.');
 
@@ -226,22 +231,25 @@ export async function run(context) {
     const prBodyPath = path.join(cwd, `.agentone-pr-body-${runId}.md`);
     writeFileSync(prBodyPath, prBody, 'utf8');
 
-    let prResult = '';
-    try {
-      prResult = runCommand(
-        `gh pr create --title ${quoteArg(prTitle)} --body-file ${quoteArg(prBodyPath)}`,
-        cwd,
-        'Failed to create GitHub PR using gh CLI.'
-      );
-    } finally {
+    const prEffect = await executeSideEffect(context.state, 'pr-created', { branchName }, async () => {
+      let prResult = '';
       try {
-        unlinkSync(prBodyPath);
-      } catch {
-        // Ignore cleanup failures
+        prResult = runCommand(
+          `gh pr create --title ${quoteArg(prTitle)} --body-file ${quoteArg(prBodyPath)}`,
+          cwd,
+          'Failed to create GitHub PR using gh CLI.'
+        );
+      } finally {
+        try {
+          unlinkSync(prBodyPath);
+        } catch {
+          // Ignore cleanup failures
+        }
       }
-    }
+      return prResult;
+    });
 
-    const prUrl = parsePrUrl(prResult);
+    const prUrl = prEffect.alreadyDone ? null : parsePrUrl(prEffect.result);
     const prNumberMatch = prUrl ? prUrl.match(/\/pull\/(\d+)(?:\D|$)/) : null;
     const prNumber = prNumberMatch ? Number(prNumberMatch[1]) : null;
     const commitSha = runCommand('git rev-parse HEAD', cwd).trim();
@@ -255,6 +263,11 @@ export async function run(context) {
       reason: null,
     };
 
+    const effects = getSideEffects(context.state);
+    if (effects.length > 0) {
+      writeCompensationFile(context.runDir || context.state.getRunDir?.() || '.', effects);
+    }
+
     context.state.checkpoint(STAGE_NAME, output);
     context.logger?.log({
       type: 'STAGE_COMPLETED',
@@ -266,6 +279,10 @@ export async function run(context) {
 
     return output;
   } catch (error) {
+    const effects = getSideEffects(context.state);
+    if (effects.length > 0) {
+      writeCompensationFile(context.runDir || context.state.getRunDir?.() || '.', effects);
+    }
     context.logger?.log({
       type: 'STAGE_FAILED',
       stage: STAGE_NAME,

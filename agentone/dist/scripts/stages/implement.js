@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 
 import { TIMEOUTS } from '../pipeline-config.js';
 import { runAgent } from '../lib/agent-runner.js';
+import { assembleContext } from '../lib/context-assembler.js';
 import { CostTracker } from '../lib/cost-tracker.js';
 
 const STAGE_NAME = 'implement';
@@ -21,14 +22,16 @@ export async function run(context) {
       throw new Error('Implement stage requires intake output (ticket) from stage "intake".');
     }
 
-    const plan = context.state.getStageOutput('plan');
-    if (!plan || typeof plan !== 'object') {
-      throw new Error('Implement stage requires plan output from stage "plan".');
+    const critiqueOutput = context.state.getStageOutput('cross-critique');
+    const plan = context.state.getStageOutput('dual-plan')
+              || context.state.getStageOutput('plan');
+    if (!plan && !critiqueOutput) {
+      throw new Error('Implement stage requires plan output from stage "plan", "dual-plan", or "cross-critique".');
     }
 
     const ticketKey = String(ticket.key || '').trim();
     const ticketSummary = String(ticket.summary || '').trim();
-    const planText = String(plan.plan || '').trim();
+    const planText = String(critiqueOutput?.finalPlan || plan?.plan || '').trim();
     const classifyOutput = context.state.getStageOutput('classify');
     const profile = String(classifyOutput?.profile || context.state.toJSON()?.profile || '').trim();
 
@@ -60,6 +63,11 @@ export async function run(context) {
     assembledPrompt = replaceAll(assembledPrompt, '{{TICKET_SUMMARY}}', ticketSummary);
     assembledPrompt = replaceAll(assembledPrompt, '{{PLAN}}', planText);
     assembledPrompt = replaceAll(assembledPrompt, '{{PROFILE}}', profile);
+
+    const contextBlock = assembleContext(context.state, 'implement', 100000);
+    if (contextBlock) {
+      assembledPrompt += '\n\n## Additional Context\n' + contextBlock;
+    }
 
     const result = await runAgent({
       cli: 'claude',

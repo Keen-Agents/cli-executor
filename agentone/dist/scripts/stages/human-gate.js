@@ -26,7 +26,8 @@ function resolvePlan(state) {
     return critique.finalPlan.trim();
   }
 
-  const plan = state.getStageOutput('plan');
+  const plan = state.getStageOutput('dual-plan')
+            || state.getStageOutput('plan');
   if (plan && typeof plan === 'object' && typeof plan.plan === 'string') {
     return plan.plan.trim();
   }

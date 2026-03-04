@@ -3,6 +3,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { runAgent } from '../lib/agent-runner.js';
 import { CostTracker } from '../lib/cost-tracker.js';
+import { assembleContext } from '../lib/context-assembler.js';
 import { TIMEOUTS } from '../pipeline-config.js';
 
 const STAGE_NAME = 'dual-plan';
@@ -75,8 +76,14 @@ export async function run(context) {
 
     const claudeTemplate = readFileSync(CLAUDE_PROMPT_PATH, 'utf8');
     const codexTemplate = readFileSync(CODEX_PROMPT_PATH, 'utf8');
-    const claudePrompt = renderPrompt(claudeTemplate, ticket, classify);
-    const codexPrompt = renderPrompt(codexTemplate, ticket, classify);
+    let claudePrompt = renderPrompt(claudeTemplate, ticket, classify);
+    let codexPrompt = renderPrompt(codexTemplate, ticket, classify);
+
+    const contextBlock = assembleContext(context.state, 'plan', 100000);
+    if (contextBlock) {
+      claudePrompt += '\n\n## Additional Context\n' + contextBlock;
+      codexPrompt += '\n\n## Additional Context\n' + contextBlock;
+    }
 
     const timeout = TIMEOUTS['dual-plan'] || 420_000;
     const ticketKey = toStringValue(ticket.key) || 'unknown';

@@ -3,6 +3,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { runAgent } from '../lib/agent-runner.js';
 import { CostTracker } from '../lib/cost-tracker.js';
+import { assembleContext } from '../lib/context-assembler.js';
 import { TIMEOUTS } from '../pipeline-config.js';
 
 const STAGE_NAME = 'cross-critique';
@@ -101,7 +102,7 @@ export async function run(context) {
     let converged = false;
 
     for (let round = 1; round <= maxRounds; round += 1) {
-      const critiquePrompt = fillTemplate(critiqueTemplate, {
+      let critiquePrompt = fillTemplate(critiqueTemplate, {
         '{{TICKET_KEY}}': asText(intakeOutput.key),
         '{{TICKET_SUMMARY}}': asText(intakeOutput.summary),
         '{{PLAN}}': currentPlan,
@@ -109,6 +110,11 @@ export async function run(context) {
         '{{MAX_ROUNDS}}': String(maxRounds),
         '{{PRIOR_CRITIQUE}}': priorCritique
       });
+
+      const contextBlock = assembleContext(context.state, 'cross-critique', 100000, { otherPlan: currentPlan, priorCritique });
+      if (contextBlock) {
+        critiquePrompt += '\n\n## Additional Context\n' + contextBlock;
+      }
 
       const critiqueResult = await runAgent({
         cli: 'claude',

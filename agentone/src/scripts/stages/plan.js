@@ -3,6 +3,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { runAgent } from '../lib/agent-runner.js';
 import { CostTracker } from '../lib/cost-tracker.js';
+import { assembleContext } from '../lib/context-assembler.js';
 import { TIMEOUTS } from '../pipeline-config.js';
 
 const STAGE_NAME = 'plan';
@@ -52,7 +53,12 @@ export async function run(context) {
       throw new Error('Plan stage requires classify output from stage "classify".');
     }
     const promptTemplate = readFileSync(PLAN_PROMPT_TEMPLATE_PATH, 'utf8');
-    const assembledPrompt = renderPlanPrompt(promptTemplate, ticket, classify);
+    let assembledPrompt = renderPlanPrompt(promptTemplate, ticket, classify);
+
+    const contextBlock = assembleContext(context.state, 'plan', 100000);
+    if (contextBlock) {
+      assembledPrompt += '\n\n## Additional Context\n' + contextBlock;
+    }
 
     const result = await runAgent({
       cli: 'claude',
