@@ -100,6 +100,6 @@ export class PipelineLogger {
  * @returns {PipelineLogger}
  */
 export function createLogger(runDir, runId) {
-  const eventsFilePath = join(runDir, 'logs', 'pipeline-runs', runId, 'events.ndjson');
+  const eventsFilePath = join(runDir, 'events.ndjson');
   return new PipelineLogger(eventsFilePath, runId);
 }
