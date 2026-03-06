@@ -85,7 +85,7 @@ function buildSummary({ ticket, classify, planText, critiqueSummary, verifyResul
     `Plan available: ${planText ? 'yes' : 'no'}`,
     `Critique available: ${critiqueSummary ? 'yes' : 'no'}`,
     `Verification included: ${verifyResult ? 'yes' : 'no'}`,
-    'Choose approve to continue, revise to continue with revision comments (Phase 4 loop pending), or reject to stop the pipeline.'
+    'Choose approve to continue, revise to return to planning with your comments, or reject to stop the pipeline.'
   ];
 
   return parts.join('\n');

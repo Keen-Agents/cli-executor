@@ -1,11 +1,12 @@
 ﻿import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { PipelineState } from './lib/state-manager.js';
 import { CostTracker } from './lib/cost-tracker.js';
 import { createLogger } from './lib/logger.js';
-import { PROFILES, TIMEOUTS, budgetThresholds } from './pipeline-config.js';
+import { PROFILES, TIMEOUTS, budgetThresholds, AUTO_UPGRADE } from './pipeline-config.js';
 
 import { run as intake } from './stages/intake.js';
 import { run as classify } from './stages/classify.js';
@@ -220,6 +221,39 @@ function buildStagePlan({ forcedProfile, state }) {
   };
 }
 
+const PROFILE_RANK = { simple: 0, standard: 1, complex: 2 };
+
+function countDiffLines(workDir) {
+  if (!workDir) return 0;
+  try {
+    const stat = execFileSync('git', ['diff', '--stat', 'HEAD~1'], {
+      cwd: workDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000
+    });
+    const match = stat.match(/(\d+) insertions?\(\+\)/);
+    const ins = match ? Number(match[1]) : 0;
+    const delMatch = stat.match(/(\d+) deletions?\(-\)/);
+    const del = delMatch ? Number(delMatch[1]) : 0;
+    return ins + del;
+  } catch {
+    return 0;
+  }
+}
+
+function checkAutoUpgrade(workDir, currentProfile) {
+  const rank = PROFILE_RANK[currentProfile] ?? -1;
+  if (rank >= PROFILE_RANK.standard) return null;
+
+  const lines = countDiffLines(workDir);
+  if (currentProfile === 'simple' && lines > AUTO_UPGRADE.simpleToStandard.diffLinesExceeds) {
+    return { upgraded: true, newProfile: 'standard', reason: `diff lines (${lines}) exceeded threshold (${AUTO_UPGRADE.simpleToStandard.diffLinesExceeds})` };
+  }
+
+  return null;
+}
+
 async function runPipeline(input) {
   const ticketKey = input.ticketKey;
   const runId = input.runId || createRunId(ticketKey);
@@ -382,6 +416,26 @@ async function runPipeline(input) {
         logger.log({ type: 'STAGE_COMPLETED', stage: instanceName });
         const costSuffix = stageCost.totalCost > 0 ? `, $${stageCost.totalCost}` : '';
         console.log(`[pipeline] Stage: ${instanceName}... done (${elapsed}${costSuffix})`);
+      }
+
+      // Auto-upgrade check after implement
+      if (stageName === 'implement') {
+        const upgrade = checkAutoUpgrade(
+          resolveWorkingDirectory(inputWorkingDirectory, state),
+          profileName
+        );
+        if (upgrade) {
+          profileName = upgrade.newProfile;
+          profileConfig = PROFILES[profileName];
+          stageList = profileConfig.stages;
+          stageInstances.length = 0;
+          stageInstances.push(...resolveStageInstances(stageList));
+          state.setProfile(profileName);
+          const updatedThresholds = budgetThresholds(profileConfig.budget);
+          costTracker.budgets = { soft: updatedThresholds.warning, hard: updatedThresholds.hard };
+          logger.log({ type: 'AUTO_UPGRADE', from: 'simple', to: profileName, reason: upgrade.reason });
+          console.log(`[pipeline] Auto-upgraded profile: simple → ${profileName} (${upgrade.reason})`);
+        }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

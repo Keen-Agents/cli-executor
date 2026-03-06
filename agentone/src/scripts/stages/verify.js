@@ -1,8 +1,16 @@
 ﻿import { execSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import path from 'path';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
+import { runAgent } from '../lib/agent-runner.js';
+import { CostTracker } from '../lib/cost-tracker.js';
+import { TIMEOUTS } from '../pipeline-config.js';
 
 const STAGE_NAME = 'verify';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const VERIFY_PROMPT_PATH = resolve(__dirname, '../prompts/verify.md');
 
 export function requireWorkingDirectory(context, stageName = STAGE_NAME) {
   const cwd = typeof context?.workDir === 'string' ? context.workDir.trim() : '';
@@ -237,6 +245,69 @@ export async function run(context) {
 
     if (!implementOutput) {
       result.summary = `${result.summary} | Note: implement output not found.`;
+    }
+
+    // Optional AI code review for non-simple profiles (advisory only)
+    result.aiReview = null;
+    const profile = context.state?.toJSON?.()?.profile;
+    if (result.passed && profile && profile !== 'simple') {
+      try {
+        let codeDiff = '';
+        try {
+          codeDiff = execSync('git diff HEAD~1', { cwd, encoding: 'utf8', timeout: 30_000 });
+        } catch { /* no diff available */ }
+
+        if (codeDiff.trim()) {
+          const intake = context.state.getStageOutput('intake') || {};
+          const plan = context.state.getStageOutput('cross-critique')?.finalPlan
+                    || context.state.getStageOutput('dual-plan')?.plan
+                    || context.state.getStageOutput('plan')?.plan || '';
+
+          const template = readFileSync(VERIFY_PROMPT_PATH, 'utf8');
+          const prompt = template
+            .split('{{TICKET_KEY}}').join(intake.key || context.ticketKey || '')
+            .split('{{TICKET_SUMMARY}}').join(intake.summary || '')
+            .split('{{PLAN}}').join(plan)
+            .split('{{CODE_DIFF}}').join(codeDiff.slice(0, 80_000))
+            .split('{{TEST_OUTPUT}}').join((result.tests?.output || '').slice(0, 10_000));
+
+          const aiResult = await runAgent({
+            cli: 'claude',
+            prompt,
+            cwd,
+            timeout: TIMEOUTS.verify,
+            label: `verify-ai-review-${intake.key || context.ticketKey || 'unknown'}`,
+            metadata: { stage: STAGE_NAME, mode: 'ai-review', runId: context.state.runId }
+          });
+
+          if (context.costTracker) {
+            context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(aiResult));
+          }
+
+          result.aiReview = {
+            content: aiResult.content || aiResult.fullOutput || '',
+            sessionId: aiResult.sessionId,
+            durationMs: aiResult.durationMs,
+            success: aiResult.success
+          };
+
+          context.logger?.log({
+            type: 'GATE_CHECK',
+            stage: STAGE_NAME,
+            gate: 'ai-code-review',
+            success: aiResult.success,
+            durationMs: aiResult.durationMs
+          });
+        }
+      } catch (aiErr) {
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'ai-code-review',
+          success: false,
+          error: aiErr instanceof Error ? aiErr.message : String(aiErr)
+        });
+      }
     }
 
     context.state.checkpoint(STAGE_NAME, result);

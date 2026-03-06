@@ -34,9 +34,27 @@ export const SIDE_EFFECT_CHECKS = {
     description: 'Pull request creation'
   },
   'jira-transition': {
-    check: async (_details) => {
-      // Would need Jira API call - for now return false (always attempt)
-      return false;
+    check: async (details) => {
+      try {
+        const baseUrl = (process.env.JIRA_BASE_URL || '').replace(/\/+$/, '');
+        const email = process.env.JIRA_EMAIL || '';
+        const token = process.env.JIRA_API_TOKEN || '';
+        if (!baseUrl || !email || !token || !details?.ticketKey) return false;
+
+        const auth = `Basic ${Buffer.from(`${email}:${token}`).toString('base64')}`;
+        const res = await fetch(
+          `${baseUrl}/rest/api/2/issue/${encodeURIComponent(details.ticketKey)}?fields=status`,
+          { headers: { Accept: 'application/json', Authorization: auth } }
+        );
+        if (!res.ok) return false;
+
+        const data = await res.json();
+        const statusName = (data?.fields?.status?.name || '').toLowerCase();
+        const doneStatuses = ['in review', 'review', 'done', 'closed', 'resolved'];
+        return doneStatuses.includes(statusName);
+      } catch {
+        return false;
+      }
     },
     description: 'Jira status transition'
   }
