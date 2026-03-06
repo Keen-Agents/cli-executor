@@ -30,6 +30,7 @@ const IS_WINDOWS = process.platform === 'win32';
 // ── Slash command registry ───────────────────────────────────────────────────
 const SLASH_COMMANDS = [
   { cmd: '/model',    args: '[claude|codex]', desc: 'Switch or toggle primary model' },
+  { cmd: '/spinner',  args: '[name]',         desc: 'Change spinner style' },
   { cmd: '/clear',    args: '',               desc: 'Clear screen (Ctrl+L)' },
   { cmd: '/help',     args: '',               desc: 'Show available commands' },
   { cmd: '/status',   args: '',               desc: 'Show session status' },
@@ -62,7 +63,20 @@ const a = {
   red:         s => `${CSI}31m${s}${CSI}0m`,
 };
 
-const SPINNER = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+// Spinner styles — rotated per session for variety
+const SPINNERS = {
+  dots:    ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'],
+  arrows:  ['←','↖','↑','↗','→','↘','↓','↙'],
+  pulse:   ['◐','◓','◑','◒'],
+  orbit:   ['◜ ','◠ ',' ◝',' ◞','◡ ','◟ '],
+  blocks:  ['▖','▘','▝','▗'],
+  bounce:  ['⠁','⠂','⠄','⡀','⠄','⠂'],
+  star:    ['✶','✸','✹','✺','✹','✸'],
+  keen:    ['◇','◈','◆','◈'],
+};
+const SPINNER_NAMES = Object.keys(SPINNERS);
+let activeSpinnerName = SPINNER_NAMES[Math.floor(Math.random() * SPINNER_NAMES.length)];
+let SPINNER = SPINNERS[activeSpinnerName];
 const HEADER_LINES = 2;
 
 const EXIT_HINTS = {
@@ -260,7 +274,7 @@ class KeenCLI {
   get rows() { return process.stdout.rows || 24; }
   get cols() { return process.stdout.columns || 80; }
   get scrollStart() { return HEADER_LINES + 1; }
-  get scrollEnd() { return Math.max(this.rows - 3, this.scrollStart); }
+  get scrollEnd() { return Math.max(this.rows - 4, this.scrollStart); }
 
   w(s) { process.stdout.write(s); }
   rule() { return a.dim('─'.repeat(this.cols)); }
@@ -270,11 +284,11 @@ class KeenCLI {
     this.w(a.moveTo(1, 1) + a.clearLine);
     const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
     this.w(
-      a.bold('\u2731 Keen CLI') +
+      a.magenta(a.bold('\u2731 Keen')) +
       a.dim('  \u00b7  ') + mc(this.primaryModel) +
-      a.dim('  \u00b7  ' + this.workdir)
+      a.dim('  \u00b7  ') + a.gray(this.workdir)
     );
-    this.w(a.moveTo(2, 1) + a.clearLine);
+    this.w(a.moveTo(2, 1) + a.clearLine + a.dim('\u2500'.repeat(this.cols)));
   }
 
   setup() {
@@ -318,12 +332,13 @@ class KeenCLI {
 
   drawBottom() {
     const r = this.rows;
+    const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
 
-    // Row r-2: separator
-    this.w(a.moveTo(r - 2, 1) + a.clearLine + this.rule());
+    // Row r-3: top separator
+    this.w(a.moveTo(r - 3, 1) + a.clearLine + this.rule());
 
-    // Row r-1: input line
-    this.w(a.moveTo(r - 1, 1) + a.clearLine);
+    // Row r-2: input line
+    this.w(a.moveTo(r - 2, 1) + a.clearLine);
     const prefixLen = 2; // "> "
     const available = Math.max(this.cols - prefixLen - 1, 10);
 
@@ -334,23 +349,30 @@ class KeenCLI {
       visibleInput = this.input.slice(start, start + available);
       visibleCursor = this.cursor - start;
     }
-    this.w(`${a.bold('\u203A')} ${visibleInput}`);
+    this.w(`${mc('\u203A')} ${visibleInput}`);
 
-    // Row r: hints line (directly under input, like Claude Code)
+    // Row r-1: bottom separator
+    this.w(a.moveTo(r - 1, 1) + a.clearLine + this.rule());
+
+    // Row r: hints line
     this.w(a.moveTo(r, 1) + a.clearLine);
     if (this.busy) {
-      this.w(a.dim(`  ^C to interrupt \u00b7 /model ${this.primaryModel}`));
+      this.w(a.dim(`  ^C to interrupt \u00b7 `) + mc(this.primaryModel));
     } else {
       const suggestions = this.slashSuggestions();
       if (suggestions) {
         this.w(`  ${suggestions}  ${a.dim('Tab')}`);
       } else {
-        this.w(a.dim(`  \u21B5 send \u00b7 ^C cancel \u00b7 /model ${this.primaryModel} \u00b7 /help`));
+        this.w(
+          a.dim('  \u21B5 send \u00b7 ^C cancel \u00b7 ') +
+          mc(`/model ${this.primaryModel}`) +
+          a.dim(' \u00b7 /help')
+        );
       }
     }
 
     // Park cursor on input line
-    this.w(a.moveTo(r - 1, prefixLen + 1 + visibleCursor));
+    this.w(a.moveTo(r - 2, prefixLen + 1 + visibleCursor));
   }
 
   // ── Slash commands ─────────────────────────────────────────────────────
@@ -370,6 +392,24 @@ class KeenCLI {
       return;
     }
 
+    if (cmd === '/spinner') {
+      const arg = (parts[1] || '').toLowerCase();
+      if (arg && SPINNERS[arg]) {
+        activeSpinnerName = arg;
+        SPINNER = SPINNERS[arg];
+        this.scrollWrite(a.magenta(`Spinner: ${arg} `) + SPINNERS[arg].join(' ') + '\n');
+      } else if (!arg) {
+        // Cycle to next spinner
+        const idx = (SPINNER_NAMES.indexOf(activeSpinnerName) + 1) % SPINNER_NAMES.length;
+        activeSpinnerName = SPINNER_NAMES[idx];
+        SPINNER = SPINNERS[activeSpinnerName];
+        this.scrollWrite(a.magenta(`Spinner: ${activeSpinnerName} `) + SPINNER.join(' ') + '\n');
+      } else {
+        this.scrollWrite(a.yellow(`Unknown spinner. Available: ${SPINNER_NAMES.join(', ')}\n`));
+      }
+      return;
+    }
+
     if (cmd === '/clear') {
       this.w(a.clear);
       this.drawHeader();
@@ -381,13 +421,12 @@ class KeenCLI {
     }
 
     if (cmd === '/help') {
-      this.scrollWrite('\n' + a.bold('Available commands:\n'));
+      this.scrollWrite('\n' + a.magenta(a.bold('Commands')) + '\n');
       for (const { cmd: c, args: ar, desc } of SLASH_COMMANDS) {
         const full = ar ? `${c} ${ar}` : c;
         this.scrollWrite(`  ${a.cyan(full.padEnd(24))} ${a.dim(desc)}\n`);
       }
-      this.scrollWrite('\n' + a.bold('Keyboard shortcuts:\n'));
-      this.scrollWrite(`  ${a.cyan('Ctrl+T'.padEnd(24))} ${a.dim('Toggle thinking (reserved)')}\n`);
+      this.scrollWrite('\n' + a.magenta(a.bold('Keyboard')) + '\n');
       this.scrollWrite(`  ${a.cyan('Ctrl+L'.padEnd(24))} ${a.dim('Clear screen')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+C'.padEnd(24))} ${a.dim('Cancel turn / Exit')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+U'.padEnd(24))} ${a.dim('Clear input line')}\n`);
@@ -399,11 +438,13 @@ class KeenCLI {
 
     if (cmd === '/status') {
       const turns = Math.floor(this.conversationHistory.length / 2);
-      this.scrollWrite(`\n${a.bold('Session status:')}\n`);
-      this.scrollWrite(`  ${a.cyan('Model:'.padEnd(14))} ${this.primaryModel}\n`);
+      const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
+      this.scrollWrite(`\n${a.magenta(a.bold('Status'))}\n`);
+      this.scrollWrite(`  ${a.cyan('Model:'.padEnd(14))} ${mc(this.primaryModel)}\n`);
+      this.scrollWrite(`  ${a.cyan('Spinner:'.padEnd(14))} ${activeSpinnerName} ${SPINNER.join(' ')}\n`);
       this.scrollWrite(`  ${a.cyan('Turns:'.padEnd(14))} ${turns}\n`);
       this.scrollWrite(`  ${a.cyan('History:'.padEnd(14))} ${this.history.length} entries\n`);
-      this.scrollWrite(`  ${a.cyan('Workdir:'.padEnd(14))} ${this.workdir}\n`);
+      this.scrollWrite(`  ${a.cyan('Workdir:'.padEnd(14))} ${a.gray(this.workdir)}\n`);
       this.scrollWrite('\n');
       return;
     }
@@ -442,7 +483,8 @@ class KeenCLI {
     this.primaryModel = model;
     this.conversationHistory = [];  // fresh start on model switch
 
-    this.scrollWrite(a.dim(`Switched to ${model}\n`));
+    const mc = model === 'claude' ? a.cyan : a.yellow;
+    this.scrollWrite(mc(`\u2731 Switched to ${model}\n`));
     this.drawHeader();
     this.drawBottom();
   }
@@ -564,11 +606,12 @@ class KeenCLI {
     const elapsed = Math.floor((Date.now() - this._turnStartTime) / 1000);
     const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
     const ss = String(elapsed % 60).padStart(2, '0');
+    const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
     const label = this.pipelineRunning
       ? `pipeline \u00b7 ${this._pipelineProfile}`
       : this.primaryModel;
     // Overwrite spinner line in-place (restore to saved pos, don't re-save)
-    this.w(a.restore + a.clearLine + a.dim(`  ${frame} ${label} \u00b7 ${mm}:${ss}`));
+    this.w(a.restore + a.clearLine + `  ${mc(frame)} ${a.dim(label + ' \u00b7 ' + mm + ':' + ss)}`);
   }
 
   _clearSpinnerLine() {
@@ -619,7 +662,7 @@ class KeenCLI {
     this.drawBottom();
 
     // User prompt echo
-    this.scrollWrite(`\n${a.bold('> ' + text)}\n\n`);
+    this.scrollWrite(`\n${a.green(a.bold('\u203A'))} ${a.bold(text)}\n\n`);
 
     // Run primary model (streams to scroll region)
     const isFirst = this.primaryModel === 'claude' ? this.isFirstClaude : this.isFirstCodex;
@@ -697,7 +740,8 @@ class KeenCLI {
 
     // Elapsed time after response
     const elapsed = ((Date.now() - this._turnStartTime) / 1000).toFixed(1);
-    this.scrollWrite('\n' + a.dim(`${elapsed}s`) + '\n\n');
+    const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
+    this.scrollWrite('\n' + mc(`${elapsed}s`) + '\n\n');
 
     this._stopSpinner();
     this._primaryProcRef = {};
