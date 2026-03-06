@@ -1,19 +1,24 @@
 #!/usr/bin/env node
 /**
- * Keen CLI — conversational REPL powered by Claude as orchestrator.
+ * Keen CLI — conversational REPL powered by Claude/Codex as orchestrator.
  *
  * Usage:  node src/scripts/interactive.js [--workdir <dir>]
  *         npm run agent
  *
- * TUI with scroll region for output, fixed input area + status bar at bottom.
- * Raw keyboard handling with history, cursor movement, and standard shortcuts.
+ * Features:
+ *   /model claude|codex   — switch primary dispatcher
+ *   /model                — toggle between Claude and Codex
+ *   /thinking             — toggle secondary model output view
+ *   Ctrl+T                — same as /thinking
+ *
+ * Both models run on every prompt: primary streams to screen,
+ * secondary runs in background via bridge. Ctrl+T toggles view.
  */
 
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -40,6 +45,7 @@ const a = {
   green:       s => `${CSI}32m${s}${CSI}0m`,
   magenta:     s => `${CSI}35m${s}${CSI}0m`,
   gray:        s => `${CSI}90m${s}${CSI}0m`,
+  red:         s => `${CSI}31m${s}${CSI}0m`,
 };
 
 // ── CLI arg parsing ──────────────────────────────────────────────────────────
@@ -54,15 +60,18 @@ function parseArgs(argv) {
   return { workdir };
 }
 
-// ── Run a single orchestrator turn via `claude -p` ───────────────────────────
-// System prompt is injected via stdin on the first turn (not --system-prompt)
-// because Windows cmd.exe mangles pipes, backticks, and quotes in CLI args.
-function runTurn(stdinContent, { workdir, isFirst, systemPrompt }) {
+// ── Run a single orchestrator turn ──────────────────────────────────────────
+function runTurn(stdinContent, { workdir, isFirst, systemPrompt, model, conversationHistory, onData }) {
+  if (model === 'codex') {
+    return runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData });
+  }
+  return runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData });
+}
+
+function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData }) {
   return new Promise((res, rej) => {
     const args = ['-p'];
-    if (!isFirst) {
-      args.push('--continue');
-    }
+    if (!isFirst) args.push('--continue');
     args.push('--dangerously-skip-permissions');
 
     const proc = spawn('claude', args, {
@@ -72,8 +81,6 @@ function runTurn(stdinContent, { workdir, isFirst, systemPrompt }) {
       env: { ...process.env }
     });
 
-    // First turn: prepend system prompt to the user message via stdin
-    // so it's part of the conversation context for --continue turns.
     if (isFirst) {
       proc.stdin.write(systemPrompt + '\n\n---\n\nUser message: ' + stdinContent);
     } else {
@@ -81,7 +88,13 @@ function runTurn(stdinContent, { workdir, isFirst, systemPrompt }) {
     }
     proc.stdin.end();
 
-    proc.stdout.on('data', (chunk) => process.stdout.write(chunk));
+    let fullOutput = '';
+    proc.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      fullOutput += text;
+      if (onData) onData(text);
+      else process.stdout.write(chunk);
+    });
 
     proc.stderr.on('data', (chunk) => {
       const t = chunk.toString();
@@ -91,7 +104,52 @@ function runTurn(stdinContent, { workdir, isFirst, systemPrompt }) {
     });
 
     proc.on('error', rej);
-    proc.on('exit', (code) => res(code ?? 0));
+    proc.on('exit', (code) => res({ code: code ?? 0, output: fullOutput }));
+  });
+}
+
+function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData }) {
+  return new Promise((res, rej) => {
+    // Build full prompt with conversation history (Codex has no --continue)
+    let fullPrompt;
+    if (!conversationHistory || conversationHistory.length === 0) {
+      fullPrompt = systemPrompt + '\n\n---\n\nUser message: ' + stdinContent;
+    } else {
+      fullPrompt = systemPrompt + '\n\n---\n\nConversation so far:\n';
+      for (const turn of conversationHistory) {
+        fullPrompt += `\n[${turn.role}]: ${turn.content}\n`;
+      }
+      fullPrompt += `\n[user]: ${stdinContent}\n`;
+      fullPrompt += '\nContinue the conversation. Respond to the latest user message.';
+    }
+
+    const args = ['exec', '--full-auto', fullPrompt];
+
+    const proc = spawn('codex', args, {
+      cwd: workdir,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: true,
+      env: { ...process.env }
+    });
+    proc.stdin.end();
+
+    let fullOutput = '';
+    proc.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      fullOutput += text;
+      if (onData) onData(text);
+      else process.stdout.write(chunk);
+    });
+
+    proc.stderr.on('data', (chunk) => {
+      const t = chunk.toString();
+      if (/error|fail/i.test(t)) {
+        process.stderr.write(chunk);
+      }
+    });
+
+    proc.on('error', rej);
+    proc.on('exit', (code) => res({ code: code ?? 0, output: fullOutput }));
   });
 }
 
@@ -107,42 +165,54 @@ class KeenCLI {
     this.history = [];
     this.histIdx = -1;
     this.savedInput = '';
+
+    // ── Dual-model state ─────────────────────────────────────────
+    this.primaryModel = 'claude';
+    this.secondaryModel = 'codex';
+    this.conversationHistory = [];
+
+    // Per-turn output buffers
+    this.primaryOutput = '';
+    this.secondaryOutput = '';
+    this.secondaryStatus = 'idle';  // 'idle' | 'running' | 'done' | 'error'
+    this.secondaryError = null;
+
+    // Toggle state
+    this.showingSecondary = false;
+
+    // Cached dynamic import
+    this._runAgent = null;
   }
 
   get rows() { return process.stdout.rows || 24; }
   get cols() { return process.stdout.columns || 80; }
-  // Scroll region occupies rows 1 … (rows - 3). Bottom 3 rows are fixed:
-  //   rows-2 = separator,  rows-1 = input,  rows = tips
   get scrollEnd() { return Math.max(this.rows - 3, 4); }
 
   w(s) { process.stdout.write(s); }
-  rule() { return a.dim('─'.repeat(this.cols)); }
+  rule() { return a.dim('\u2500'.repeat(this.cols)); }
 
   // ── Layout ───────────────────────────────────────────────────────────────
   setup() {
     this.w(a.clear);
     this.w(a.scrollRgn(1, this.scrollEnd));
 
-    // Header (inside scroll region)
     this.w(a.moveTo(1, 1));
-    this.w('╔══════════════════════╗\n');
-    this.w('║       Keen CLI       ║\n');
-    this.w('╚══════════════════════╝\n');
+    this.w('\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n');
+    this.w('\u2551       Keen CLI       \u2551\n');
+    this.w('\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D\n');
     this.w(a.dim(`workdir ${this.workdir}\n`));
+    const modelColor = this.primaryModel === 'claude' ? a.cyan : a.yellow;
+    this.w(a.dim('model   ') + modelColor(this.primaryModel) + a.dim(` (secondary: ${this.secondaryModel})`) + '\n');
     this.w('\n');
 
-    // Save cursor position in scroll region (for later restore)
     this.w(a.save);
-
     this.drawBottom();
 
-    // Resize handler
     process.stdout.on('resize', () => {
       this.w(a.scrollRgn(1, this.scrollEnd));
       this.drawBottom();
     });
 
-    // Raw keyboard mode
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(true);
     }
@@ -161,24 +231,179 @@ class KeenCLI {
     const r = this.rows;
     // Separator
     this.w(a.moveTo(r - 2, 1) + a.clearLine + this.rule());
-    // Input line
+
+    // Input line with model badge
     this.w(a.moveTo(r - 1, 1) + a.clearToEnd);
-    this.w(`${a.bold('>')} ${this.input}`);
+    const badge = this.primaryModel === 'claude'
+      ? a.cyan(`[claude]`)
+      : a.yellow(`[codex]`);
+    this.w(`${badge} ${a.bold('>')} ${this.input}`);
+
     // Tips line
     this.w(a.moveTo(r, 1) + a.clearToEnd);
     if (this.busy) {
-      this.w(`  ${a.dim('⏳ thinking...')}`);
+      const panelLabel = this.showingSecondary
+        ? a.yellow(`viewing: ${this.secondaryModel}`)
+        : a.cyan(`viewing: ${this.primaryModel}`);
+      const secStatus = this.secondaryStatusLabel();
+      this.w(`  ${a.dim('\u23F3 thinking...')}  ${panelLabel}  ${secStatus}`);
     } else {
-      this.w([
-        `  ${a.cyan('↵ send')}`,
+      const secStatus = this.secondaryStatusLabel();
+      const tips = [
+        `  ${a.cyan('\u21B5 send')}`,
         `${a.yellow('^C exit')}`,
         `${a.green('^L clear')}`,
-        `${a.magenta('↑↓ history')}`,
-        `${a.gray('^U clear line')}`,
-      ].join('  '));
+        `${a.magenta('\u2191\u2193 history')}`,
+        `${a.gray('^T thinking')}`,
+      ];
+      if (secStatus) tips.push(secStatus);
+      this.w(tips.join('  '));
     }
-    // Park cursor on input line at the right column
-    this.w(a.moveTo(r - 1, 3 + this.cursor));
+
+    // Park cursor on input line (adjust for badge width)
+    const badgeLen = this.primaryModel.length + 2; // "[claude]" or "[codex]"
+    this.w(a.moveTo(r - 1, badgeLen + 4 + this.cursor)); // badge + " > " + cursor
+  }
+
+  secondaryStatusLabel() {
+    const model = this.secondaryModel;
+    switch (this.secondaryStatus) {
+      case 'running': return a.dim(`${model}: running...`);
+      case 'done':    return a.green(`${model}: done`);
+      case 'error':   return a.red(`${model}: ${this.secondaryError || 'error'}`);
+      default:        return '';
+    }
+  }
+
+  // ── Slash commands ─────────────────────────────────────────────────────
+  handleSlashCommand(text) {
+    const parts = text.split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+
+    if (cmd === '/model') {
+      const arg = (parts[1] || '').toLowerCase();
+      if (arg === 'claude' || arg === 'codex') {
+        this.setPrimaryModel(arg);
+      } else if (!arg) {
+        this.setPrimaryModel(this.primaryModel === 'claude' ? 'codex' : 'claude');
+      } else {
+        this.writeToScroll(a.yellow(`Unknown model: ${arg}. Use /model claude or /model codex\n`));
+        this.w(a.save);
+      }
+      return true;
+    }
+
+    if (cmd === '/thinking') {
+      this.toggleSecondaryView();
+      return true;
+    }
+
+    return false;
+  }
+
+  setPrimaryModel(model) {
+    this.primaryModel = model;
+    this.secondaryModel = model === 'claude' ? 'codex' : 'claude';
+    this.isFirst = true;
+    this.conversationHistory = [];
+
+    this.writeToScroll(
+      a.green(`\u2714 Primary model: ${a.bold(model)}`) +
+      a.dim(` | Secondary: ${this.secondaryModel}\n`)
+    );
+    this.w(a.save);
+    this.drawBottom();
+  }
+
+  writeToScroll(text) {
+    this.w(a.restore);
+    this.w(text);
+  }
+
+  // ── Toggle secondary view ─────────────────────────────────────────────
+  toggleSecondaryView() {
+    this.showingSecondary = !this.showingSecondary;
+
+    this.w(a.clear);
+    this.w(a.scrollRgn(1, this.scrollEnd));
+    this.w(a.moveTo(1, 1));
+
+    if (this.showingSecondary) {
+      const colorFn = this.secondaryModel === 'codex' ? a.yellow : a.cyan;
+      this.w(a.dim(`\u2500\u2500 ${this.secondaryModel} (secondary) \u2500\u2500\n\n`));
+
+      if (this.secondaryStatus === 'running') {
+        this.w(a.dim('Still running...\n'));
+      } else if (this.secondaryOutput) {
+        this.w(colorFn(this.secondaryOutput));
+      } else {
+        this.w(a.dim('No output yet.\n'));
+      }
+    } else {
+      const colorFn = this.primaryModel === 'codex' ? a.yellow : a.cyan;
+      this.w(a.dim(`\u2500\u2500 ${this.primaryModel} (primary) \u2500\u2500\n\n`));
+
+      if (this.primaryOutput) {
+        this.w(this.primaryOutput);
+      } else {
+        this.w(a.dim('No output yet.\n'));
+      }
+    }
+
+    this.w(a.save);
+    this.drawBottom();
+  }
+
+  // ── Secondary model dispatch (background via bridge) ──────────────────
+  async spawnSecondary(userText) {
+    this.secondaryStatus = 'running';
+    this.secondaryOutput = '';
+    this.secondaryError = null;
+    this.drawBottom();
+
+    try {
+      if (!this._runAgent) {
+        const mod = await import('./lib/agent-runner.js');
+        this._runAgent = mod.runAgent;
+      }
+
+      let prompt;
+      if (this.conversationHistory.length === 0) {
+        prompt = this.systemPrompt + '\n\n---\n\nUser message: ' + userText;
+      } else {
+        prompt = this.systemPrompt + '\n\n---\n\nConversation so far:\n';
+        for (const turn of this.conversationHistory) {
+          prompt += `\n[${turn.role}]: ${turn.content}\n`;
+        }
+        prompt += `\n[user]: ${userText}\n`;
+        prompt += '\nContinue the conversation. Respond to the latest user message.';
+      }
+
+      const result = await this._runAgent({
+        cli: this.secondaryModel,
+        prompt,
+        cwd: this.workdir,
+        timeout: 300_000,
+        label: `interactive-secondary-${this.secondaryModel}`,
+        metadata: {
+          agentType: 'interactive-secondary',
+          model: this.secondaryModel
+        }
+      });
+
+      this.secondaryOutput = result.fullOutput || result.content || result.rawStdout || '';
+      this.secondaryStatus = result.success ? 'done' : 'error';
+
+      if (!result.success) {
+        this.secondaryError = result.timedOut ? 'Timed out' : 'Failed';
+      }
+    } catch (err) {
+      this.secondaryStatus = 'error';
+      this.secondaryError = err.message.slice(0, 60);
+      this.secondaryOutput = `Error: ${err.message}`;
+    }
+
+    this.drawBottom();
   }
 
   // ── Submit ─────────────────────────────────────────────────────────────
@@ -186,31 +411,73 @@ class KeenCLI {
     const text = this.input.trim();
     if (!text || this.busy) return;
 
+    // Slash commands
+    if (text.startsWith('/')) {
+      const handled = this.handleSlashCommand(text);
+      if (handled) {
+        this.input = '';
+        this.cursor = 0;
+        this.drawBottom();
+        return;
+      }
+    }
+
     this.history.push(text);
     this.histIdx = this.history.length;
     this.input = '';
     this.cursor = 0;
     this.busy = true;
+
+    // Reset per-turn buffers
+    this.primaryOutput = '';
+    this.secondaryOutput = '';
+    this.secondaryStatus = 'idle';
+    this.secondaryError = null;
+    this.showingSecondary = false;
+
     this.drawBottom();
 
-    // Restore cursor into scroll region, write user message
+    // Write user message in scroll region
     this.w(a.restore);
     this.w(`\n${a.bold('>')} ${text}\n\n`);
 
+    // 1. Fire-and-forget: spawn secondary model in background
+    this.spawnSecondary(text);
+
+    // 2. Run primary model (streams to terminal)
     try {
-      const code = await runTurn(text, {
+      const result = await runTurn(text, {
         workdir: this.workdir,
         isFirst: this.isFirst,
-        systemPrompt: this.systemPrompt
+        systemPrompt: this.systemPrompt,
+        model: this.primaryModel,
+        conversationHistory: this.conversationHistory,
+        onData: (chunk) => {
+          this.primaryOutput += chunk;
+          if (!this.showingSecondary) {
+            process.stdout.write(chunk);
+          }
+        }
       });
+
       this.isFirst = false;
-      if (code !== 0) this.w(a.dim(`\n[keen] exit code ${code}\n`));
+
+      // Track conversation for Codex context
+      this.conversationHistory.push({ role: 'user', content: text });
+      this.conversationHistory.push({ role: 'assistant', content: this.primaryOutput });
+
+      // Trim to last 10 turn-pairs
+      if (this.conversationHistory.length > 20) {
+        this.conversationHistory = this.conversationHistory.slice(-20);
+      }
+
+      if (result.code !== 0) this.w(a.dim(`\n[keen] exit code ${result.code}\n`));
     } catch (err) {
       this.w(a.dim(`\n[keen] error: ${err.message}\n`));
     }
 
     this.w('\n');
-    this.w(a.save); // save position in scroll region for next round
+    this.w(a.save);
     this.busy = false;
     this.drawBottom();
   }
@@ -224,9 +491,16 @@ class KeenCLI {
       process.exit(0);
     }
 
-    if (this.busy) return; // ignore everything else while thinking
-
     const key = data.toString();
+
+    // Allow Ctrl+T even while busy
+    if (key === '\x14') {
+      this.toggleSecondaryView();
+      return;
+    }
+
+    if (this.busy) return;
+
     const hex = data.toString('hex');
 
     // Enter
@@ -327,7 +601,7 @@ class KeenCLI {
         }
         return;
       }
-      return; // ignore other sequences
+      return;
     }
 
     // Printable characters
