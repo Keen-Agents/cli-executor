@@ -260,12 +260,13 @@ class KeenCLI {
         ? a.yellow(`viewing: ${this.secondaryModel}`)
         : a.cyan(`viewing: ${this.primaryModel}`);
       const secStatus = this.secondaryStatusLabel();
-      this.w(`  ${a.dim('\u23F3 thinking...')}  ${panelLabel}  ${secStatus}`);
+      const modelColor = this.primaryModel === 'claude' ? a.cyan : a.yellow;
+      this.w(`  ${modelColor('\u23F3 ' + this.primaryModel + ' thinking...')}  ${panelLabel}  ${secStatus}`);
     } else {
       // Show slash command suggestions when typing /
       const suggestions = this.slashSuggestions();
       if (suggestions) {
-        this.w(`  ${suggestions}`);
+        this.w(`  ${suggestions}  ${a.dim('Tab to complete')}`);
       } else {
         const secStatus = this.secondaryStatusLabel();
         const tips = [
@@ -442,6 +443,7 @@ class KeenCLI {
         prompt,
         cwd: this.workdir,
         timeout: 300_000,
+        extractRegex: null,  // no <COMPLETED> tag needed for interactive mode
         label: `interactive-secondary-${this.secondaryModel}`,
         metadata: {
           agentType: 'interactive-secondary',
@@ -563,6 +565,34 @@ class KeenCLI {
 
     // Enter
     if (key === '\r' || key === '\n') { this.submit(); return; }
+
+    // Tab — autocomplete slash commands
+    if (key === '\t') {
+      if (this.input.startsWith('/')) {
+        const input = this.input.toLowerCase();
+        const matches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(input) && c.cmd !== input);
+        if (matches.length === 1) {
+          // Single match — complete it (add trailing space for args)
+          this.input = matches[0].cmd + (matches[0].args ? ' ' : '');
+          this.cursor = this.input.length;
+          this.drawBottom();
+        } else if (matches.length > 1) {
+          // Multiple matches — complete common prefix
+          let common = matches[0].cmd;
+          for (let i = 1; i < matches.length; i++) {
+            while (!matches[i].cmd.startsWith(common)) {
+              common = common.slice(0, -1);
+            }
+          }
+          if (common.length > this.input.length) {
+            this.input = common;
+            this.cursor = this.input.length;
+            this.drawBottom();
+          }
+        }
+      }
+      return;
+    }
 
     // Backspace (0x7f Unix, 0x08 Windows)
     if (key === '\x7f' || hex === '08') {
