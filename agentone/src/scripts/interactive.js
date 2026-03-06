@@ -299,7 +299,7 @@ class KeenCLI {
     const model = this.secondaryModel;
     switch (this.secondaryStatus) {
       case 'running': return a.dim(`${model}: running...`);
-      case 'done':    return a.green(`${model}: done`);
+      case 'done':    return a.green(`${model}: done`) + a.dim(' (^T to view)');
       case 'error':   return a.red(`${model}: ${this.secondaryError || 'error'}`);
       default:        return '';
     }
@@ -445,6 +445,11 @@ class KeenCLI {
           }
         }
       });
+
+      // Fallback: if streaming didn't capture, use the final combined output
+      if (!this.secondaryOutput.trim() && result.output) {
+        this.secondaryOutput = result.output;
+      }
 
       this.secondaryStatus = result.code === 0 ? 'done' : 'error';
       if (result.code !== 0) {
