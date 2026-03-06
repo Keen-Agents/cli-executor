@@ -24,6 +24,20 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SYSTEM_PROMPT_PATH = resolve(__dirname, 'prompts/orchestrator.md');
 
+// Ensure bridge API token is available for agent-runner.js (secondary model dispatch).
+// The bridge hardcodes this token; pipeline-config.js reads from env vars.
+if (!process.env.AGENTONE_API_TOKEN && !process.env.BRIDGE_API_TOKEN) {
+  process.env.BRIDGE_API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
+}
+
+// ── Slash command registry ───────────────────────────────────────────────────
+const SLASH_COMMANDS = [
+  { cmd: '/model',    args: '[claude|codex]', desc: 'Switch or toggle primary model' },
+  { cmd: '/thinking', args: '',               desc: 'Toggle secondary model output (Ctrl+T)' },
+  { cmd: '/clear',    args: '',               desc: 'Clear screen (Ctrl+L)' },
+  { cmd: '/help',     args: '',               desc: 'Show available commands' },
+];
+
 // ── ANSI helpers ─────────────────────────────────────────────────────────────
 const ESC = '\x1b';
 const CSI = `${ESC}[`;
@@ -248,16 +262,22 @@ class KeenCLI {
       const secStatus = this.secondaryStatusLabel();
       this.w(`  ${a.dim('\u23F3 thinking...')}  ${panelLabel}  ${secStatus}`);
     } else {
-      const secStatus = this.secondaryStatusLabel();
-      const tips = [
-        `  ${a.cyan('\u21B5 send')}`,
-        `${a.yellow('^C exit')}`,
-        `${a.green('^L clear')}`,
-        `${a.magenta('\u2191\u2193 history')}`,
-        `${a.gray('^T thinking')}`,
-      ];
-      if (secStatus) tips.push(secStatus);
-      this.w(tips.join('  '));
+      // Show slash command suggestions when typing /
+      const suggestions = this.slashSuggestions();
+      if (suggestions) {
+        this.w(`  ${suggestions}`);
+      } else {
+        const secStatus = this.secondaryStatusLabel();
+        const tips = [
+          `  ${a.cyan('\u21B5 send')}`,
+          `${a.yellow('^C exit')}`,
+          `${a.green('^L clear')}`,
+          `${a.magenta('\u2191\u2193 history')}`,
+          `${a.gray('^T thinking')}`,
+        ];
+        if (secStatus) tips.push(secStatus);
+        this.w(tips.join('  '));
+      }
     }
 
     // Park cursor on input line (adjust for badge width)
@@ -298,7 +318,45 @@ class KeenCLI {
       return true;
     }
 
+    if (cmd === '/clear') {
+      this.w(a.clear);
+      this.w(a.scrollRgn(1, this.scrollEnd));
+      this.w(a.moveTo(1, 1));
+      this.w(a.save);
+      return true;
+    }
+
+    if (cmd === '/help') {
+      this.writeToScroll('\n' + a.bold('Available commands:\n'));
+      for (const { cmd: c, args: ar, desc } of SLASH_COMMANDS) {
+        const full = ar ? `${c} ${ar}` : c;
+        this.writeToScroll(`  ${a.cyan(full.padEnd(24))} ${a.dim(desc)}\n`);
+      }
+      this.writeToScroll('\n' + a.bold('Keyboard shortcuts:\n'));
+      this.writeToScroll(`  ${a.cyan('Ctrl+T'.padEnd(24))} ${a.dim('Toggle secondary model output')}\n`);
+      this.writeToScroll(`  ${a.cyan('Ctrl+L'.padEnd(24))} ${a.dim('Clear screen')}\n`);
+      this.writeToScroll(`  ${a.cyan('Ctrl+C'.padEnd(24))} ${a.dim('Exit')}\n`);
+      this.writeToScroll(`  ${a.cyan('Ctrl+U'.padEnd(24))} ${a.dim('Clear input line')}\n`);
+      this.writeToScroll(`  ${a.cyan('Ctrl+W'.padEnd(24))} ${a.dim('Delete word backward')}\n`);
+      this.writeToScroll(`  ${a.cyan('\u2191\u2193 arrows'.padEnd(24))} ${a.dim('History navigation')}\n`);
+      this.writeToScroll('\n');
+      this.w(a.save);
+      return true;
+    }
+
     return false;
+  }
+
+  // ── Slash command suggestions ─────────────────────────────────────────
+  slashSuggestions() {
+    const input = this.input.toLowerCase();
+    if (!input.startsWith('/')) return null;
+    const matches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(input) && c.cmd !== input);
+    if (matches.length === 0) return null;
+    return matches.map(c => {
+      const ar = c.args ? ` ${a.dim(c.args)}` : '';
+      return `${a.cyan(c.cmd)}${ar}`;
+    }).join('  ');
   }
 
   setPrimaryModel(model) {
