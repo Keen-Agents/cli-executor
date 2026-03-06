@@ -78,9 +78,11 @@ function asText(value) {
 }
 
 function resolvePlan(runState, extraData) {
+  const dualPlanOutput = runState?.getStageOutput?.('dual-plan');
   const planOutput = runState?.getStageOutput?.('plan');
   return (
     asText(extraData?.finalPlan) ||
+    asText(dualPlanOutput?.plan) ||
     asText(planOutput?.finalPlan) ||
     asText(planOutput?.plan) ||
     ''

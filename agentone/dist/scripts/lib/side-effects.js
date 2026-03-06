@@ -55,13 +55,17 @@ export async function executeSideEffect(state, effectType, details, action) {
 }
 
 function recordSideEffect(state, type, details, result) {
-  if (!state._sideEffects) state._sideEffects = [];
-  state._sideEffects.push({
+  // Store on state.state so it gets serialized by PipelineState.toJSON/persistRun
+  const stateObj = state.state || state;
+  if (!stateObj.sideEffects) stateObj.sideEffects = [];
+  stateObj.sideEffects.push({
     type,
     details,
     result,
     timestamp: new Date().toISOString()
   });
+  // Also keep reference on instance for getSideEffects()
+  state._sideEffects = stateObj.sideEffects;
 }
 
 export function writeCompensationFile(runDir, sideEffects) {

@@ -21,15 +21,17 @@ export async function bridgeCall(endpoint, body) {
         body: JSON.stringify(body || {})
     });
 
+    const text = await response.text();
+
     if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(`Bridge error (${endpoint}): ${err.error || response.statusText}`);
+        let errMsg = response.statusText;
+        try { errMsg = JSON.parse(text).error || errMsg; } catch {}
+        throw new Error(`Bridge error (${endpoint}): ${errMsg}`);
     }
 
     try {
-        return await response.json();
+        return JSON.parse(text);
     } catch {
-        const text = await response.text().catch(() => '');
         throw new Error(`Bridge returned non-JSON response (${endpoint}): ${text.slice(0, 200)}`);
     }
 }

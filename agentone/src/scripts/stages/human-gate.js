@@ -95,7 +95,7 @@ export async function run(context) {
   const maxWaitMs = TIMEOUTS[STAGE_NAME];
   const runId = context.state.runId;
   const runDir = path.resolve(context.runDir || context.state.getRunDir());
-  const instanceSuffix = instanceName !== STAGE_NAME ? `-${instanceName.replace(':', '-')}` : '';
+  const instanceSuffix = instanceName !== STAGE_NAME ? `-${instanceName.replace(/--/g, '-')}` : '';
   const requestFile = instanceSuffix ? `human-decision-request${instanceSuffix}.json` : REQUEST_FILE;
   const decisionFile = instanceSuffix ? `human-decision${instanceSuffix}.json` : DECISION_FILE;
   const requestPath = path.join(runDir, requestFile);

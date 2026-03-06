@@ -120,7 +120,7 @@ function resolveStageInstances(stageList) {
   return stageList.map(name => {
     counts[name] = (counts[name] || 0) + 1;
     return counts[name] > 1
-      ? { baseName: name, instanceName: `${name}:${counts[name]}` }
+      ? { baseName: name, instanceName: `${name}--${counts[name]}` }
       : { baseName: name, instanceName: name };
   });
 }
@@ -247,6 +247,7 @@ async function runPipeline(input) {
         stageList = profileConfig.stages;
         stageInstances.length = 0;
         stageInstances.push(...resolveStageInstances(stageList));
+        stageIndex = 0; // Reset — isCompleted() will skip already-done stages
         state.setProfile(selectedProfile);
 
         const updatedThresholds = budgetThresholds(profileConfig.budget);

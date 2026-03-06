@@ -317,12 +317,14 @@ export async function run(context) {
       }
 
       // Budget check between rounds
-      if (context.costTracker?.checkBudget?.()) {
+      const budgetStatus = context.costTracker?.checkBudget?.();
+      if (budgetStatus && budgetStatus.status === 'exceeded') {
         context.logger?.log({
           type: 'GATE_CHECK',
           stage: STAGE_NAME,
           gate: 'budget',
           round,
+          spent: budgetStatus.spent,
           message: 'Budget exceeded during cross-critique; stopping early.'
         });
         break;

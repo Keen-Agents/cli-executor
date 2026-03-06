@@ -3,13 +3,15 @@
  * approve.js — CLI tool to approve/revise/reject a pipeline human-gate.
  *
  * Usage:
- *   node approve.js --run-id <id> [--decision approve|revise|reject] [--comments "..."] [--gate human-gate:2]
+ *   node approve.js --run-id <id> [--decision approve|revise|reject] [--comments "..."] [--gate human-gate--2]
  *
  * If --decision is omitted, defaults to "approve".
  * If --gate is omitted, looks for any pending human-decision-request*.json in the run dir.
  */
 import fs from 'node:fs';
 import path from 'node:path';
+
+const RUN_ID_PATTERN = /^[a-zA-Z0-9_\-\.]+$/;
 
 function parseArgs(argv) {
   const args = { runId: '', decision: 'approve', comments: '', gate: '' };
@@ -21,13 +23,18 @@ function parseArgs(argv) {
     if (arg === '--comments') { args.comments = argv[++i] || ''; continue; }
     if (arg === '--gate') { args.gate = argv[++i] || ''; continue; }
     if (arg === '--help' || arg === '-h') {
-      console.log('Usage: node approve.js --run-id <id> [--decision approve|revise|reject] [--comments "..."] [--gate human-gate:2]');
+      console.log('Usage: node approve.js --run-id <id> [--decision approve|revise|reject] [--comments "..."] [--gate human-gate--2]');
       process.exit(0);
     }
   }
 
   if (!args.runId) {
     console.error('Error: --run-id is required');
+    process.exit(1);
+  }
+
+  if (!RUN_ID_PATTERN.test(args.runId)) {
+    console.error('Error: --run-id contains invalid characters (only alphanumeric, hyphens, underscores, dots allowed)');
     process.exit(1);
   }
 
@@ -42,7 +49,7 @@ function parseArgs(argv) {
 
 function findPendingRequest(runDir, gate) {
   if (gate) {
-    const suffix = gate !== 'human-gate' ? `-${gate.replace(':', '-')}` : '';
+    const suffix = gate !== 'human-gate' ? `-${gate.replace(/--/g, '-')}` : '';
     const requestFile = suffix ? `human-decision-request${suffix}.json` : 'human-decision-request.json';
     const decisionFile = suffix ? `human-decision${suffix}.json` : 'human-decision.json';
     const requestPath = path.join(runDir, requestFile);
@@ -60,7 +67,6 @@ function findPendingRequest(runDir, gate) {
   // Auto-detect: find any request file without a corresponding decision file
   const files = fs.readdirSync(runDir).filter(f => f.startsWith('human-decision-request'));
   for (const reqFile of files) {
-    const decFile = reqFile.replace('request', '').replace('--', '-');
     // human-decision-request.json → human-decision.json
     // human-decision-request-human-gate-2.json → human-decision-human-gate-2.json
     const decisionFile = reqFile.replace('-request', '');
