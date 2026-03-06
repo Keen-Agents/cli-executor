@@ -193,9 +193,6 @@ class KeenCLI {
 
     // Toggle state
     this.showingSecondary = false;
-
-    // Cached dynamic import
-    this._runAgent = null;
   }
 
   get rows() { return process.stdout.rows || 24; }
@@ -413,7 +410,8 @@ class KeenCLI {
     this.drawBottom();
   }
 
-  // ── Secondary model dispatch (background via bridge) ──────────────────
+  // ── Secondary model dispatch (direct child_process, not bridge) ─────
+  // Uses direct spawn to avoid Windows cmd.exe 8191-char arg limit.
   async spawnSecondary(userText) {
     this.secondaryStatus = 'running';
     this.secondaryOutput = '';
@@ -421,43 +419,24 @@ class KeenCLI {
     this.drawBottom();
 
     try {
-      if (!this._runAgent) {
-        const mod = await import('./lib/agent-runner.js');
-        this._runAgent = mod.runAgent;
-      }
-
-      let prompt;
-      if (this.conversationHistory.length === 0) {
-        prompt = this.systemPrompt + '\n\n---\n\nUser message: ' + userText;
-      } else {
-        prompt = this.systemPrompt + '\n\n---\n\nConversation so far:\n';
-        for (const turn of this.conversationHistory) {
-          prompt += `\n[${turn.role}]: ${turn.content}\n`;
-        }
-        prompt += `\n[user]: ${userText}\n`;
-        prompt += '\nContinue the conversation. Respond to the latest user message.';
-      }
-
-      const result = await this._runAgent({
-        cli: this.secondaryModel,
-        prompt,
-        cwd: this.workdir,
-        timeout: 300_000,
-        extractRegex: null,  // no <COMPLETED> tag needed for interactive mode
-        label: `interactive-secondary-${this.secondaryModel}`,
-        metadata: {
-          agentType: 'interactive-secondary',
-          model: this.secondaryModel
+      const result = await runTurn(userText, {
+        workdir: this.workdir,
+        isFirst: this.isFirst,
+        systemPrompt: this.systemPrompt,
+        model: this.secondaryModel,
+        conversationHistory: this.conversationHistory,
+        onData: (chunk) => {
+          this.secondaryOutput += chunk;
+          // If user is viewing secondary panel, stream it live
+          if (this.showingSecondary) {
+            process.stdout.write(chunk);
+          }
         }
       });
 
-      this.secondaryOutput = result.fullOutput || result.content || result.rawStdout || '';
-      this.secondaryStatus = (result.exitCode === 0 || result.success) ? 'done' : 'error';
-
-      if (this.secondaryStatus === 'error') {
-        this.secondaryError = result.timedOut ? 'Timed out'
-          : result.exitCode ? `exit ${result.exitCode}`
-          : 'Failed';
+      this.secondaryStatus = result.code === 0 ? 'done' : 'error';
+      if (result.code !== 0) {
+        this.secondaryError = `exit ${result.code}`;
       }
     } catch (err) {
       this.secondaryStatus = 'error';
