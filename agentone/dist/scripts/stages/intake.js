@@ -354,6 +354,47 @@ async function fetchIssue(ticketKey, credentials) {
   return response.json();
 }
 
+function hasJiraCredentials() {
+  return Boolean(
+    process.env.JIRA_BASE_URL?.trim() &&
+    process.env.JIRA_EMAIL?.trim() &&
+    process.env.JIRA_API_TOKEN?.trim()
+  );
+}
+
+function buildPromptTicket(ticketKey, promptText, workingDirectory, repo, baseBranch) {
+  const lines = promptText.split('\n').filter(Boolean);
+  const summary = lines[0]?.slice(0, 200) || 'General task';
+  const description = promptText;
+
+  return {
+    key: ticketKey,
+    projectKey: ticketKey.includes('-') ? ticketKey.split('-')[0] : 'TASK',
+    summary,
+    description,
+    ticketType: 'Task',
+    priority: 'Medium',
+    labels: [],
+    components: [],
+    componentCount: 0,
+    storyPoints: null,
+    hasSubtasks: false,
+    subtaskCount: 0,
+    assignee: null,
+    reporter: 'pipeline',
+    status: 'Open',
+    created: new Date().toISOString(),
+    attachments: [],
+    comments: [],
+    linkedIssues: [],
+    forceProfile: null,
+    repo,
+    baseBranch,
+    workingDirectory: workingDirectory ? path.resolve(workingDirectory) : null,
+    source: 'prompt',
+  };
+}
+
 export async function run(context) {
   context.state.stageStart(STAGE_NAME);
   context.logger.log({
@@ -366,23 +407,51 @@ export async function run(context) {
     throw new Error('context.ticketKey is required');
   }
 
-  const credentials = requireEnvVars();
-  const issue = await fetchIssue(ticketKey, credentials);
-  const partialTicket = normalizeTicket(issue, null);
-  const workingDirectory = resolveWorkingDirectory(issue, partialTicket, context);
-  if (!workingDirectory) {
-    throw new Error(
-      'Unable to resolve a working directory for this ticket. Set AGENTONE_WORKDIR, PIPELINE_WORKDIR, or AGENTONE_WORKDIR_MAP.'
-    );
-  }
-  if (!fs.existsSync(workingDirectory)) {
-    throw new Error(`Resolved working directory does not exist: ${workingDirectory}`);
-  }
+  const promptText = context?.promptText || '';
+  const isPromptMode = Boolean(promptText) && !hasJiraCredentials();
 
-  const repoMetadata = resolveRepoMetadata(workingDirectory);
-  const ticket = normalizeTicket(issue, workingDirectory, repoMetadata.repo, repoMetadata.baseBranch);
-  if (typeof context.state?.setWorkingDirectory === 'function') {
-    context.state.setWorkingDirectory(workingDirectory, { base: true });
+  let ticket;
+
+  if (isPromptMode) {
+    // Prompt mode — no Jira, build synthetic ticket from text
+    const workingDirectory = resolveWorkingDirectory({}, { key: ticketKey, projectKey: 'TASK' }, context);
+    if (!workingDirectory) {
+      throw new Error(
+        'Prompt mode requires a working directory. Use --workdir or set AGENTONE_WORKDIR.'
+      );
+    }
+    if (!fs.existsSync(workingDirectory)) {
+      throw new Error(`Working directory does not exist: ${workingDirectory}`);
+    }
+
+    const repoMetadata = resolveRepoMetadata(workingDirectory);
+    ticket = buildPromptTicket(ticketKey, promptText, workingDirectory, repoMetadata.repo, repoMetadata.baseBranch);
+
+    if (typeof context.state?.setWorkingDirectory === 'function') {
+      context.state.setWorkingDirectory(workingDirectory, { base: true });
+    }
+
+    console.log(`[intake] Prompt mode — task "${ticket.summary}" in ${workingDirectory}`);
+  } else {
+    // Jira mode — fetch ticket from Jira API
+    const credentials = requireEnvVars();
+    const issue = await fetchIssue(ticketKey, credentials);
+    const partialTicket = normalizeTicket(issue, null);
+    const workingDirectory = resolveWorkingDirectory(issue, partialTicket, context);
+    if (!workingDirectory) {
+      throw new Error(
+        'Unable to resolve a working directory for this ticket. Set AGENTONE_WORKDIR, PIPELINE_WORKDIR, or AGENTONE_WORKDIR_MAP.'
+      );
+    }
+    if (!fs.existsSync(workingDirectory)) {
+      throw new Error(`Resolved working directory does not exist: ${workingDirectory}`);
+    }
+
+    const repoMetadata = resolveRepoMetadata(workingDirectory);
+    ticket = normalizeTicket(issue, workingDirectory, repoMetadata.repo, repoMetadata.baseBranch);
+    if (typeof context.state?.setWorkingDirectory === 'function') {
+      context.state.setWorkingDirectory(workingDirectory, { base: true });
+    }
   }
 
   context.state.checkpoint(STAGE_NAME, ticket);

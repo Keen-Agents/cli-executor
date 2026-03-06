@@ -97,7 +97,9 @@ function parseArgs(argv) {
     profile: '',
     runId: '',
     resume: false,
-    workingDirectory: ''
+    workingDirectory: '',
+    prompt: '',
+    promptFile: ''
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -132,11 +134,27 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--prompt') {
+      args.prompt = argv[i + 1] || '';
+      i += 1;
+      continue;
+    }
+
+    if (arg === '--prompt-file') {
+      args.promptFile = argv[i + 1] || '';
+      i += 1;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${arg}`);
   }
 
+  if (!args.ticketKey && !args.prompt && !args.promptFile) {
+    throw new Error('Missing required argument: --ticket KEY or --prompt "text" or --prompt-file path');
+  }
+
   if (!args.ticketKey) {
-    throw new Error('Missing required argument: --ticket KEY');
+    args.ticketKey = `TASK-${Date.now()}`;
   }
 
   if (args.profile && !PROFILES[args.profile]) {
@@ -254,11 +272,22 @@ function checkAutoUpgrade(workDir, currentProfile) {
   return null;
 }
 
+function resolvePromptText(input) {
+  if (input.prompt && typeof input.prompt === 'string' && input.prompt.trim()) {
+    return input.prompt.trim();
+  }
+  if (input.promptFile && typeof input.promptFile === 'string' && input.promptFile.trim()) {
+    return fs.readFileSync(path.resolve(input.promptFile.trim()), 'utf8').trim();
+  }
+  return '';
+}
+
 async function runPipeline(input) {
   const ticketKey = input.ticketKey;
   const runId = input.runId || createRunId(ticketKey);
   const forcedProfile = input.profile || '';
   const shouldResume = Boolean(input.resume);
+  const promptText = resolvePromptText(input);
   const inputWorkingDirectory =
     typeof input.workingDirectory === 'string' && input.workingDirectory.trim()
       ? input.workingDirectory.trim()
@@ -347,6 +376,7 @@ async function runPipeline(input) {
       config: profileConfig,
       runDir,
       ticketKey,
+      promptText,
       stageName: instanceName,
       workDir: resolveWorkingDirectory(inputWorkingDirectory, state),
       workingDirectory: resolveWorkingDirectory(inputWorkingDirectory, state)
@@ -478,17 +508,21 @@ async function main() {
 }
 
 export async function exec(dictionary) {
-  const ticketKey = dictionary?.ticketKey;
-  if (!ticketKey) {
-    throw new Error('exec(dictionary) requires dictionary.ticketKey');
+  const ticketKey = dictionary?.ticketKey || '';
+  const prompt = dictionary?.prompt || '';
+  const promptFile = dictionary?.promptFile || '';
+
+  if (!ticketKey && !prompt && !promptFile) {
+    throw new Error('exec(dictionary) requires dictionary.ticketKey, dictionary.prompt, or dictionary.promptFile');
   }
 
+  const effectiveKey = ticketKey || `TASK-${Date.now()}`;
   const profile = dictionary?.profile || '';
-  const runId = dictionary?.runId || createRunId(ticketKey);
+  const runId = dictionary?.runId || createRunId(effectiveKey);
   const resume = Boolean(dictionary?.resume);
   const workingDirectory = dictionary?.workingDirectory || dictionary?.workDir || '';
 
-  const result = await runPipeline({ ticketKey, profile, runId, resume, workingDirectory });
+  const result = await runPipeline({ ticketKey: effectiveKey, profile, runId, resume, workingDirectory, prompt, promptFile });
 
   if (dictionary && typeof dictionary === 'object') {
     dictionary.response = result;
