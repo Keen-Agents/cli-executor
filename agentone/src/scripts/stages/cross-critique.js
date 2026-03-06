@@ -24,6 +24,11 @@ const CONVERGENCE_PHRASES = [
   /ready for implementation/i,
 ];
 const CHANGE_RATIO_THRESHOLD = 0.10;
+const MAX_PLAN_CHARS = 12000;
+const MAX_CONTEXT_CHARS = 4000;
+const MAX_CRITIQUE_CHARS = 6000;
+const MAX_PRIOR_CRITIQUES = 2;
+const MAX_PRIOR_BLOCK_CHARS = 5000;
 
 function asText(value) {
   if (typeof value === 'string') {
@@ -33,6 +38,14 @@ function asText(value) {
     return '';
   }
   return String(value);
+}
+
+function trimToChars(text, maxChars) {
+  const normalized = asText(text);
+  if (maxChars <= 0 || normalized.length <= maxChars) {
+    return normalized;
+  }
+  return normalized.slice(0, Math.max(0, maxChars - 20)).trimEnd() + '\n...[truncated]';
 }
 
 function fillTemplate(template, replacements) {
@@ -188,22 +201,29 @@ export async function run(context) {
     let convergenceReason = null;
 
     for (let round = 1; round <= maxRounds; round += 1) {
-      const priorCritiqueBlock = priorCritiques.length > 0
-        ? priorCritiques.map(p => `### Round ${p.round} Critique\n${p.text}`).join('\n\n')
+      const recentPriorCritiques = priorCritiques
+        .slice(-MAX_PRIOR_CRITIQUES)
+        .map(p => ({ ...p, text: trimToChars(p.text, MAX_CRITIQUE_CHARS) }));
+
+      const priorCritiqueBlock = recentPriorCritiques.length > 0
+        ? trimToChars(
+            recentPriorCritiques.map(p => `### Round ${p.round} Critique\n${p.text}`).join('\n\n'),
+            MAX_PRIOR_BLOCK_CHARS
+          )
         : '';
 
       let critiquePrompt = fillTemplate(critiqueTemplate, {
         '{{TICKET_KEY}}': asText(intakeOutput.key),
         '{{TICKET_SUMMARY}}': asText(intakeOutput.summary),
-        '{{PLAN}}': currentPlan,
+        '{{PLAN}}': trimToChars(currentPlan, MAX_PLAN_CHARS),
         '{{ROUND}}': String(round),
         '{{MAX_ROUNDS}}': String(maxRounds),
         '{{PRIOR_CRITIQUE}}': priorCritiqueBlock
       });
 
-      const contextBlock = assembleContext(context.state, 'cross-critique', 100000, { otherPlan: currentPlan, priorCritique: priorCritiqueBlock });
+      const contextBlock = assembleContext(context.state, 'cross-critique', MAX_CONTEXT_CHARS, { otherPlan: currentPlan, priorCritique: priorCritiqueBlock });
       if (contextBlock) {
-        critiquePrompt += '\n\n## Additional Context\n' + contextBlock;
+        critiquePrompt += '\n\n## Additional Context\n' + trimToChars(contextBlock, MAX_CONTEXT_CHARS);
       }
 
       const humanRevision = context.state.getLatestHumanRevision?.();
@@ -267,11 +287,11 @@ export async function run(context) {
         // Critic has issues — run revision
         const revisionPrompt = buildRevisionPrompt({
           ticket: intakeOutput,
-          currentPlan,
-          critique: critiqueText,
+          currentPlan: trimToChars(currentPlan, MAX_PLAN_CHARS),
+          critique: trimToChars(critiqueText, MAX_CRITIQUE_CHARS),
           round,
           maxRounds,
-          priorCritiques
+          priorCritiques: recentPriorCritiques
         });
 
         const revisionResult = await runAgent({

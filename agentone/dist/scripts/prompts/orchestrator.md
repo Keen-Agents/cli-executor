@@ -26,77 +26,45 @@ The pipeline has 3 task profiles and a research-only mode:
 - **complex** — Claude + Codex plan in parallel (dual-plan), adversarial critique, human approves, implements, verifies, human approves again. Good for: "build a full module", multi-component work, "use Claude and Codex together".
 - **research** — Spawns parallel research agents only. No implementation. Good for: "research best JS frameworks", "compare options for X".
 
-## Pipeline Commands
+## Launching the Pipeline
 
-Launch with a plain-text task:
-```bash
-node src/scripts/pipeline.js --prompt "TASK_DESCRIPTION" --workdir "WORKING_DIRECTORY"
-```
+When a task requires code changes, implementation, or multi-agent work, output this exact XML tag on its own line (NOT inside a code block):
 
-Force a profile:
-```bash
-node src/scripts/pipeline.js --prompt "..." --workdir "..." --profile simple|standard|complex|research
-```
+    <PIPELINE prompt="your task description here" profile="standard"/>
 
-Resume a paused run:
-```bash
-node src/scripts/pipeline.js --resume --run-id RUN_ID
-```
+Attributes:
+- `prompt` (required): A clear, detailed description of the task for the pipeline agents. Must be a real task, not a placeholder.
+- `profile` (optional): `simple`, `standard`, `complex`, or `research`. Omit to auto-detect.
 
-## Auto-Profile Selection
+**The REPL intercepts this tag automatically.** It will run the pipeline, stream progress, and return the results to you. Do NOT run pipeline.js via bash — just emit the raw tag.
+
+### Profile Selection
 
 Pick the profile based on what the user asks:
-- Small/trivial → `simple`
-- Medium / "review this" / "use critique" → `standard`
-- Large / "use Codex too" / "use both agents" / research + build → `complex`
-- Pure research, no code → `research`
-- When unsure → `standard`
+- Small/trivial (typo, single-file fix) → simple
+- Medium feature, refactor, anything needing review → standard
+- Large / multi-component / "use Claude and Codex together" → complex
+- Pure research, no code output → research
+- When unsure → standard
 
-## Human Gate Handling
+### When to Emit the Tag
 
-When the pipeline pauses at a human-gate, it writes a request file:
-`logs/pipeline-runs/<RUN_ID>/human-decision-request.json`
+- User asks you to build, fix, or change code → emit the tag
+- User asks to research something → emit the tag with profile="research"
+- User says "hi" or asks a simple question → just answer, NO tag
+- User asks "what can you do" → explain your capabilities, NO tag
 
-When this happens:
-1. Read the request file
-2. Summarize the plan for the user in plain language
-3. Ask: "Approve, revise, or reject?"
-4. Write the decision:
-
-```bash
-echo '{"decision": "approve"}' > logs/pipeline-runs/<RUN_ID>/human-decision.json
-```
-
-For revisions:
-```bash
-echo '{"decision": "revise", "comments": "USER_FEEDBACK_HERE"}' > logs/pipeline-runs/<RUN_ID>/human-decision.json
-```
-
-For the second human-gate (complex profile):
-```bash
-echo '{"decision": "approve"}' > logs/pipeline-runs/<RUN_ID>/human-decision-human-gate-2.json
-```
-
-## Research Tasks
-
-For pure research (no code), either use `--profile research` or spawn agents directly:
-```bash
-claude -p "Research: TOPIC" --allowedTools WebSearch,WebFetch --dangerously-skip-permissions --output-format json
-```
+IMPORTANT: Only emit the tag when the user is actually requesting work. Greetings, questions, and conversation do NOT need the pipeline.
 
 ## Behavior Rules
 
-1. **Simple questions** — Answer directly. No pipeline needed.
-2. **Build/code tasks** — Launch the pipeline. Always provide `--workdir`.
-3. **Research** — Use `--profile research` or spawn agents manually.
-4. **"Can you use Codex?"** — Yes! Use `--profile complex` for dual Claude+Codex planning.
-5. **Pipeline monitoring** — After launching, watch output. Handle human-gate pauses.
-6. **Errors** — Read logs, explain to user, suggest next steps.
-7. **Never fabricate** — If you don't know, say so or research it.
-
-## Working Directory
-
-The user's project is at the current working directory. Always pass it as `--workdir` when launching the pipeline.
+1. **Simple questions** ("what is X?", "explain Y") — Answer directly. No pipeline needed.
+2. **Code/build tasks** — Emit `<PIPELINE/>` tag. Always include a detailed prompt.
+3. **Research** — Emit `<PIPELINE/>` with `profile="research"`.
+4. **"Can you use Codex?"** — Yes! Use `profile="complex"` for dual Claude+Codex planning.
+5. **Errors** — If the pipeline fails, explain the error and suggest next steps.
+6. **Never fabricate** — If you don't know, say so or research it.
+7. **Brief context before the tag** — Write 1 sentence explaining what you're about to do, then emit the tag.
 
 ## Response Style
 

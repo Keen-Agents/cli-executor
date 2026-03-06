@@ -6,43 +6,41 @@
  *         npm run agent
  *
  * Features:
- *   /model claude|codex   — switch primary dispatcher
+ *   /model claude|codex   — switch which model answers prompts
  *   /model                — toggle between Claude and Codex
- *   /thinking             — toggle secondary model output view
- *   Ctrl+T                — same as /thinking
+ *   Ctrl+C                — cancel running turn (double-tap to exit)
  *
- * Both models run on every prompt: primary streams to screen,
- * secondary runs in background via bridge. Ctrl+T toggles view.
+ * Multi-model coordination (dual-plan, cross-critique, implementation)
+ * is handled by the pipeline stages, not the REPL.
  */
 
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { homedir } from 'node:os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SYSTEM_PROMPT_PATH = resolve(__dirname, 'prompts/orchestrator.md');
-
-// Ensure bridge API token is available for agent-runner.js (secondary model dispatch).
-// The bridge hardcodes this token; pipeline-config.js reads from env vars.
-if (!process.env.AGENTONE_API_TOKEN && !process.env.BRIDGE_API_TOKEN) {
-  process.env.BRIDGE_API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
-}
+const HISTORY_FILE = resolve(homedir(), '.keen_history');
+const MAX_HISTORY = 500;
+const IS_WINDOWS = process.platform === 'win32';
 
 // ── Slash command registry ───────────────────────────────────────────────────
 const SLASH_COMMANDS = [
   { cmd: '/model',    args: '[claude|codex]', desc: 'Switch or toggle primary model' },
-  { cmd: '/thinking', args: '',               desc: 'Toggle secondary model output (Ctrl+T)' },
   { cmd: '/clear',    args: '',               desc: 'Clear screen (Ctrl+L)' },
   { cmd: '/help',     args: '',               desc: 'Show available commands' },
+  { cmd: '/status',   args: '',               desc: 'Show session status' },
+  { cmd: '/save',     args: '[path]',         desc: 'Save conversation to file' },
 ];
 
 // ── ANSI helpers ─────────────────────────────────────────────────────────────
 const ESC = '\x1b';
 const CSI = `${ESC}[`;
 const a = {
-  clear:       `${CSI}2J${CSI}H`,
+  clear:       `${CSI}2J${CSI}3J${CSI}H`,
   clearLine:   `${CSI}2K`,
   clearToEnd:  `${CSI}K`,
   moveTo:      (r, c) => `${CSI}${r};${c}H`,
@@ -52,6 +50,8 @@ const a = {
   restore:     `${ESC}8`,
   show:        `${CSI}?25h`,
   hide:        `${CSI}?25l`,
+  altOn:       `${CSI}?1049h`,
+  altOff:      `${CSI}?1049l`,
   bold:        s => `${CSI}1m${s}${CSI}0m`,
   dim:         s => `${CSI}2m${s}${CSI}0m`,
   cyan:        s => `${CSI}36m${s}${CSI}0m`,
@@ -61,6 +61,26 @@ const a = {
   gray:        s => `${CSI}90m${s}${CSI}0m`,
   red:         s => `${CSI}31m${s}${CSI}0m`,
 };
+
+const SPINNER = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+const HEADER_LINES = 2;
+
+const EXIT_HINTS = {
+  1: 'general error', 2: 'invalid arguments', 126: 'not executable',
+  127: 'command not found', 130: 'interrupted', 137: 'killed (OOM)',
+};
+
+// ── Process kill helper ──────────────────────────────────────────────────────
+function killProc(proc) {
+  if (!proc || proc.exitCode !== null) return;
+  try {
+    if (IS_WINDOWS && proc.pid) {
+      spawn('taskkill', ['/F', '/T', '/PID', String(proc.pid)], { stdio: 'ignore', shell: false });
+    } else {
+      proc.kill('SIGTERM');
+    }
+  } catch {}
+}
 
 // ── CLI arg parsing ──────────────────────────────────────────────────────────
 function parseArgs(argv) {
@@ -75,14 +95,12 @@ function parseArgs(argv) {
 }
 
 // ── Run a single orchestrator turn ──────────────────────────────────────────
-function runTurn(stdinContent, { workdir, isFirst, systemPrompt, model, conversationHistory, onData }) {
-  if (model === 'codex') {
-    return runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData });
-  }
-  return runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData });
+function runTurn(stdinContent, opts) {
+  if (opts.model === 'codex') return runCodexTurn(stdinContent, opts);
+  return runClaudeTurn(stdinContent, opts);
 }
 
-function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData }) {
+function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, procRef }) {
   return new Promise((res, rej) => {
     const args = ['-p'];
     if (!isFirst) args.push('--continue');
@@ -95,36 +113,30 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData })
       env: { ...process.env }
     });
 
+    if (procRef) procRef.proc = proc;
+
     if (isFirst) {
       proc.stdin.write(systemPrompt + '\n\n---\n\nUser message: ' + stdinContent);
     } else {
       proc.stdin.write(stdinContent);
     }
     proc.stdin.end();
+    proc.stdin.on('error', () => {});
 
     let fullOutput = '';
     proc.stdout.on('data', (chunk) => {
       const text = chunk.toString();
       fullOutput += text;
       if (onData) onData(text);
-      else process.stdout.write(chunk);
     });
-
-    proc.stderr.on('data', (chunk) => {
-      const t = chunk.toString();
-      if (/error|fail/i.test(t) && !/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏/u.test(t)) {
-        process.stderr.write(chunk);
-      }
-    });
-
+    proc.stderr.on('data', () => {});
     proc.on('error', rej);
     proc.on('exit', (code) => res({ code: code ?? 0, output: fullOutput }));
   });
 }
 
-function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData }) {
+function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData, procRef }) {
   return new Promise((res, rej) => {
-    // Build full prompt with conversation history (Codex has no --continue)
     let fullPrompt;
     if (!conversationHistory || conversationHistory.length === 0) {
       fullPrompt = systemPrompt + '\n\n---\n\nUser message: ' + stdinContent;
@@ -137,10 +149,7 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
       fullPrompt += '\nContinue the conversation. Respond to the latest user message.';
     }
 
-    // Use '-' to read prompt from stdin (avoids Windows 8191-char cmd line limit).
-    // No --full-auto (doesn't exist); codex exec runs non-interactively by default.
     const args = ['exec', '-'];
-
     const proc = spawn('codex', args, {
       cwd: workdir,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -148,35 +157,67 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
       env: { ...process.env }
     });
 
+    if (procRef) procRef.proc = proc;
+
     proc.stdin.write(fullPrompt);
     proc.stdin.end();
+    proc.stdin.on('error', () => {});
 
     let fullOutput = '';
     let stderrOutput = '';
 
-    // Codex puts the final answer on stdout and thinking/progress on stderr.
-    // Capture both — stdout is the primary response, stderr has the context.
-    proc.stdout.on('data', (chunk) => {
-      const text = chunk.toString();
-      fullOutput += text;
-      if (onData) onData(text);
-      else process.stdout.write(chunk);
-    });
-
-    proc.stderr.on('data', (chunk) => {
-      const text = chunk.toString();
-      stderrOutput += text;
-      // Also stream stderr to onData so the thinking panel shows codex's progress
-      if (onData) onData(text);
-    });
+    // Don't stream raw Codex output — it echoes the system prompt.
+    // Buffer everything, extract just the response on exit.
+    proc.stdout.on('data', (chunk) => { fullOutput += chunk.toString(); });
+    proc.stderr.on('data', (chunk) => { stderrOutput += chunk.toString(); });
 
     proc.on('error', rej);
     proc.on('exit', (code) => {
-      // Combine: stderr (thinking/progress) + stdout (final answer)
-      const combined = stderrOutput + (fullOutput ? '\n' + fullOutput : '');
-      res({ code: code ?? 0, output: combined });
+      // Extract the actual response from Codex output.
+      // Codex echoes the prompt, then outputs the response after a marker line.
+      const response = extractCodexResponse(fullOutput, systemPrompt);
+      if (onData && response) onData(response);
+      res({ code: code ?? 0, output: response || fullOutput });
     });
   });
+}
+
+/**
+ * Extract just the model response from Codex stdout, stripping:
+ * - Echoed system prompt / input
+ * - "mcp startup:" lines
+ * - "codex" header line
+ * - "tokens used\nN,NNN" footer
+ */
+function extractCodexResponse(stdout, systemPrompt) {
+  let text = stdout;
+
+  // Strip echoed system prompt if present
+  if (systemPrompt && text.startsWith(systemPrompt.slice(0, 80))) {
+    // Find end of echo — look for the "User message:" boundary repeated
+    const marker = 'User message:';
+    const lastIdx = text.lastIndexOf(marker);
+    if (lastIdx > 0) {
+      // Skip past the marker line
+      const afterMarker = text.indexOf('\n', lastIdx);
+      if (afterMarker > 0) text = text.slice(afterMarker + 1);
+    }
+  }
+
+  // Strip common Codex metadata lines
+  const lines = text.split('\n');
+  const cleaned = [];
+  let skipTokens = false;
+
+  for (const line of lines) {
+    if (line.startsWith('mcp startup:')) continue;
+    if (line.trim() === 'codex') continue;
+    if (line.trim() === 'tokens used') { skipTokens = true; continue; }
+    if (skipTokens) { skipTokens = false; continue; } // skip the count line after "tokens used"
+    cleaned.push(line);
+  }
+
+  return cleaned.join('\n').trim();
 }
 
 // ── TUI ──────────────────────────────────────────────────────────────────────
@@ -184,125 +225,132 @@ class KeenCLI {
   constructor({ workdir, systemPrompt }) {
     this.workdir = workdir;
     this.systemPrompt = systemPrompt;
-    this.isFirst = true;
     this.busy = false;
     this.input = '';
     this.cursor = 0;
-    this.history = [];
-    this.histIdx = -1;
+    this.history = this._loadHistory();
+    this.histIdx = this.history.length;
     this.savedInput = '';
+    this._cleaned = false;
 
-    // ── Dual-model state ─────────────────────────────────────────
+    // ── Model state ──────────────────────────────────────────────
     this.primaryModel = 'claude';
-    this.secondaryModel = 'codex';
-    this.conversationHistory = [];
+    this.isFirstClaude = true;
+    this.isFirstCodex = true;
+    this.conversationHistory = [];   // used for Codex context (Claude uses --continue)
 
-    // Per-turn output buffers
+    // Per-turn output buffer
     this.primaryOutput = '';
-    this.secondaryOutput = '';
-    this.secondaryStatus = 'idle';  // 'idle' | 'running' | 'done' | 'error'
-    this.secondaryError = null;
+    this.pipelineRunning = false;
+    this._pipelineProfile = '';
 
-    // Toggle state
-    this.showingSecondary = false;
+    // Process reference (for kill on Ctrl+C)
+    this._primaryProcRef = {};
+
+    // Spinner + elapsed time
+    this._spinnerFrame = 0;
+    this._spinnerInterval = null;
+    this._turnStartTime = 0;
+
+    // Event handlers (stored for cleanup)
+    this._onResize = null;
+    this._onStdinData = null;
   }
 
   get rows() { return process.stdout.rows || 24; }
   get cols() { return process.stdout.columns || 80; }
-  get scrollEnd() { return Math.max(this.rows - 3, 4); }
+  get scrollStart() { return HEADER_LINES + 1; }
+  get scrollEnd() { return Math.max(this.rows - 3, this.scrollStart); }
 
   w(s) { process.stdout.write(s); }
-  rule() { return a.dim('\u2500'.repeat(this.cols)); }
+  rule() { return a.dim('─'.repeat(this.cols)); }
 
-  // ── Layout ───────────────────────────────────────────────────────────────
+  // ── Layout ─────────────────────────────────────────────────────────────
+  drawHeader() {
+    this.w(a.moveTo(1, 1) + a.clearLine);
+    const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
+    this.w(
+      a.bold('\u2731 Keen CLI') +
+      a.dim('  \u00b7  ') + mc(this.primaryModel) +
+      a.dim('  \u00b7  ' + this.workdir)
+    );
+    this.w(a.moveTo(2, 1) + a.clearLine);
+  }
+
   setup() {
+    this.w(a.altOn);
     this.w(a.clear);
-    this.w(a.scrollRgn(1, this.scrollEnd));
-
-    this.w(a.moveTo(1, 1));
-    this.w('\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n');
-    this.w('\u2551       Keen CLI       \u2551\n');
-    this.w('\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D\n');
-    this.w(a.dim(`workdir ${this.workdir}\n`));
-    const modelColor = this.primaryModel === 'claude' ? a.cyan : a.yellow;
-    this.w(a.dim('model   ') + modelColor(this.primaryModel) + a.dim(` (secondary: ${this.secondaryModel})`) + '\n');
-    this.w('\n');
-
+    this.drawHeader();
+    this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
+    this.w(a.moveTo(this.scrollStart, 1));
     this.w(a.save);
     this.drawBottom();
 
-    process.stdout.on('resize', () => {
-      this.w(a.scrollRgn(1, this.scrollEnd));
+    this._onResize = () => {
+      this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
       this.drawBottom();
-    });
+    };
+    process.stdout.on('resize', this._onResize);
 
-    if (process.stdin.isTTY) {
-      process.stdin.setRawMode(true);
-    }
+    this._onStdinData = (d) => this.onKey(d);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
     process.stdin.resume();
-    process.stdin.on('data', (d) => this.onKey(d));
+    process.stdin.on('data', this._onStdinData);
   }
 
   cleanup() {
+    if (this._cleaned) return;
+    this._cleaned = true;
+
+    killProc(this._primaryProcRef.proc);
+
+    if (this._spinnerInterval) clearInterval(this._spinnerInterval);
+    if (this._onResize) process.stdout.removeListener('resize', this._onResize);
+    if (this._onStdinData) process.stdin.removeListener('data', this._onStdinData);
+
     this.w(a.resetScroll);
     this.w(a.show);
-    this.w(a.moveTo(this.rows, 1) + '\n');
-    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    this.w(a.altOff);
+    if (process.stdin.isTTY) {
+      try { process.stdin.setRawMode(false); } catch {}
+    }
   }
 
   drawBottom() {
     const r = this.rows;
-    // Separator
+
+    // Row r-2: separator
     this.w(a.moveTo(r - 2, 1) + a.clearLine + this.rule());
 
-    // Input line with model badge
-    this.w(a.moveTo(r - 1, 1) + a.clearToEnd);
-    const badge = this.primaryModel === 'claude'
-      ? a.cyan(`[claude]`)
-      : a.yellow(`[codex]`);
-    this.w(`${badge} ${a.bold('>')} ${this.input}`);
+    // Row r-1: input line
+    this.w(a.moveTo(r - 1, 1) + a.clearLine);
+    const prefixLen = 2; // "> "
+    const available = Math.max(this.cols - prefixLen - 1, 10);
 
-    // Tips line
-    this.w(a.moveTo(r, 1) + a.clearToEnd);
+    let visibleInput = this.input;
+    let visibleCursor = this.cursor;
+    if (this.input.length > available) {
+      const start = Math.max(0, this.cursor - Math.floor(available * 0.7));
+      visibleInput = this.input.slice(start, start + available);
+      visibleCursor = this.cursor - start;
+    }
+    this.w(`${a.bold('\u203A')} ${visibleInput}`);
+
+    // Row r: hints line (directly under input, like Claude Code)
+    this.w(a.moveTo(r, 1) + a.clearLine);
     if (this.busy) {
-      const panelLabel = this.showingSecondary
-        ? a.yellow(`viewing: ${this.secondaryModel}`)
-        : a.cyan(`viewing: ${this.primaryModel}`);
-      const secStatus = this.secondaryStatusLabel();
-      const modelColor = this.primaryModel === 'claude' ? a.cyan : a.yellow;
-      this.w(`  ${modelColor('\u23F3 ' + this.primaryModel + ' thinking...')}  ${panelLabel}  ${secStatus}`);
+      this.w(a.dim(`  ^C to interrupt \u00b7 /model ${this.primaryModel}`));
     } else {
-      // Show slash command suggestions when typing /
       const suggestions = this.slashSuggestions();
       if (suggestions) {
-        this.w(`  ${suggestions}  ${a.dim('Tab to complete')}`);
+        this.w(`  ${suggestions}  ${a.dim('Tab')}`);
       } else {
-        const secStatus = this.secondaryStatusLabel();
-        const tips = [
-          `  ${a.cyan('\u21B5 send')}`,
-          `${a.yellow('^C exit')}`,
-          `${a.green('^L clear')}`,
-          `${a.magenta('\u2191\u2193 history')}`,
-          `${a.gray('^T thinking')}`,
-        ];
-        if (secStatus) tips.push(secStatus);
-        this.w(tips.join('  '));
+        this.w(a.dim(`  \u21B5 send \u00b7 ^C cancel \u00b7 /model ${this.primaryModel} \u00b7 /help`));
       }
     }
 
-    // Park cursor on input line (adjust for badge width)
-    const badgeLen = this.primaryModel.length + 2; // "[claude]" or "[codex]"
-    this.w(a.moveTo(r - 1, badgeLen + 4 + this.cursor)); // badge + " > " + cursor
-  }
-
-  secondaryStatusLabel() {
-    const model = this.secondaryModel;
-    switch (this.secondaryStatus) {
-      case 'running': return a.dim(`${model}: running...`);
-      case 'done':    return a.green(`${model}: done`) + a.dim(' (^T to view)');
-      case 'error':   return a.red(`${model}: ${this.secondaryError || 'error'}`);
-      default:        return '';
-    }
+    // Park cursor on input line
+    this.w(a.moveTo(r - 1, prefixLen + 1 + visibleCursor));
   }
 
   // ── Slash commands ─────────────────────────────────────────────────────
@@ -317,47 +365,68 @@ class KeenCLI {
       } else if (!arg) {
         this.setPrimaryModel(this.primaryModel === 'claude' ? 'codex' : 'claude');
       } else {
-        this.writeToScroll(a.yellow(`Unknown model: ${arg}. Use /model claude or /model codex\n`));
-        this.w(a.save);
+        this.scrollWrite(a.yellow(`Unknown model: ${arg}. Use /model claude or /model codex\n`));
       }
-      return true;
-    }
-
-    if (cmd === '/thinking') {
-      this.toggleSecondaryView();
-      return true;
+      return;
     }
 
     if (cmd === '/clear') {
       this.w(a.clear);
-      this.w(a.scrollRgn(1, this.scrollEnd));
-      this.w(a.moveTo(1, 1));
+      this.drawHeader();
+      this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
+      this.w(a.moveTo(this.scrollStart, 1));
       this.w(a.save);
-      return true;
+      this.drawBottom();
+      return;
     }
 
     if (cmd === '/help') {
-      this.writeToScroll('\n' + a.bold('Available commands:\n'));
+      this.scrollWrite('\n' + a.bold('Available commands:\n'));
       for (const { cmd: c, args: ar, desc } of SLASH_COMMANDS) {
         const full = ar ? `${c} ${ar}` : c;
-        this.writeToScroll(`  ${a.cyan(full.padEnd(24))} ${a.dim(desc)}\n`);
+        this.scrollWrite(`  ${a.cyan(full.padEnd(24))} ${a.dim(desc)}\n`);
       }
-      this.writeToScroll('\n' + a.bold('Keyboard shortcuts:\n'));
-      this.writeToScroll(`  ${a.cyan('Ctrl+T'.padEnd(24))} ${a.dim('Toggle secondary model output')}\n`);
-      this.writeToScroll(`  ${a.cyan('Ctrl+L'.padEnd(24))} ${a.dim('Clear screen')}\n`);
-      this.writeToScroll(`  ${a.cyan('Ctrl+C'.padEnd(24))} ${a.dim('Exit')}\n`);
-      this.writeToScroll(`  ${a.cyan('Ctrl+U'.padEnd(24))} ${a.dim('Clear input line')}\n`);
-      this.writeToScroll(`  ${a.cyan('Ctrl+W'.padEnd(24))} ${a.dim('Delete word backward')}\n`);
-      this.writeToScroll(`  ${a.cyan('\u2191\u2193 arrows'.padEnd(24))} ${a.dim('History navigation')}\n`);
-      this.writeToScroll('\n');
-      this.w(a.save);
-      return true;
+      this.scrollWrite('\n' + a.bold('Keyboard shortcuts:\n'));
+      this.scrollWrite(`  ${a.cyan('Ctrl+T'.padEnd(24))} ${a.dim('Toggle thinking (reserved)')}\n`);
+      this.scrollWrite(`  ${a.cyan('Ctrl+L'.padEnd(24))} ${a.dim('Clear screen')}\n`);
+      this.scrollWrite(`  ${a.cyan('Ctrl+C'.padEnd(24))} ${a.dim('Cancel turn / Exit')}\n`);
+      this.scrollWrite(`  ${a.cyan('Ctrl+U'.padEnd(24))} ${a.dim('Clear input line')}\n`);
+      this.scrollWrite(`  ${a.cyan('Ctrl+W'.padEnd(24))} ${a.dim('Delete word backward')}\n`);
+      this.scrollWrite(`  ${a.cyan('\u2191\u2193 arrows'.padEnd(24))} ${a.dim('History navigation')}\n`);
+      this.scrollWrite('\n');
+      return;
     }
 
-    return false;
+    if (cmd === '/status') {
+      const turns = Math.floor(this.conversationHistory.length / 2);
+      this.scrollWrite(`\n${a.bold('Session status:')}\n`);
+      this.scrollWrite(`  ${a.cyan('Model:'.padEnd(14))} ${this.primaryModel}\n`);
+      this.scrollWrite(`  ${a.cyan('Turns:'.padEnd(14))} ${turns}\n`);
+      this.scrollWrite(`  ${a.cyan('History:'.padEnd(14))} ${this.history.length} entries\n`);
+      this.scrollWrite(`  ${a.cyan('Workdir:'.padEnd(14))} ${this.workdir}\n`);
+      this.scrollWrite('\n');
+      return;
+    }
+
+    if (cmd === '/save') {
+      const path = parts[1] || `keen-session-${Date.now()}.md`;
+      const content = this.conversationHistory.map(t =>
+        `## ${t.role}\n\n${t.content}\n`
+      ).join('\n---\n\n');
+      try {
+        writeFileSync(resolve(this.workdir, path), content, 'utf8');
+        this.scrollWrite(a.green(`Saved to ${path}\n`));
+      } catch (err) {
+        this.scrollWrite(a.red(`Failed to save: ${err.message}\n`));
+      }
+      return;
+    }
+
+    // Unknown slash command
+    this.scrollWrite(a.red(`Unknown command: ${cmd}`) + a.dim(' — type /help for available commands\n'));
   }
 
-  // ── Slash command suggestions ─────────────────────────────────────────
+  // ── Slash command suggestions ──────────────────────────────────────────
   slashSuggestions() {
     const input = this.input.toLowerCase();
     if (!input.startsWith('/')) return null;
@@ -371,97 +440,150 @@ class KeenCLI {
 
   setPrimaryModel(model) {
     this.primaryModel = model;
-    this.secondaryModel = model === 'claude' ? 'codex' : 'claude';
-    this.isFirst = true;
-    this.conversationHistory = [];
+    this.conversationHistory = [];  // fresh start on model switch
 
-    this.writeToScroll(
-      a.green(`\u2714 Primary model: ${a.bold(model)}`) +
-      a.dim(` | Secondary: ${this.secondaryModel}\n`)
-    );
-    this.w(a.save);
+    this.scrollWrite(a.dim(`Switched to ${model}\n`));
+    this.drawHeader();
     this.drawBottom();
   }
 
-  writeToScroll(text) {
+  // Write text into the scroll region (auto-saves cursor position)
+  scrollWrite(text) {
     this.w(a.restore);
     this.w(text);
-  }
-
-  // ── Toggle secondary view ─────────────────────────────────────────────
-  toggleSecondaryView() {
-    this.showingSecondary = !this.showingSecondary;
-
-    this.w(a.clear);
-    this.w(a.scrollRgn(1, this.scrollEnd));
-    this.w(a.moveTo(1, 1));
-
-    if (this.showingSecondary) {
-      const colorFn = this.secondaryModel === 'codex' ? a.yellow : a.cyan;
-      this.w(a.dim(`\u2500\u2500 ${this.secondaryModel} (secondary) \u2500\u2500\n\n`));
-
-      if (this.secondaryStatus === 'running') {
-        this.w(a.dim('Still running...\n'));
-      } else if (this.secondaryOutput) {
-        this.w(colorFn(this.secondaryOutput));
-      } else {
-        this.w(a.dim('No output yet.\n'));
-      }
-    } else {
-      const colorFn = this.primaryModel === 'codex' ? a.yellow : a.cyan;
-      this.w(a.dim(`\u2500\u2500 ${this.primaryModel} (primary) \u2500\u2500\n\n`));
-
-      if (this.primaryOutput) {
-        this.w(this.primaryOutput);
-      } else {
-        this.w(a.dim('No output yet.\n'));
-      }
-    }
-
     this.w(a.save);
-    this.drawBottom();
   }
 
-  // ── Secondary model dispatch (direct child_process, not bridge) ─────
-  // Uses direct spawn to avoid Windows cmd.exe 8191-char arg limit.
-  async spawnSecondary(userText) {
-    this.secondaryStatus = 'running';
-    this.secondaryOutput = '';
-    this.secondaryError = null;
+  // ── Pipeline tag detection ───────────────────────────────────────────
+  _extractPipelineTag(output) {
+    const match = output.match(/<PIPELINE\s+([^>]*?)\/>/);
+    if (!match) return null;
+
+    const attrs = match[1];
+    const promptMatch = attrs.match(/prompt="([^"]*)"/);
+    const profileMatch = attrs.match(/profile="([^"]*)"/);
+    if (!promptMatch) return null;
+
+    const prompt = promptMatch[1];
+
+    // Reject placeholder/example prompts (from system prompt echo)
+    const REJECT = ['TASK_DESCRIPTION', 'your task description here', '...'];
+    if (!prompt || prompt.length < 5 || REJECT.includes(prompt)) return null;
+
+    return {
+      prompt,
+      profile: profileMatch ? profileMatch[1] : ''
+    };
+  }
+
+  _stripPipelineTag(text) {
+    return text.replace(/<PIPELINE\s+[^>]*?\/>/g, '').trim();
+  }
+
+  // ── Pipeline dispatch ──────────────────────────────────────────────────
+  async runPipelineFromTag(prompt, profile) {
+    const scriptPath = resolve(__dirname, 'pipeline.js');
+    const args = [scriptPath, '--prompt', prompt, '--workdir', this.workdir];
+    if (profile) args.push('--profile', profile);
+
+    this.pipelineRunning = true;
+    this._pipelineProfile = profile || 'auto';
+    this._turnStartTime = Date.now(); // reset timer for pipeline phase
+    this._spinnerActive = true; // re-enable spinner for pipeline phase
+
+    this.scrollWrite('\n' + a.dim('─'.repeat(Math.min(40, this.cols))) + '\n');
+    const label = prompt.length > 60 ? prompt.slice(0, 57) + '...' : prompt;
+    this.scrollWrite(a.bold('Pipeline started') + a.dim(` · ${this._pipelineProfile} · ${label}`) + '\n\n');
     this.drawBottom();
 
-    try {
-      const result = await runTurn(userText, {
-        workdir: this.workdir,
-        isFirst: this.isFirst,
-        systemPrompt: this.systemPrompt,
-        model: this.secondaryModel,
-        conversationHistory: this.conversationHistory,
-        onData: (chunk) => {
-          this.secondaryOutput += chunk;
-          // If user is viewing secondary panel, stream it live
-          if (this.showingSecondary) {
-            process.stdout.write(chunk);
-          }
+    let pipelineOutput = '';
+
+    const proc = spawn('node', args, {
+      cwd: this.workdir,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: true,
+      env: { ...process.env }
+    });
+
+    this._primaryProcRef.proc = proc;
+    proc.stdin.end();
+    proc.stdin.on('error', () => {});
+
+    proc.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      pipelineOutput += text;
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        if (line.includes('[pipeline]')) {
+          this.scrollWrite(a.cyan(line) + '\n');
+        } else {
+          this.scrollWrite(a.dim(line) + '\n');
         }
-      });
-
-      // Fallback: if streaming didn't capture, use the final combined output
-      if (!this.secondaryOutput.trim() && result.output) {
-        this.secondaryOutput = result.output;
       }
+      this.drawBottom();
+    });
 
-      this.secondaryStatus = result.code === 0 ? 'done' : 'error';
-      if (result.code !== 0) {
-        this.secondaryError = `exit ${result.code}`;
-      }
-    } catch (err) {
-      this.secondaryStatus = 'error';
-      this.secondaryError = err.message.slice(0, 60);
-      this.secondaryOutput = `Error: ${err.message}`;
-    }
+    proc.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      pipelineOutput += text;
+      this.scrollWrite(a.red(text));
+      this.drawBottom();
+    });
 
+    const result = await new Promise((res) => {
+      proc.on('error', (err) => res({ code: 1, success: false, error: err.message }));
+      proc.on('exit', (code) => res({ code: code ?? 1, success: code === 0 }));
+    });
+
+    this.pipelineRunning = false;
+    this._primaryProcRef = {};
+
+    this.scrollWrite('\n' + (result.success
+      ? a.green('Pipeline completed.')
+      : a.red(`Pipeline exited with code ${result.code}.`)) + '\n');
+    this.scrollWrite(a.dim('─'.repeat(Math.min(40, this.cols))) + '\n\n');
     this.drawBottom();
+
+    return { ...result, output: pipelineOutput };
+  }
+
+  // ── Spinner (renders in scroll area, not bottom bar) ─────────────────
+  _startSpinner() {
+    this._spinnerFrame = 0;
+    this._turnStartTime = Date.now();
+    this._spinnerActive = true;
+    this._spinnerInterval = setInterval(() => {
+      this._spinnerFrame++;
+      if (this._spinnerActive) this._drawSpinnerInScroll();
+      this.drawBottom();
+    }, 120);
+  }
+
+  _drawSpinnerInScroll() {
+    const frame = SPINNER[this._spinnerFrame % SPINNER.length];
+    const elapsed = Math.floor((Date.now() - this._turnStartTime) / 1000);
+    const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const ss = String(elapsed % 60).padStart(2, '0');
+    const label = this.pipelineRunning
+      ? `pipeline \u00b7 ${this._pipelineProfile}`
+      : this.primaryModel;
+    // Overwrite spinner line in-place (restore to saved pos, don't re-save)
+    this.w(a.restore + a.clearLine + a.dim(`  ${frame} ${label} \u00b7 ${mm}:${ss}`));
+  }
+
+  _clearSpinnerLine() {
+    if (!this._spinnerActive) return;
+    this._spinnerActive = false;
+    // Clear the spinner line and save position for normal streaming
+    this.w(a.restore + a.clearLine + a.save);
+  }
+
+  _stopSpinner() {
+    this._spinnerActive = false;
+    if (this._spinnerInterval) {
+      clearInterval(this._spinnerInterval);
+      this._spinnerInterval = null;
+    }
   }
 
   // ── Submit ─────────────────────────────────────────────────────────────
@@ -469,18 +591,21 @@ class KeenCLI {
     const text = this.input.trim();
     if (!text || this.busy) return;
 
-    // Slash commands
+    // Slash commands — all / prefixed input is treated as a command
     if (text.startsWith('/')) {
-      const handled = this.handleSlashCommand(text);
-      if (handled) {
-        this.input = '';
-        this.cursor = 0;
-        this.drawBottom();
-        return;
-      }
+      this.handleSlashCommand(text);
+      this.input = '';
+      this.cursor = 0;
+      this.drawBottom();
+      return;
     }
 
-    this.history.push(text);
+    // Deduplicate adjacent history entries
+    if (!this.history.length || this.history[this.history.length - 1] !== text) {
+      this.history.push(text);
+      if (this.history.length > MAX_HISTORY) this.history.shift();
+      try { appendFileSync(HISTORY_FILE, text + '\n'); } catch {}
+    }
     this.histIdx = this.history.length;
     this.input = '';
     this.cursor = 0;
@@ -488,74 +613,137 @@ class KeenCLI {
 
     // Reset per-turn buffers
     this.primaryOutput = '';
-    this.secondaryOutput = '';
-    this.secondaryStatus = 'idle';
-    this.secondaryError = null;
-    this.showingSecondary = false;
+    this._primaryProcRef = {};
 
+    this._startSpinner();
     this.drawBottom();
 
-    // Write user message in scroll region
-    this.w(a.restore);
-    this.w(`\n${a.bold('>')} ${text}\n\n`);
+    // User prompt echo
+    this.scrollWrite(`\n${a.bold('> ' + text)}\n\n`);
 
-    // 1. Fire-and-forget: spawn secondary model in background
-    this.spawnSecondary(text);
-
-    // 2. Run primary model (streams to terminal)
+    // Run primary model (streams to scroll region)
+    const isFirst = this.primaryModel === 'claude' ? this.isFirstClaude : this.isFirstCodex;
     try {
       const result = await runTurn(text, {
         workdir: this.workdir,
-        isFirst: this.isFirst,
+        isFirst,
         systemPrompt: this.systemPrompt,
         model: this.primaryModel,
         conversationHistory: this.conversationHistory,
+        procRef: this._primaryProcRef,
         onData: (chunk) => {
           this.primaryOutput += chunk;
-          if (!this.showingSecondary) {
-            process.stdout.write(chunk);
-          }
+          this._clearSpinnerLine();
+          // Filter out <PIPELINE .../> tag from display
+          const display = chunk.replace(/<PIPELINE\s+[^>]*?\/>/g, '');
+          if (display) this.scrollWrite(display);
+          this.drawBottom();
         }
       });
 
-      this.isFirst = false;
+      // Update isFirst for the primary model
+      if (this.primaryModel === 'claude') this.isFirstClaude = false;
+      else this.isFirstCodex = false;
 
-      // Track conversation for Codex context
+      // Track conversation (used by Codex for context; Claude uses --continue)
       this.conversationHistory.push({ role: 'user', content: text });
-      this.conversationHistory.push({ role: 'assistant', content: this.primaryOutput });
-
-      // Trim to last 10 turn-pairs
+      this.conversationHistory.push({ role: 'assistant', content: this.primaryOutput || result.output });
       if (this.conversationHistory.length > 20) {
         this.conversationHistory = this.conversationHistory.slice(-20);
       }
 
-      if (result.code !== 0) this.w(a.dim(`\n[keen] exit code ${result.code}\n`));
+      if (result.code !== 0) {
+        const hint = EXIT_HINTS[result.code] || '';
+        this.scrollWrite(a.dim(`\n[keen] exit code ${result.code}${hint ? ': ' + hint : ''}\n`));
+      }
+
+      // ── Pipeline tag interception ──────────────────────────────────
+      const pipelineTag = this._extractPipelineTag(this.primaryOutput);
+      if (pipelineTag) {
+        const pipelineResult = await this.runPipelineFromTag(pipelineTag.prompt, pipelineTag.profile);
+
+        // Feed result back to dispatcher for summarization
+        const summaryPrompt = pipelineResult.success
+          ? `The pipeline completed successfully. Here is the pipeline output (last 4000 chars):\n\n${pipelineResult.output.slice(-4000)}\n\nGive the user a brief summary of what was done.`
+          : `The pipeline failed with exit code ${pipelineResult.code}. Output:\n\n${pipelineResult.output.slice(-4000)}\n\nExplain what went wrong and suggest next steps.`;
+
+        this._primaryProcRef = {};
+        try {
+          const followUp = await runTurn(summaryPrompt, {
+            workdir: this.workdir,
+            isFirst: false,
+            systemPrompt: this.systemPrompt,
+            model: this.primaryModel,
+            conversationHistory: this.conversationHistory,
+            procRef: this._primaryProcRef,
+            onData: (chunk) => {
+              this.scrollWrite(chunk);
+              this.drawBottom();
+            }
+          });
+
+          this.conversationHistory.push({ role: 'user', content: '[pipeline result]' });
+          this.conversationHistory.push({ role: 'assistant', content: followUp.output || '' });
+          if (this.conversationHistory.length > 20) {
+            this.conversationHistory = this.conversationHistory.slice(-20);
+          }
+        } catch (err) {
+          this.scrollWrite(a.dim(`\n[keen] summary error: ${err.message}\n`));
+        }
+      }
     } catch (err) {
-      this.w(a.dim(`\n[keen] error: ${err.message}\n`));
+      this.scrollWrite(a.dim(`\n[keen] error: ${err.message}\n`));
     }
 
-    this.w('\n');
-    this.w(a.save);
+    // Elapsed time after response
+    const elapsed = ((Date.now() - this._turnStartTime) / 1000).toFixed(1);
+    this.scrollWrite('\n' + a.dim(`${elapsed}s`) + '\n\n');
+
+    this._stopSpinner();
+    this._primaryProcRef = {};
     this.busy = false;
     this.drawBottom();
   }
 
+  // ── Cancel running turn ────────────────────────────────────────────────
+  cancelTurn() {
+    killProc(this._primaryProcRef.proc);
+    this._primaryProcRef = {};
+
+    this._stopSpinner();
+    this.busy = false;
+
+    this.scrollWrite(a.yellow('\n[keen] Turn cancelled.\n'));
+    this.drawBottom();
+  }
+
+  // ── History persistence ────────────────────────────────────────────────
+  _loadHistory() {
+    try {
+      if (!existsSync(HISTORY_FILE)) return [];
+      const lines = readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(Boolean);
+      return lines.slice(-MAX_HISTORY);
+    } catch { return []; }
+  }
+
   // ── Keyboard ───────────────────────────────────────────────────────────
   onKey(data) {
-    // Always allow Ctrl+C
-    if (data.toString() === '\x03') {
+    const key = data.toString();
+
+    // Ctrl+C: cancel turn if busy, exit if idle
+    if (key === '\x03') {
+      if (this.busy) {
+        this.cancelTurn();
+        return;
+      }
       this.cleanup();
-      console.log(a.dim('[keen] Goodbye.'));
+      const turns = Math.floor(this.conversationHistory.length / 2);
+      console.log(a.dim(`[keen] ${turns} turn${turns !== 1 ? 's' : ''} completed. Goodbye.`));
       process.exit(0);
     }
 
-    const key = data.toString();
-
-    // Allow Ctrl+T even while busy
-    if (key === '\x14') {
-      this.toggleSecondaryView();
-      return;
-    }
+    // Ctrl+T — reserved for future use
+    if (key === '\x14') return;
 
     if (this.busy) return;
 
@@ -570,12 +758,10 @@ class KeenCLI {
         const input = this.input.toLowerCase();
         const matches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(input) && c.cmd !== input);
         if (matches.length === 1) {
-          // Single match — complete it (add trailing space for args)
           this.input = matches[0].cmd + (matches[0].args ? ' ' : '');
           this.cursor = this.input.length;
           this.drawBottom();
         } else if (matches.length > 1) {
-          // Multiple matches — complete common prefix
           let common = matches[0].cmd;
           for (let i = 1; i < matches.length; i++) {
             while (!matches[i].cmd.startsWith(common)) {
@@ -602,11 +788,12 @@ class KeenCLI {
       return;
     }
 
-    // Ctrl+L — clear scroll region
+    // Ctrl+L — clear screen + redraw header
     if (key === '\x0c') {
       this.w(a.clear);
-      this.w(a.scrollRgn(1, this.scrollEnd));
-      this.w(a.moveTo(1, 1));
+      this.drawHeader();
+      this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
+      this.w(a.moveTo(this.scrollStart, 1));
       this.w(a.save);
       this.drawBottom();
       return;
@@ -687,15 +874,17 @@ class KeenCLI {
         }
         return;
       }
-      return;
+      return; // silently ignore unknown escape sequences
     }
 
-    // Printable characters
-    if (key.length >= 1 && key.charCodeAt(0) >= 32) {
-      this.input = this.input.slice(0, this.cursor) + key + this.input.slice(this.cursor);
-      this.cursor += key.length;
-      this.drawBottom();
-    }
+    // Ignore non-printable control characters
+    if (key.charCodeAt(0) < 32) return;
+
+    // Printable characters — strip newlines from paste operations
+    const clean = key.replace(/[\r\n]/g, ' ');
+    this.input = this.input.slice(0, this.cursor) + clean + this.input.slice(this.cursor);
+    this.cursor += clean.length;
+    this.drawBottom();
   }
 }
 
@@ -734,11 +923,19 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   }
 
   const cli = new KeenCLI({ workdir: args.workdir, systemPrompt });
+
+  const shutdown = () => { cli.cleanup(); process.exit(0); };
   process.on('exit', () => cli.cleanup());
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
   process.on('uncaughtException', (err) => {
     cli.cleanup();
     console.error('[keen] Fatal:', err.message);
     process.exit(1);
   });
+  process.stdout.on('error', (err) => {
+    if (err.code === 'EPIPE') process.exit(0);
+  });
+
   cli.setup();
 }

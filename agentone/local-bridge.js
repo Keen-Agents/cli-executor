@@ -348,7 +348,7 @@ function createSession(cli, args, cwd, metadata = {}) {
     const proc = spawn(cli, args, {
         cwd: cwd || BASE_DIR,
         stdio: ['pipe', 'pipe', 'pipe'],
-        shell: false,
+        shell: IS_WINDOWS,
         env: { ...process.env, CLAUDECODE: undefined, PATH: process.env.PATH }
     });
 
