@@ -12,6 +12,7 @@ const COMPLETED_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const CRITIQUE_PROMPT_TEMPLATE_PATH = resolve(__dirname, '../prompts/critique.md');
+const ADVERSARIAL_PROMPT_TEMPLATE_PATH = resolve(__dirname, '../prompts/critique-adversarial.md');
 
 const CONVERGENCE_PHRASES = [
   /no significant (?:remaining )?issues/i,
@@ -153,7 +154,10 @@ export async function run(context) {
       throw new Error('Cross-critique stage requires a resolved profile from state or stage "classify".');
     }
 
-    const maxRounds = Number(context?.config?.maxConvergenceRounds ?? 0);
+    const adversarial = Boolean(context?.config?.adversarialCritique);
+    const baseMaxRounds = Number(context?.config?.maxConvergenceRounds ?? 0);
+    const maxRounds = adversarial ? Math.max(baseMaxRounds, 4) : baseMaxRounds;
+    const changeRatioThreshold = adversarial ? 0.05 : CHANGE_RATIO_THRESHOLD;
     const initialPlan = asText(planOutput.plan).trim();
     if (!initialPlan) {
       throw new Error('Cross-critique stage requires non-empty plan.plan text from stage "plan".');
@@ -172,7 +176,11 @@ export async function run(context) {
       return skippedOutput;
     }
 
-    const critiqueTemplate = readFileSync(CRITIQUE_PROMPT_TEMPLATE_PATH, 'utf8');
+    const templatePath = adversarial ? ADVERSARIAL_PROMPT_TEMPLATE_PATH : CRITIQUE_PROMPT_TEMPLATE_PATH;
+    const critiqueTemplate = readFileSync(templatePath, 'utf8');
+    if (adversarial) {
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'adversarial_mode', maxRounds, changeRatioThreshold });
+    }
     const rounds = [];
     const priorCritiques = [];
     let currentPlan = initialPlan;
@@ -302,7 +310,7 @@ export async function run(context) {
 
         // Check diff-based convergence
         changeRatio = computeChangeRatio(currentPlan, revisedPlan);
-        if (changeRatio <= CHANGE_RATIO_THRESHOLD) {
+        if (changeRatio <= changeRatioThreshold) {
           converged = true;
           convergenceReason = 'low_change_ratio';
         }
@@ -313,7 +321,7 @@ export async function run(context) {
           gate: 'convergence',
           round,
           changeRatio: Math.round(changeRatio * 1000) / 1000,
-          threshold: CHANGE_RATIO_THRESHOLD,
+          threshold: changeRatioThreshold,
           converged
         });
 

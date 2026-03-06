@@ -19,6 +19,7 @@ import { run as verify } from './stages/verify.js';
 import { run as fixLoop } from './stages/fix-loop.js';
 import { run as prCreate } from './stages/pr-create.js';
 import { run as jiraClose } from './stages/jira-close.js';
+import { run as research } from './stages/research.js';
 
 const STAGE_MAP = {
   intake, classify, plan,
@@ -28,7 +29,8 @@ const STAGE_MAP = {
   implement, verify,
   'fix-loop': fixLoop,
   'pr-create': prCreate,
-  'jira-close': jiraClose
+  'jira-close': jiraClose,
+  research
 };
 
 const RUN_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;

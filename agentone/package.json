@@ -3,8 +3,13 @@
     "version": "1.0.0",
     "main": "index.js",
     "type": "module",
+    "bin": {
+        "ago": "./ago.js"
+    },
     "scripts": {
-        "dev": "keen-builder"
+        "dev": "keen-builder",
+        "ago": "node ago.js",
+        "agent": "node src/scripts/interactive.js"
     },
     "keywords": [],
     "author": "",

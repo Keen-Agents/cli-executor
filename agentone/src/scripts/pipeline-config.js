@@ -46,6 +46,7 @@ export const PROFILES = {
     stages: [
       'intake',
       'classify',
+      'research',
       'dual-plan',
       'cross-critique',
       'human-gate',
@@ -58,7 +59,18 @@ export const PROFILES = {
     ],
     budget: 150,
     maxConvergenceRounds: 2,
-    maxFixAttempts: 3
+    maxFixAttempts: 3,
+    adversarialCritique: true
+  },
+  research: {
+    stages: [
+      'intake',
+      'classify',
+      'research'
+    ],
+    budget: 30,
+    maxConvergenceRounds: 0,
+    maxFixAttempts: 0
   }
 };
 
@@ -94,6 +106,7 @@ export const TIMEOUTS = {
   implement: 900_000,
   verify: 600_000,
   'fix-loop': 420_000,
+  research: 300_000,
   'pr-create': 180_000,
   'jira-close': 120_000
 };
