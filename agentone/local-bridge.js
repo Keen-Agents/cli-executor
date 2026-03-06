@@ -812,12 +812,16 @@ const server = http.createServer(async (req, res) => {
             }
 
             else if (url === '/api/cli/spawn') {
-                const { cli, args = [], cwd, closeStdin = false, metadata = {} } = data;
+                const { cli, args = [], cwd, closeStdin = false, stdinData, metadata = {} } = data;
                 if (!cli) throw new Error("No CLI tool specified. Provide 'cli' field (e.g. 'claude', 'codex')");
 
                 const session = createSession(cli, args, cwd, metadata);
 
-                if (closeStdin) {
+                // Write stdinData then close stdin (for codex '-' stdin prompt mode)
+                if (stdinData) {
+                    session.process.stdin.write(stdinData);
+                }
+                if (closeStdin || stdinData) {
                     session.process.stdin.end();
                     console.log(`[${new Date().toISOString()}] Stdin closed for session ${session.id} (one-shot mode)`);
                 }

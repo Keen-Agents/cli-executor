@@ -84,11 +84,15 @@ export async function runAgent(opts) {
         ...(opts?.label ? { label: opts.label } : {})
     };
 
+    // For codex with '-' stdin mode: send prompt as stdinData, bridge writes + closes stdin.
+    const stdinData = cli === 'codex' ? prompt : undefined;
+
     const spawnResult = await bridgeCall('/api/cli/spawn', {
         cli,
         args,
         cwd: opts?.cwd,
         closeStdin: true,
+        stdinData,
         metadata
     });
 
@@ -182,7 +186,9 @@ function buildArgs(cli, prompt, extraArgs) {
     }
     if (cli === 'codex') {
         const defaults = AGENT_DEFAULTS.codex?.extraArgs || [];
-        return ['exec', '--sandbox', 'read-only', '--json', prompt, ...defaults, ...extraArgs];
+        // Use '-' to read prompt from stdin (avoids Windows cmd line length limits).
+        // The prompt is sent via the bridge's stdin write after spawn.
+        return ['exec', '--json', '-', ...defaults, ...extraArgs];
     }
     return [prompt, ...extraArgs];
 }

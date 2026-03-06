@@ -137,7 +137,9 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
       fullPrompt += '\nContinue the conversation. Respond to the latest user message.';
     }
 
-    const args = ['exec', '--full-auto', fullPrompt];
+    // Use '-' to read prompt from stdin (avoids Windows 8191-char cmd line limit).
+    // No --full-auto (doesn't exist); codex exec runs non-interactively by default.
+    const args = ['exec', '-'];
 
     const proc = spawn('codex', args, {
       cwd: workdir,
@@ -145,6 +147,8 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
       shell: true,
       env: { ...process.env }
     });
+
+    proc.stdin.write(fullPrompt);
     proc.stdin.end();
 
     let fullOutput = '';
