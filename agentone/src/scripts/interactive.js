@@ -152,6 +152,10 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
     proc.stdin.end();
 
     let fullOutput = '';
+    let stderrOutput = '';
+
+    // Codex puts the final answer on stdout and thinking/progress on stderr.
+    // Capture both — stdout is the primary response, stderr has the context.
     proc.stdout.on('data', (chunk) => {
       const text = chunk.toString();
       fullOutput += text;
@@ -160,14 +164,18 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
     });
 
     proc.stderr.on('data', (chunk) => {
-      const t = chunk.toString();
-      if (/error|fail/i.test(t)) {
-        process.stderr.write(chunk);
-      }
+      const text = chunk.toString();
+      stderrOutput += text;
+      // Also stream stderr to onData so the thinking panel shows codex's progress
+      if (onData) onData(text);
     });
 
     proc.on('error', rej);
-    proc.on('exit', (code) => res({ code: code ?? 0, output: fullOutput }));
+    proc.on('exit', (code) => {
+      // Combine: stderr (thinking/progress) + stdout (final answer)
+      const combined = stderrOutput + (fullOutput ? '\n' + fullOutput : '');
+      res({ code: code ?? 0, output: combined });
+    });
   });
 }
 
