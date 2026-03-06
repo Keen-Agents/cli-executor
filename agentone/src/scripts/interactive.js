@@ -765,33 +765,14 @@ class KeenCLI {
       if (spawnTag) {
         const spawnResult = await this.runSpawnFromTag(spawnTag.cli, spawnTag.prompt);
 
-        // Feed spawn result back to dispatcher
-        this._primaryProcRef = {};
-        const mc = spawnTag.cli === 'claude' ? 'Claude' : 'Codex';
-        try {
-          const followUp = await runTurn(
-            `${mc} responded:\n\n${(spawnResult || '(no output)').slice(-2000)}\n\nRelay this to the user concisely.`,
-            {
-              workdir: this.workdir,
-              isFirst: false,
-              systemPrompt: this.systemPrompt,
-              model: this.primaryModel,
-              conversationHistory: this.conversationHistory,
-              procRef: this._primaryProcRef,
-              onData: (chunk) => {
-                this._clearSpinnerLine();
-                this.scrollWrite(chunk);
-                this.drawBottom();
-              }
-            }
-          );
-          this.conversationHistory.push({ role: 'user', content: `[${mc} spawn result]` });
-          this.conversationHistory.push({ role: 'assistant', content: followUp.output || '' });
-          if (this.conversationHistory.length > 20) {
-            this.conversationHistory = this.conversationHistory.slice(-20);
-          }
-        } catch (err) {
-          this.scrollWrite(a.dim(`\n[keen] relay error: ${err.message}\n`));
+        // Track in conversation history (no relay — user already saw the response)
+        const modelName = spawnTag.cli === 'claude' ? 'Claude' : 'Codex';
+        this.conversationHistory.push({
+          role: 'assistant',
+          content: `[${modelName} said: ${(spawnResult || '(no output)').slice(0, 500)}]`
+        });
+        if (this.conversationHistory.length > 20) {
+          this.conversationHistory = this.conversationHistory.slice(-20);
         }
       }
 
