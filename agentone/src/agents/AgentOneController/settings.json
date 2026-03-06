@@ -1,0 +1,15 @@
+{
+  "agentName": "AgentOneController",
+  "llm": {
+    "company": "google",
+    "model": "gemini-2.5-flash",
+    "modelId": 4913,
+    "parameters": {
+      "temperature": 0.2,
+      "top_p": 0.8,
+      "maxTokens": 65536
+    }
+  },
+  "filePaths": [],
+  "specialRules": []
+}
