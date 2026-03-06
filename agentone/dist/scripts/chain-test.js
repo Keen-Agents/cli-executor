@@ -19,8 +19,8 @@ const output = IS_KEEN
     ? (msg) => { runLog.push({ t: Date.now(), type: 'output', msg }); writeOut(msg); }
     : (msg) => { runLog.push({ t: Date.now(), type: 'output', msg }); console.log(msg); };
 
-const BRIDGE_URL = 'http://localhost:3222';
-const API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
+const BRIDGE_URL = process.env.AGENTONE_BRIDGE_URL || process.env.BRIDGE_URL || 'http://localhost:3222';
+const API_TOKEN = process.env.AGENTONE_API_TOKEN || process.env.BRIDGE_API_TOKEN || '';
 const POLL_INTERVAL = 3000;
 const STEP_TIMEOUT = 120_000;
 const COMPLETED_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;

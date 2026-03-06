@@ -4,6 +4,23 @@ import path from 'path';
 
 const STAGE_NAME = 'verify';
 
+export function requireWorkingDirectory(context, stageName = STAGE_NAME) {
+  const cwd = typeof context?.workDir === 'string' ? context.workDir.trim() : '';
+  if (!cwd) {
+    throw new Error(`${stageName} requires a working directory from intake or pipeline input.`);
+  }
+
+  if (!existsSync(cwd)) {
+    throw new Error(`${stageName} working directory does not exist: ${cwd}`);
+  }
+
+  if (!existsSync(path.join(cwd, '.git'))) {
+    throw new Error(`${stageName} working directory is not a git repository: ${cwd}`);
+  }
+
+  return cwd;
+}
+
 function readPackageJson(cwd) {
   const packageJsonPath = path.join(cwd, 'package.json');
   if (!existsSync(packageJsonPath)) {
@@ -48,7 +65,7 @@ function runTests(cwd) {
 
     return {
       passed: false,
-      output: stdout,
+      output: combined.trim(),
       stderr,
       exitCode: typeof err?.status === 'number' ? err.status : null,
     };
@@ -121,9 +138,64 @@ function buildSummary({ tests, lint, audit }) {
   return parts.join(' | ');
 }
 
+function auditPasses(audit) {
+  const vulnerabilities = audit?.vulnerabilities || {};
+  const critical = Number(vulnerabilities.critical || 0);
+  const high = Number(vulnerabilities.high || 0);
+  return critical === 0 && high === 0;
+}
+
+export function isVerificationPassed(result) {
+  const lintPassed = result?.lint === null || result?.lint?.passed === true;
+  const auditPassed = result?.audit?.passed !== false;
+  return result?.tests?.passed === true && lintPassed && auditPassed;
+}
+
+export function runVerificationSuite(cwd) {
+  const tests = runTests(cwd);
+  const lint = runLint(cwd);
+  const audit = runAudit(cwd);
+  const auditPassed = auditPasses(audit);
+
+  return {
+    tests: {
+      passed: tests.passed,
+      output: tests.output || '',
+      stderr: tests.stderr || '',
+      exitCode: tests.exitCode ?? null,
+    },
+    lint: lint
+      ? {
+          passed: lint.passed,
+          output: lint.output || '',
+          stderr: lint.stderr || '',
+          exitCode: lint.exitCode ?? null,
+        }
+      : null,
+    audit: {
+      passed: auditPassed,
+      vulnerabilities: audit.vulnerabilities || {},
+      output: audit.output || '',
+    },
+    summary: buildSummary({ tests, lint, audit }),
+  };
+}
+
+export function runVerification(cwd, startedAt = Date.now()) {
+  const suite = runVerificationSuite(cwd);
+  return {
+    passed: isVerificationPassed(suite),
+    tests: suite.tests,
+    lint: suite.lint,
+    audit: suite.audit,
+    summary: suite.summary,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 export async function run(context) {
   const startedAt = Date.now();
-  const cwd = context.workDir || process.cwd();
+  const cwd = requireWorkingDirectory(context);
 
   context.state.stageStart(STAGE_NAME);
   context.logger?.log({
@@ -135,7 +207,8 @@ export async function run(context) {
   try {
     const implementOutput = context.state.getStageOutput('implement');
 
-    const tests = runTests(cwd);
+    const result = runVerification(cwd, startedAt);
+    const tests = result.tests;
     context.logger?.log({
       type: 'GATE_CHECK',
       stage: STAGE_NAME,
@@ -143,7 +216,7 @@ export async function run(context) {
       passed: tests.passed,
     });
 
-    const lint = runLint(cwd);
+    const lint = result.lint;
     if (lint !== null) {
       context.logger?.log({
         type: 'GATE_CHECK',
@@ -153,33 +226,14 @@ export async function run(context) {
       });
     }
 
-    const audit = runAudit(cwd);
+    const audit = result.audit;
     context.logger?.log({
       type: 'GATE_CHECK',
       stage: STAGE_NAME,
       gate: 'npm audit --json',
       vulnerabilities: audit.vulnerabilities,
+      passed: audit.passed,
     });
-
-    const result = {
-      passed: tests.passed,
-      tests: {
-        passed: tests.passed,
-        output: tests.output || '',
-      },
-      lint: lint
-        ? {
-            passed: lint.passed,
-            output: lint.output || '',
-          }
-        : null,
-      audit: {
-        vulnerabilities: audit.vulnerabilities || {},
-        output: audit.output || '',
-      },
-      summary: buildSummary({ tests, lint, audit }),
-      durationMs: Date.now() - startedAt,
-    };
 
     if (!implementOutput) {
       result.summary = `${result.summary} | Note: implement output not found.`;
@@ -197,9 +251,9 @@ export async function run(context) {
   } catch (error) {
     const failed = {
       passed: false,
-      tests: { passed: false, output: '' },
+      tests: { passed: false, output: '', stderr: '', exitCode: null },
       lint: null,
-      audit: { vulnerabilities: {}, output: '' },
+      audit: { passed: false, vulnerabilities: {}, output: '' },
       summary: `Verification stage failed: ${error instanceof Error ? error.message : String(error)}`,
       durationMs: Date.now() - startedAt,
     };

@@ -60,6 +60,21 @@ function mergePlans(claudeContent, codexContent) {
   return parts.join('\n');
 }
 
+function resolveProfile(state) {
+  const classify = state.getStageOutput('classify');
+  const fromArtifact = typeof classify?.profile === 'string' ? classify.profile.trim() : '';
+  if (fromArtifact) {
+    return { profile: fromArtifact };
+  }
+
+  const fromState = typeof state?.toJSON?.()?.profile === 'string' ? state.toJSON().profile.trim() : '';
+  if (fromState) {
+    return { profile: fromState, forced: true };
+  }
+
+  return null;
+}
+
 export async function run(context) {
   context.state.stageStart(STAGE_NAME);
   context.logger?.log({ type: 'STAGE_STARTED', stage: STAGE_NAME });
@@ -69,9 +84,9 @@ export async function run(context) {
     if (!ticket || typeof ticket !== 'object') {
       throw new Error('Dual-plan stage requires intake output from stage "intake".');
     }
-    const classify = context.state.getStageOutput('classify');
+    const classify = resolveProfile(context.state);
     if (!classify || typeof classify !== 'object') {
-      throw new Error('Dual-plan stage requires classify output from stage "classify".');
+      throw new Error('Dual-plan stage requires a resolved profile from state or stage "classify".');
     }
 
     const claudeTemplate = readFileSync(CLAUDE_PROMPT_PATH, 'utf8');
@@ -83,6 +98,13 @@ export async function run(context) {
     if (contextBlock) {
       claudePrompt += '\n\n## Additional Context\n' + contextBlock;
       codexPrompt += '\n\n## Additional Context\n' + contextBlock;
+    }
+
+    const humanRevision = context.state.getLatestHumanRevision?.();
+    if (humanRevision?.comments) {
+      const revisionBlock = `\n\n## Human Revision Request\n${humanRevision.comments}`;
+      claudePrompt += revisionBlock;
+      codexPrompt += revisionBlock;
     }
 
     const timeout = TIMEOUTS['dual-plan'] || 420_000;
@@ -100,6 +122,7 @@ export async function run(context) {
       runAgent({
         cli: 'claude',
         prompt: claudePrompt,
+        cwd: context.workDir || undefined,
         timeout,
         label: `dual-plan-claude-${ticketKey}`,
         metadata: {
@@ -112,6 +135,7 @@ export async function run(context) {
       runAgent({
         cli: 'codex',
         prompt: codexPrompt,
+        cwd: context.workDir || undefined,
         timeout,
         label: `dual-plan-codex-${ticketKey}`,
         metadata: {

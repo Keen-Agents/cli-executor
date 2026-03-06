@@ -30,12 +30,73 @@ const STAGE_MAP = {
   'jira-close': jiraClose
 };
 
+const RUN_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
+
+function sanitizeTicketSegment(ticketKey) {
+  return String(ticketKey || 'ticket')
+    .trim()
+    .replace(/[^a-zA-Z0-9_.-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'ticket';
+}
+
+function createRunId(ticketKey) {
+  return `run-${Date.now()}-${sanitizeTicketSegment(ticketKey)}`;
+}
+
+function assertValidRunId(runId) {
+  if (!runId || typeof runId !== 'string') {
+    throw new Error('runId must be a non-empty string');
+  }
+
+  if (!RUN_ID_PATTERN.test(runId) || runId === '.' || runId === '..') {
+    throw new Error(
+      'Invalid runId. Only alphanumeric characters, dots, hyphens, and underscores are allowed.'
+    );
+  }
+}
+
+function resolveWorkingDirectory(inputWorkingDirectory, state) {
+  const intake = state?.getStageOutput?.('intake');
+  const candidates = [
+    state?.getWorkingDirectory?.(),
+    intake?.workingDirectory,
+    inputWorkingDirectory,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return path.resolve(candidate.trim());
+    }
+  }
+
+  return '';
+}
+
+function hasPendingStage(stageInstances, stageIndex, stageName) {
+  return stageInstances.slice(stageIndex).some((stage) => stage.baseName === stageName);
+}
+
+function findRevisionTargetIndex(stageInstances, currentInstanceName) {
+  const preferred = currentInstanceName === 'human-gate'
+    ? ['dual-plan', 'plan']
+    : ['implement', 'dual-plan', 'plan'];
+  for (const stageName of preferred) {
+    const index = stageInstances.findIndex((stage) => stage.baseName === stageName);
+    if (index >= 0) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
 function parseArgs(argv) {
   const args = {
     ticketKey: '',
     profile: '',
     runId: '',
-    resume: false
+    resume: false,
+    workingDirectory: ''
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -64,6 +125,12 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--workdir') {
+      args.workingDirectory = argv[i + 1] || '';
+      i += 1;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -80,8 +147,10 @@ function parseArgs(argv) {
   }
 
   if (!args.runId) {
-    args.runId = `run-${Date.now()}-${args.ticketKey}`;
+    args.runId = createRunId(args.ticketKey);
   }
+
+  assertValidRunId(args.runId);
 
   return args;
 }
@@ -153,9 +222,15 @@ function buildStagePlan({ forcedProfile, state }) {
 
 async function runPipeline(input) {
   const ticketKey = input.ticketKey;
-  const runId = input.runId;
+  const runId = input.runId || createRunId(ticketKey);
   const forcedProfile = input.profile || '';
   const shouldResume = Boolean(input.resume);
+  const inputWorkingDirectory =
+    typeof input.workingDirectory === 'string' && input.workingDirectory.trim()
+      ? input.workingDirectory.trim()
+      : '';
+
+  assertValidRunId(runId);
 
   const existingRun = runExists(runId);
   if (shouldResume && !existingRun) {
@@ -177,9 +252,22 @@ async function runPipeline(input) {
     state.setProfile(profileName);
   }
 
+  if (inputWorkingDirectory) {
+    state.setWorkingDirectory(inputWorkingDirectory, { base: true });
+  }
+
+  if (forcedProfile && !state.isCompleted('classify')) {
+    state.checkpoint('classify', {
+      profile: forcedProfile,
+      forced: true
+    });
+  }
+
   const thresholds = budgetThresholds(profileConfig.budget);
   const logger = createLogger(runDir, runId);
-  const costTracker = new CostTracker(runDir, { soft: thresholds.warning, hard: thresholds.hard });
+  const costTracker = shouldResume
+    ? CostTracker.load(runDir, { soft: thresholds.warning, hard: thresholds.hard })
+    : new CostTracker(runDir, { soft: thresholds.warning, hard: thresholds.hard });
 
   console.log(`[pipeline] Starting run ${runId}`);
 
@@ -201,7 +289,7 @@ async function runPipeline(input) {
 
     const budgetCheck = costTracker.checkBudget();
     if (budgetCheck.status === 'exceeded') {
-      state.pause('budget_exceeded', { spent: budgetCheck.spent });
+      state.pause('budget_exceeded', { spent: budgetCheck.spent }, 'PAUSED_BUDGET');
       logger.log({ type: 'BUDGET_EXCEEDED', stage: instanceName, spent: budgetCheck.spent });
       console.log(`[pipeline] Budget exceeded ($${budgetCheck.spent}). Pipeline paused.`);
       break;
@@ -225,13 +313,14 @@ async function runPipeline(input) {
       config: profileConfig,
       runDir,
       ticketKey,
-      stageName: instanceName
+      stageName: instanceName,
+      workDir: resolveWorkingDirectory(inputWorkingDirectory, state),
+      workingDirectory: resolveWorkingDirectory(inputWorkingDirectory, state)
     };
 
     try {
       logger.log({ type: 'STAGE_STARTED', stage: instanceName });
       const result = await runWithTimeout(instanceName, stageTimeout, STAGE_MAP[stageName], context);
-      logger.log({ type: 'STAGE_COMPLETED', stage: instanceName });
 
       const stageCost = costTracker.getStageCost(instanceName);
       const elapsed = formatDuration(Date.now() - stageStart);
@@ -256,8 +345,41 @@ async function runPipeline(input) {
           hard: updatedThresholds.hard
         };
 
+        logger.log({ type: 'STAGE_COMPLETED', stage: instanceName });
+
         console.log(`[pipeline] Stage: ${instanceName}... ${selectedProfile} profile selected (${elapsed})`);
+      } else if (stageName === 'human-gate' && result?.decision === 'revise') {
+        const rerouteIndex = findRevisionTargetIndex(stageInstances, instanceName);
+        if (rerouteIndex < 0) {
+          throw new Error('Human requested revisions, but no planning stage is available to rerun.');
+        }
+
+        const stagesToReset = stageInstances.slice(rerouteIndex).map((stage) => stage.instanceName);
+        state.resetStages(stagesToReset);
+        stageIndex = rerouteIndex;
+
+        logger.log({
+          type: 'STAGE_COMPLETED',
+          stage: instanceName,
+          revised: true,
+          rerouteTo: stageInstances[rerouteIndex].instanceName
+        });
+
+        console.log(
+          `[pipeline] Stage: ${instanceName}... revisions requested, returning to ${stageInstances[rerouteIndex].instanceName} (${elapsed})`
+        );
+      } else if (stageName === 'verify' && result?.passed !== true) {
+        if (!hasPendingStage(stageInstances, stageIndex, 'fix-loop')) {
+          throw new Error('Verification failed and no fix-loop stage remains. Stopping before side effects.');
+        }
+
+        logger.log({ type: 'STAGE_COMPLETED', stage: instanceName });
+        const costSuffix = stageCost.totalCost > 0 ? `, $${stageCost.totalCost}` : '';
+        console.log(`[pipeline] Stage: ${instanceName}... done (${elapsed}${costSuffix})`);
+      } else if (stageName === 'fix-loop' && result?.finalVerifyPassed !== true) {
+        throw new Error('Fix loop exhausted without producing a passing verification result.');
       } else {
+        logger.log({ type: 'STAGE_COMPLETED', stage: instanceName });
         const costSuffix = stageCost.totalCost > 0 ? `, $${stageCost.totalCost}` : '';
         console.log(`[pipeline] Stage: ${instanceName}... done (${elapsed}${costSuffix})`);
       }
@@ -308,10 +430,11 @@ export async function exec(dictionary) {
   }
 
   const profile = dictionary?.profile || '';
-  const runId = dictionary?.runId || '';
+  const runId = dictionary?.runId || createRunId(ticketKey);
   const resume = Boolean(dictionary?.resume);
+  const workingDirectory = dictionary?.workingDirectory || dictionary?.workDir || '';
 
-  const result = await runPipeline({ ticketKey, profile, runId, resume });
+  const result = await runPipeline({ ticketKey, profile, runId, resume, workingDirectory });
 
   if (dictionary && typeof dictionary === 'object') {
     dictionary.response = result;

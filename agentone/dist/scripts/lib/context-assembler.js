@@ -78,10 +78,16 @@ function asText(value) {
 }
 
 function resolvePlan(runState, extraData) {
+  const secondHumanGateOutput = runState?.getStageOutput?.('human-gate--2');
+  const humanGateOutput = runState?.getStageOutput?.('human-gate');
+  const critiqueOutput = runState?.getStageOutput?.('cross-critique');
   const dualPlanOutput = runState?.getStageOutput?.('dual-plan');
   const planOutput = runState?.getStageOutput?.('plan');
   return (
     asText(extraData?.finalPlan) ||
+    asText(secondHumanGateOutput?.effectivePlan) ||
+    asText(humanGateOutput?.effectivePlan) ||
+    asText(critiqueOutput?.finalPlan) ||
     asText(dualPlanOutput?.plan) ||
     asText(planOutput?.finalPlan) ||
     asText(planOutput?.plan) ||
@@ -92,6 +98,7 @@ function resolvePlan(runState, extraData) {
 function resolveContent(runState, key, extraData = {}) {
   const intakeOutput = runState?.getStageOutput?.('intake');
   const planOutput = runState?.getStageOutput?.('plan');
+  const critiqueOutput = runState?.getStageOutput?.('cross-critique');
   const implementOutput = runState?.getStageOutput?.('implement');
   const verifyOutput = runState?.getStageOutput?.('verify');
 
@@ -122,7 +129,7 @@ function resolveContent(runState, key, extraData = {}) {
     case 'failingCode':
       return asText(extraData[key]);
     case 'critiqueSummary':
-      return asText(extraData.critiqueSummary || planOutput?.critiqueSummary);
+      return asText(extraData.critiqueSummary || critiqueOutput?.summary || planOutput?.critiqueSummary);
     default:
       return '';
   }

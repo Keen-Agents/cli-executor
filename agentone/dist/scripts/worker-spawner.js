@@ -11,8 +11,8 @@
 
 import flow from 'system/flow';
 
-const BRIDGE_URL = 'https://sofwks0018.tail588de3.ts.net';
-const API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
+const BRIDGE_URL = process.env.AGENTONE_BRIDGE_URL || process.env.BRIDGE_URL || 'http://localhost:3222';
+const API_TOKEN = process.env.AGENTONE_API_TOKEN || process.env.BRIDGE_API_TOKEN || '';
 const CHECKPOINT_DIR = '.keen-checkpoint';
 const CHECKPOINT_STAGES = ['task-intake', 'judge', 'task-router', 'worker-spawner', 'review-loop', 'results-aggregator', 'completed'];
 

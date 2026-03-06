@@ -1,11 +1,11 @@
 import { readFileSync } from 'fs';
-import { execSync } from 'child_process';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { runAgent } from '../lib/agent-runner.js';
 import { CostTracker } from '../lib/cost-tracker.js';
 import { assembleContext } from '../lib/context-assembler.js';
 import { TIMEOUTS } from '../pipeline-config.js';
+import { runVerificationSuite, isVerificationPassed, requireWorkingDirectory, runVerification } from './verify.js';
 
 const STAGE_NAME = 'fix-loop';
 
@@ -31,40 +31,6 @@ function renderTemplate(template, values) {
   return rendered;
 }
 
-function runTestVerification(cwd) {
-  try {
-    const stdout = execSync('npm test', {
-      cwd,
-      encoding: 'utf8',
-      timeout: TIMEOUTS.verify,
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    return {
-      passed: true,
-      output: toText(stdout).trim(),
-      summary: 'Tests passed after fix attempt.'
-    };
-  } catch (error) {
-    const stdout = typeof error?.stdout === 'string' ? error.stdout : '';
-    const stderr = typeof error?.stderr === 'string' ? error.stderr : '';
-    const combined = `${stdout}\n${stderr}`.trim();
-
-    if (/no test specified/i.test(combined)) {
-      return {
-        passed: true,
-        output: combined,
-        summary: 'No test script specified; treating as passed.'
-      };
-    }
-
-    return {
-      passed: false,
-      output: combined,
-      summary: combined || 'npm test failed after fix attempt.'
-    };
-  }
-}
-
 export async function run(context) {
   context.state.stageStart(STAGE_NAME);
 
@@ -80,6 +46,7 @@ export async function run(context) {
         attempts: [],
         totalAttempts: 0,
         finalVerifyPassed: true,
+        effectiveVerify: verify,
         skipped: true,
         reason: 'Verify already passed; fix-loop skipped.'
       };
@@ -94,10 +61,11 @@ export async function run(context) {
 
     const ticketKey = toText(context.ticketKey || implement?.ticketKey || 'UNKNOWN-TICKET').trim() || 'UNKNOWN-TICKET';
     const maxAttempts = Number(context.config?.maxFixAttempts) || 1;
-    const cwd = context.workDir || process.cwd();
+    const cwd = requireWorkingDirectory(context, STAGE_NAME);
 
     const attempts = [];
     let finalVerifyPassed = false;
+    let effectiveVerify = verify;
     let currentTestOutput = toText(verify?.tests?.output);
     const promptTemplate = readFileSync(FIX_PROMPT_TEMPLATE_PATH, 'utf8');
 
@@ -111,7 +79,9 @@ export async function run(context) {
       const verifyNotes = [
         `Verify summary: ${toText(verify.summary)}`,
         `Lint passed: ${Boolean(verify?.lint?.passed)}`,
+        `Lint output: ${toText(verify?.lint?.output || '').trim()}`,
         `Audit vulnerabilities: ${JSON.stringify(verify?.audit?.vulnerabilities || {})}`,
+        `Audit output: ${toText(verify?.audit?.output || '').trim()}`,
         `Implement summary: ${toText(implement?.summary || '').trim()}`
       ].join('\n');
 
@@ -184,15 +154,32 @@ export async function run(context) {
         durationMs: result.durationMs
       });
 
-      const verifyResult = runTestVerification(cwd);
+      const verification = runVerificationSuite(cwd);
+      const verifyPassed = isVerificationPassed(verification);
+      effectiveVerify = {
+        passed: verifyPassed,
+        tests: verification.tests,
+        lint: verification.lint,
+        audit: verification.audit,
+        summary: verification.summary,
+        durationMs: Date.now() - startedAt,
+      };
+      const verifySummary = verification.summary || 'Verification failed after fix attempt.';
+      const verifyOutput = [
+        verification.tests?.output || '',
+        verification.tests?.stderr || '',
+        verification.lint?.output || '',
+        verification.lint?.stderr || '',
+        verification.audit?.output || ''
+      ].filter(Boolean).join('\n').trim();
       const attemptRecord = {
         attempt,
         fixSummary: toText(result.content || result.fullOutput || '').trim(),
         sessionId: toText(result.sessionId),
         durationMs: Date.now() - startedAt,
         verifyResult: {
-          passed: verifyResult.passed,
-          summary: verifyResult.summary
+          passed: verifyPassed,
+          summary: verifySummary
         }
       };
 
@@ -201,18 +188,19 @@ export async function run(context) {
       context.logger?.log({
         type: 'GATE_CHECK',
         stage: STAGE_NAME,
-        gate: 'npm test',
+        gate: 'post-fix verification',
         attempt,
-        passed: verifyResult.passed,
-        summary: verifyResult.summary
+        passed: verifyPassed,
+        summary: verifySummary
       });
 
-      if (verifyResult.passed) {
+      if (verifyPassed) {
         finalVerifyPassed = true;
+        effectiveVerify = runVerification(cwd);
+        context.state.checkpoint('verify', effectiveVerify);
         break;
       } else {
-        // Update test output for next attempt so agent sees current failures
-        currentTestOutput = verifyResult.output || currentTestOutput;
+        currentTestOutput = verifyOutput || currentTestOutput;
       }
     }
 
@@ -220,7 +208,8 @@ export async function run(context) {
       fixed: finalVerifyPassed,
       attempts,
       totalAttempts: attempts.length,
-      finalVerifyPassed
+      finalVerifyPassed,
+      effectiveVerify
     };
 
     context.state.checkpoint(STAGE_NAME, output);

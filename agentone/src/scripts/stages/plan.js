@@ -40,6 +40,21 @@ function renderPlanPrompt(template, ticket, classify) {
   return rendered;
 }
 
+function resolveProfile(state) {
+  const classify = state.getStageOutput('classify');
+  const fromArtifact = typeof classify?.profile === 'string' ? classify.profile.trim() : '';
+  if (fromArtifact) {
+    return { profile: fromArtifact };
+  }
+
+  const fromState = typeof state?.toJSON?.()?.profile === 'string' ? state.toJSON().profile.trim() : '';
+  if (fromState) {
+    return { profile: fromState, forced: true };
+  }
+
+  return null;
+}
+
 export async function run(context) {
   context.state.stageStart(STAGE_NAME);
 
@@ -48,9 +63,9 @@ export async function run(context) {
     if (!ticket || typeof ticket !== 'object') {
       throw new Error('Plan stage requires intake output (ticket) from stage "intake".');
     }
-    const classify = context.state.getStageOutput('classify');
+    const classify = resolveProfile(context.state);
     if (!classify || typeof classify !== 'object') {
-      throw new Error('Plan stage requires classify output from stage "classify".');
+      throw new Error('Plan stage requires a resolved profile from state or stage "classify".');
     }
     const promptTemplate = readFileSync(PLAN_PROMPT_TEMPLATE_PATH, 'utf8');
     let assembledPrompt = renderPlanPrompt(promptTemplate, ticket, classify);
@@ -60,9 +75,15 @@ export async function run(context) {
       assembledPrompt += '\n\n## Additional Context\n' + contextBlock;
     }
 
+    const humanRevision = context.state.getLatestHumanRevision?.();
+    if (humanRevision?.comments) {
+      assembledPrompt += `\n\n## Human Revision Request\n${humanRevision.comments}`;
+    }
+
     const result = await runAgent({
       cli: 'claude',
       prompt: assembledPrompt,
+      cwd: context.workDir || undefined,
       timeout: TIMEOUTS.plan,
       label: `plan-${ticket?.key || 'unknown'}`,
       metadata: {

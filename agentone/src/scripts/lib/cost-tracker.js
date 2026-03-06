@@ -1,5 +1,6 @@
 ﻿// @ts-check
 
+import { existsSync, readFileSync } from 'fs';
 import { mkdir, writeFile } from 'fs/promises';
 import { resolve } from 'path';
 
@@ -46,6 +47,36 @@ export class CostTracker {
         this.totalOutputTokens = 0;
         this.totalCacheReadTokens = 0;
         this.totalCacheWriteTokens = 0;
+    }
+
+    /**
+     * @param {string} runDir
+     * @param {{soft?: number, hard?: number, profile?: 'simple' | 'standard' | 'complex'} | undefined} budgets
+     */
+    static load(runDir, budgets = undefined) {
+        const tracker = new CostTracker(runDir, budgets);
+        const filePath = resolve(runDir, COST_SUMMARY_FILE);
+        if (!existsSync(filePath)) {
+            return tracker;
+        }
+
+        try {
+            const parsed = JSON.parse(readFileSync(filePath, 'utf8'));
+            if (parsed?.budgets && typeof parsed.budgets === 'object' && !budgets) {
+                tracker.budgets = normalizeBudgets(parsed.budgets);
+            }
+            tracker.stages = parsed?.stages && typeof parsed.stages === 'object' ? parsed.stages : {};
+            tracker.totalCost = toNumberSafe(parsed?.totals?.costUsd);
+            tracker.totalCalls = toNumberSafe(parsed?.totals?.calls);
+            tracker.totalInputTokens = toNumberSafe(parsed?.totals?.inputTokens);
+            tracker.totalOutputTokens = toNumberSafe(parsed?.totals?.outputTokens);
+            tracker.totalCacheReadTokens = toNumberSafe(parsed?.totals?.cacheReadTokens);
+            tracker.totalCacheWriteTokens = toNumberSafe(parsed?.totals?.cacheWriteTokens);
+        } catch {
+            return tracker;
+        }
+
+        return tracker;
     }
 
     /**
@@ -206,7 +237,7 @@ export class CostTracker {
      * }}
      */
     static fromAgentResult(result) {
-        const parsed = result?.parsedJson && typeof result.parsedJson === 'object' ? result.parsedJson : null;
+        const parsed = normalizeParsedPayload(result?.parsedJson);
         const usage = pickObject(result?.usage, parsed?.usage, parsed?.response?.usage, result?.response?.usage);
 
         return {
@@ -358,4 +389,41 @@ function toStringSafe(value, fallback) {
 
 function roundCurrency(value) {
     return Number(toNumberSafe(value).toFixed(6));
+}
+
+function normalizeParsedPayload(value) {
+    if (!value) {
+        return null;
+    }
+
+    if (!Array.isArray(value) && typeof value === 'object') {
+        return value;
+    }
+
+    if (!Array.isArray(value)) {
+        return null;
+    }
+
+    for (const item of value) {
+        const usage =
+            item?.usage ||
+            item?.item?.usage ||
+            item?.response?.usage ||
+            item?.metrics?.usage;
+        const model =
+            item?.model ||
+            item?.item?.model ||
+            item?.response?.model;
+
+        if (usage || model) {
+            return {
+                usage,
+                model,
+                response: item?.response,
+                metrics: item?.metrics
+            };
+        }
+    }
+
+    return null;
 }

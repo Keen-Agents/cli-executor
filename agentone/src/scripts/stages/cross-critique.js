@@ -117,6 +117,21 @@ function buildRevisionPrompt({ ticket, currentPlan, critique, round, maxRounds, 
   return parts.join('\n');
 }
 
+function resolveProfile(state) {
+  const classify = state.getStageOutput('classify');
+  const fromArtifact = typeof classify?.profile === 'string' ? classify.profile.trim() : '';
+  if (fromArtifact) {
+    return { profile: fromArtifact };
+  }
+
+  const fromState = typeof state?.toJSON?.()?.profile === 'string' ? state.toJSON().profile.trim() : '';
+  if (fromState) {
+    return { profile: fromState, forced: true };
+  }
+
+  return null;
+}
+
 export async function run(context) {
   context.state.stageStart(STAGE_NAME);
   context.logger?.log({ type: 'STAGE_STARTED', stage: STAGE_NAME });
@@ -133,9 +148,9 @@ export async function run(context) {
       throw new Error('Cross-critique stage requires intake output from stage "intake".');
     }
 
-    const classifyOutput = context.state.getStageOutput('classify');
+    const classifyOutput = resolveProfile(context.state);
     if (!classifyOutput || typeof classifyOutput !== 'object') {
-      throw new Error('Cross-critique stage requires classify output from stage "classify".');
+      throw new Error('Cross-critique stage requires a resolved profile from state or stage "classify".');
     }
 
     const maxRounds = Number(context?.config?.maxConvergenceRounds ?? 0);
@@ -183,9 +198,15 @@ export async function run(context) {
         critiquePrompt += '\n\n## Additional Context\n' + contextBlock;
       }
 
+      const humanRevision = context.state.getLatestHumanRevision?.();
+      if (humanRevision?.comments) {
+        critiquePrompt += `\n\n## Human Revision Request\n${humanRevision.comments}`;
+      }
+
       const critiqueResult = await runAgent({
         cli: 'claude',
         prompt: critiquePrompt,
+        cwd: context.workDir || undefined,
         timeout: TIMEOUTS['cross-critique'],
         label: `cross-critique-critique-r${round}-${asText(intakeOutput.key) || 'unknown'}`,
         metadata: {
@@ -248,6 +269,7 @@ export async function run(context) {
         const revisionResult = await runAgent({
           cli: 'claude',
           prompt: revisionPrompt,
+          cwd: context.workDir || undefined,
           timeout: TIMEOUTS['cross-critique'],
           label: `cross-critique-revision-r${round}-${asText(intakeOutput.key) || 'unknown'}`,
           metadata: {

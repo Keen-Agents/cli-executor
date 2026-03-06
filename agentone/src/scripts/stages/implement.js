@@ -1,4 +1,7 @@
-import fs from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 
 import { TIMEOUTS } from '../pipeline-config.js';
 import { runAgent } from '../lib/agent-runner.js';
@@ -11,6 +14,67 @@ const TEMPLATE_PATH = new URL('../prompts/implement.md', import.meta.url);
 
 function replaceAll(template, placeholder, value) {
   return template.split(placeholder).join(value);
+}
+
+function sanitizeSegment(value, fallback = 'run') {
+  const normalized = String(value || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || fallback;
+}
+
+function runGit(args, cwd, errorPrefix) {
+  try {
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe']
+    }).trim();
+  } catch (error) {
+    const stdout = typeof error?.stdout === 'string' ? error.stdout.trim() : '';
+    const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : '';
+    const details = [stdout, stderr].filter(Boolean).join('\n');
+    throw new Error(details ? `${errorPrefix}\n${details}` : errorPrefix);
+  }
+}
+
+function ensureWorktree(context, ticketKey) {
+  const existingPath = context.state.getMetadata?.('worktreePath');
+  if (existingPath && fs.existsSync(existingPath)) {
+    return {
+      worktreePath: existingPath,
+      branchName: context.state.getMetadata?.('worktreeBranch') || null
+    };
+  }
+
+  const baseWorkingDirectory = context.state.getMetadata?.('baseWorkingDirectory')
+    || context.state.getWorkingDirectory?.()
+    || context.workDir;
+  if (!baseWorkingDirectory) {
+    throw new Error('Implement stage requires a resolved base working directory before creating a worktree.');
+  }
+
+  const repoRoot = runGit(['rev-parse', '--show-toplevel'], baseWorkingDirectory, 'Failed to resolve git repository root.');
+  const worktreeRoot = path.join(repoRoot, '.pipeline-worktrees');
+  const worktreePath = path.join(worktreeRoot, sanitizeSegment(context.state.runId, 'run'));
+  const branchName = `pipeline/${sanitizeSegment(context.state.runId, 'run')}/${sanitizeSegment(ticketKey, 'ticket')}`;
+
+  fs.mkdirSync(worktreeRoot, { recursive: true });
+
+  if (!fs.existsSync(worktreePath)) {
+    runGit(['worktree', 'add', '-b', branchName, worktreePath], repoRoot, `Failed to create git worktree at ${worktreePath}.`);
+  }
+
+  if (typeof context.state?.setWorktree === 'function') {
+    context.state.setWorktree({
+      worktreePath,
+      branchName,
+      baseWorkingDirectory: repoRoot
+    });
+  }
+
+  return { worktreePath, branchName };
 }
 
 export async function run(context) {
@@ -51,9 +115,11 @@ export async function run(context) {
       throw new Error('Implement stage requires profile (simple/standard/complex).');
     }
 
+    const { worktreePath, branchName } = ensureWorktree(context, ticketKey);
+
     let template;
     try {
-      template = await fs.readFile(TEMPLATE_PATH, 'utf8');
+      template = await fsp.readFile(TEMPLATE_PATH, 'utf8');
     } catch (error) {
       throw new Error(`Implement prompt template load failed at ${TEMPLATE_PATH.pathname}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -69,10 +135,15 @@ export async function run(context) {
       assembledPrompt += '\n\n## Additional Context\n' + contextBlock;
     }
 
+    const humanRevision = context.state.getLatestHumanRevision?.();
+    if (humanRevision?.comments) {
+      assembledPrompt += `\n\n## Human Revision Request\n${humanRevision.comments}`;
+    }
+
     const result = await runAgent({
       cli: 'claude',
       prompt: assembledPrompt,
-      cwd: context.workDir || undefined,
+      cwd: worktreePath,
       timeout: TIMEOUTS.implement,
       label: `implement-${ticketKey}`,
       metadata: { stage: STAGE_NAME, ticketKey, runId: context.state.runId }
@@ -100,7 +171,9 @@ export async function run(context) {
       fullOutput: result.fullOutput,
       sessionId: result.sessionId,
       durationMs: result.durationMs,
-      success: result.success
+      success: result.success,
+      workingDirectory: worktreePath,
+      branchName
     };
 
     context.state.checkpoint(STAGE_NAME, output);

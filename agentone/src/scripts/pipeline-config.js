@@ -1,5 +1,5 @@
-export const BRIDGE_URL = 'http://localhost:3222';
-export const API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
+export const BRIDGE_URL = process.env.AGENTONE_BRIDGE_URL || process.env.BRIDGE_URL || 'http://localhost:3222';
+export const API_TOKEN = process.env.AGENTONE_API_TOKEN || process.env.BRIDGE_API_TOKEN || '';
 
 export const DEFAULTS = {
   pollInterval: 3_000,

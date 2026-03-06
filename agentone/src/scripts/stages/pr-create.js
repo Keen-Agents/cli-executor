@@ -1,17 +1,17 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { writeFileSync, unlinkSync } from 'fs';
 import path from 'node:path';
 import { executeSideEffect, getSideEffects, writeCompensationFile } from '../lib/side-effects.js';
 
 const STAGE_NAME = 'pr-create';
 
-function quoteArg(value) {
-  return `"${String(value).replace(/(["\\$`])/g, '\\$1')}"`;
-}
-
-function runCommand(command, cwd, errorPrefix) {
+function runCommand(command, args, cwd, errorPrefix) {
   try {
-    return execSync(command, { cwd, encoding: 'utf8' });
+    return execFileSync(command, args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
   } catch (error) {
     const stdout = typeof error?.stdout === 'string' ? error.stdout.trim() : '';
     const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : '';
@@ -27,6 +27,14 @@ function toText(value) {
   if (typeof value === 'string') return value;
   if (value === null || value === undefined) return '';
   return String(value);
+}
+
+function sanitizeRefSegment(value, fallback) {
+  const sanitized = toText(value)
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return sanitized || fallback;
 }
 
 function vulnerabilitiesSummary(audit) {
@@ -106,8 +114,16 @@ function readProfile(context) {
   return fromState || 'unknown';
 }
 
+function requireWorkingDirectory(context) {
+  const cwd = typeof context.workDir === 'string' ? context.workDir.trim() : '';
+  if (!cwd) {
+    throw new Error('PR create stage requires a working directory from intake or pipeline input.');
+  }
+  return cwd;
+}
+
 export async function run(context) {
-  const cwd = context.workDir || process.cwd();
+  const cwd = requireWorkingDirectory(context);
   const runId = toText(context.state?.runId || context.runId || 'unknown-run').trim();
 
   context.state.stageStart(STAGE_NAME);
@@ -125,33 +141,37 @@ export async function run(context) {
     const plan = context.state.getStageOutput('dual-plan')
               || context.state.getStageOutput('plan') || {};
     const implement = context.state.getStageOutput('implement') || {};
-    const verifyResult = context.state.getStageOutput('verify') || null;
+    const fixLoopOutput = context.state.getStageOutput('fix-loop') || null;
+    const verifyResult = fixLoopOutput?.effectiveVerify || context.state.getStageOutput('verify') || null;
     const ticketKey = toText(ticket.key).trim();
 
     if (!ticketKey) {
       throw new Error('PR create stage requires ticket.key from intake output.');
     }
 
-    const branchName = `pipeline/${runId}/${ticketKey}`;
-    const branchArg = quoteArg(branchName);
+    const branchName = toText(context.state.getMetadata?.('worktreeBranch')).trim()
+      || `pipeline/${sanitizeRefSegment(runId, 'run')}/${sanitizeRefSegment(ticketKey, 'ticket')}`;
+    const currentBranch = runCommand('git', ['rev-parse', '--abbrev-ref', 'HEAD'], cwd, 'Failed to resolve current git branch.').trim();
 
     try {
-      execSync('gh --version', { cwd, encoding: 'utf8' });
+      execFileSync('gh', ['--version'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     } catch {
       throw new Error('GitHub CLI (gh) is required for PR creation but was not found in PATH.');
     }
 
     const existingPrRaw = runCommand(
-      `gh pr list --head ${branchArg} --json number,url`,
+      'gh',
+      ['pr', 'list', '--head', branchName, '--json', 'number,url'],
       cwd,
       'Failed to query existing GitHub PRs via gh CLI.'
     );
     const existingPr = parsePrInfo(existingPrRaw);
     if (existingPr.prUrl) {
-      const existingSha = runCommand('git rev-parse HEAD', cwd).trim();
+      const existingSha = runCommand('git', ['rev-parse', 'HEAD'], cwd, 'Failed to resolve current commit SHA.').trim();
       const output = {
         prUrl: existingPr.prUrl,
         prNumber: existingPr.prNumber,
+        prTitle: `${ticketKey}: ${toText(ticket.summary).trim()}`,
         branch: branchName,
         commitSha: existingSha,
         skipped: false,
@@ -168,13 +188,22 @@ export async function run(context) {
       return output;
     }
 
-    const status = runCommand('git status --porcelain', cwd).trim();
-    if (!status) {
+    const status = runCommand('git', ['status', '--porcelain'], cwd, 'Failed to inspect git status.').trim();
+    const localBranchExists = runCommand('git', ['branch', '--list', branchName], cwd, 'Failed to inspect local branches.').trim().length > 0;
+    let remoteBranchExists = false;
+    try {
+      remoteBranchExists = runCommand('git', ['ls-remote', '--heads', 'origin', branchName], cwd, 'Failed to inspect remote branches.').trim().length > 0;
+    } catch {
+      remoteBranchExists = false;
+    }
+    const branchIsReadyForPr = currentBranch === branchName || localBranchExists || remoteBranchExists;
+    if (!status && !branchIsReadyForPr) {
       const output = {
         prUrl: null,
         prNumber: null,
+        prTitle: `${ticketKey}: ${toText(ticket.summary).trim()}`,
         branch: branchName,
-        commitSha: runCommand('git rev-parse HEAD', cwd).trim(),
+        commitSha: runCommand('git', ['rev-parse', 'HEAD'], cwd, 'Failed to resolve current commit SHA.').trim(),
         skipped: true,
         reason: 'No changes detected',
       };
@@ -188,24 +217,32 @@ export async function run(context) {
       return output;
     }
 
-    await executeSideEffect(context.state, 'git-branch', { branchName }, async () => {
-      const existingBranch = runCommand(`git branch --list ${branchArg}`, cwd).trim();
+    const existingBranch = localBranchExists
+      ? runCommand('git', ['branch', '--list', branchName], cwd, 'Failed to inspect local branches.').trim()
+      : '';
+    if (currentBranch !== branchName) {
       if (existingBranch) {
-        runCommand(`git checkout ${branchArg}`, cwd, `Failed to checkout existing branch "${branchName}".`);
+        runCommand('git', ['checkout', branchName], cwd, `Failed to checkout existing branch "${branchName}".`);
       } else {
-        runCommand(`git checkout -b ${branchArg}`, cwd, `Failed to create branch "${branchName}".`);
+        await executeSideEffect(context.state, 'git-branch', { branchName, cwd }, async () => {
+          runCommand('git', ['checkout', '-b', branchName], cwd, `Failed to create branch "${branchName}".`);
+          return { branchName };
+        });
       }
-      return { branchName };
-    });
+    }
 
-    runCommand('git add -A', cwd, 'Failed to stage changes with git add -A.');
+    if (status) {
+      runCommand('git', ['add', '-A'], cwd, 'Failed to stage changes with git add -A.');
+    }
 
     const profile = readProfile(context);
     const commitMessage = `${ticketKey}: ${toText(ticket.summary).trim()}\n\nAutomated implementation by AgentOne pipeline.\nRun: ${runId}\nProfile: ${profile}`;
     const commitMessagePath = path.join(cwd, `.agentone-commit-${runId}.txt`);
     writeFileSync(commitMessagePath, commitMessage, 'utf8');
     try {
-      runCommand(`git commit -F ${quoteArg(commitMessagePath)}`, cwd, 'Failed to commit changes.');
+      if (status) {
+        runCommand('git', ['commit', '-F', commitMessagePath], cwd, 'Failed to commit changes.');
+      }
     } finally {
       try {
         unlinkSync(commitMessagePath);
@@ -215,7 +252,7 @@ export async function run(context) {
     }
 
     try {
-      runCommand(`git push -u origin ${branchArg}`, cwd);
+      runCommand('git', ['push', '-u', 'origin', branchName], cwd, 'Failed to push branch.');
     } catch (error) {
       throw new Error(
         `Failed to push branch "${branchName}" to origin. Ensure git remote "origin" exists and authentication is configured.\n${error instanceof Error ? error.message : String(error)}`
@@ -226,16 +263,17 @@ export async function run(context) {
     const prBody = buildPrBody(ticket, plan, implement.summary, verifyResult, {
       runId,
       profile,
-      totalCost: context.costTracker?.getRunCost?.() || 0,
+      totalCost: context.costTracker?.getRunCost?.().totalCost ?? 0,
     });
     const prBodyPath = path.join(cwd, `.agentone-pr-body-${runId}.md`);
     writeFileSync(prBodyPath, prBody, 'utf8');
 
-    const prEffect = await executeSideEffect(context.state, 'pr-created', { branchName }, async () => {
+    const prEffect = await executeSideEffect(context.state, 'pr-created', { branchName, cwd }, async () => {
       let prResult = '';
       try {
         prResult = runCommand(
-          `gh pr create --title ${quoteArg(prTitle)} --body-file ${quoteArg(prBodyPath)}`,
+          'gh',
+          ['pr', 'create', '--title', prTitle, '--body-file', prBodyPath],
           cwd,
           'Failed to create GitHub PR using gh CLI.'
         );
@@ -249,14 +287,22 @@ export async function run(context) {
       return prResult;
     });
 
-    const prUrl = prEffect.alreadyDone ? null : parsePrUrl(prEffect.result);
-    const prNumberMatch = prUrl ? prUrl.match(/\/pull\/(\d+)(?:\D|$)/) : null;
-    const prNumber = prNumberMatch ? Number(prNumberMatch[1]) : null;
-    const commitSha = runCommand('git rev-parse HEAD', cwd).trim();
+    const latestPr = prEffect.alreadyDone
+      ? parsePrInfo(runCommand('gh', ['pr', 'list', '--head', branchName, '--json', 'number,url'], cwd, 'Failed to reload existing pull request.'))
+      : null;
+    const prUrl = prEffect.alreadyDone ? latestPr?.prUrl || null : parsePrUrl(prEffect.result);
+    const prNumber = prEffect.alreadyDone
+      ? latestPr?.prNumber || null
+      : (() => {
+          const prNumberMatch = prUrl ? prUrl.match(/\/pull\/(\d+)(?:\D|$)/) : null;
+          return prNumberMatch ? Number(prNumberMatch[1]) : null;
+        })();
+    const commitSha = runCommand('git', ['rev-parse', 'HEAD'], cwd, 'Failed to resolve current commit SHA.').trim();
 
     const output = {
       prUrl,
       prNumber,
+      prTitle,
       branch: branchName,
       commitSha,
       skipped: false,

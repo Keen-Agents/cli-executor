@@ -20,6 +20,26 @@ function coerceComments(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function buildEffectivePlan(planText, comments) {
+  const normalizedPlan = toStringOrEmpty(planText).trim();
+  const normalizedComments = coerceComments(comments);
+
+  if (!normalizedComments) {
+    return normalizedPlan;
+  }
+
+  if (!normalizedPlan) {
+    return `Human revision notes:\n${normalizedComments}`;
+  }
+
+  return [
+    normalizedPlan,
+    '',
+    '## Human Revision Notes',
+    normalizedComments
+  ].join('\n');
+}
+
 function resolvePlan(state) {
   const critique = state.getStageOutput('cross-critique');
   if (critique && typeof critique === 'object' && typeof critique.finalPlan === 'string' && critique.finalPlan.trim()) {
@@ -127,7 +147,7 @@ export async function run(context) {
     fs.mkdirSync(runDir, { recursive: true });
     fs.writeFileSync(requestPath, `${JSON.stringify(requestPayload, null, 2)}\n`, 'utf8');
 
-    context.state.pause('human_gate', { requestFile: requestFile });
+    context.state.pause('human_gate', { requestFile: requestFile }, 'PAUSED_HITL');
     context.logger?.log({
       type: 'PAUSED_HITL',
       stage: instanceName,
@@ -144,16 +164,16 @@ export async function run(context) {
     while (!finalDecision) {
       const elapsedMs = Date.now() - Date.parse(requestedAt);
       if (elapsedMs >= maxWaitMs) {
-        context.state.pause('budget_timeout', {
+        context.state.pause('human_gate_timeout', {
           stage: instanceName,
-          reason: 'budget_timeout',
+          reason: 'human_gate_timeout',
           waitDurationMs: elapsedMs,
           requestFile: requestFile
-        });
+        }, 'PAUSED_HITL');
         context.logger?.log({
           type: 'PAUSED_HITL',
           stage: instanceName,
-          reason: 'budget_timeout',
+          reason: 'human_gate_timeout',
           waitDurationMs: elapsedMs
         });
         throw new Error(`Timed out waiting for ${decisionFile} after ${elapsedMs}ms`);
@@ -175,12 +195,16 @@ export async function run(context) {
     const output = {
       decision: finalDecision.decision,
       comments: finalDecision.comments,
+      effectivePlan: buildEffectivePlan(planText, finalDecision.comments),
       waitDurationMs,
       requestedAt,
       decidedAt
     };
 
     if (output.decision === 'revise') {
+      if (typeof context.state?.addHumanRevision === 'function') {
+        context.state.addHumanRevision(output.comments || '', instanceName);
+      }
       context.logger?.log({
         type: 'GATE_CHECK',
         stage: instanceName,

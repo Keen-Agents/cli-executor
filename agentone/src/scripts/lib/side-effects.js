@@ -1,12 +1,20 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { writeFileSync } from 'fs';
 import path from 'node:path';
+
+function runCommand(command, args, cwd) {
+  return execFileSync(command, args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+}
 
 export const SIDE_EFFECT_CHECKS = {
   'git-branch': {
     check: async (details) => {
       try {
-        const result = execSync(`git branch --list "${details.branchName}"`, { encoding: 'utf8' });
+        const result = runCommand('git', ['branch', '--list', String(details.branchName || '')], details.cwd);
         return result.trim().length > 0;
       } catch {
         return false;
@@ -17,7 +25,7 @@ export const SIDE_EFFECT_CHECKS = {
   'pr-created': {
     check: async (details) => {
       try {
-        const result = execSync(`gh pr list --head "${details.branchName}" --json number`, { encoding: 'utf8' });
+        const result = runCommand('gh', ['pr', 'list', '--head', String(details.branchName || ''), '--json', 'number'], details.cwd);
         return JSON.parse(result).length > 0;
       } catch {
         return false;
@@ -55,16 +63,21 @@ export async function executeSideEffect(state, effectType, details, action) {
 }
 
 function recordSideEffect(state, type, details, result) {
-  // Store on state.state so it gets serialized by PipelineState.toJSON/persistRun
-  const stateObj = state.state || state;
-  if (!stateObj.sideEffects) stateObj.sideEffects = [];
-  stateObj.sideEffects.push({
+  const effect = {
     type,
     details,
     result,
     timestamp: new Date().toISOString()
-  });
-  // Also keep reference on instance for getSideEffects()
+  };
+
+  if (typeof state?.recordSideEffect === 'function') {
+    state.recordSideEffect(effect);
+    return;
+  }
+
+  const stateObj = state.state || state;
+  if (!stateObj.sideEffects) stateObj.sideEffects = [];
+  stateObj.sideEffects.push(effect);
   state._sideEffects = stateObj.sideEffects;
 }
 
@@ -95,5 +108,13 @@ function getUndoHint(effect) {
 }
 
 export function getSideEffects(state) {
-  return state._sideEffects || [];
+  if (typeof state?.getSideEffects === 'function') {
+    return state.getSideEffects();
+  }
+
+  if (Array.isArray(state?.state?.sideEffects)) {
+    return state.state.sideEffects;
+  }
+
+  return state?._sideEffects || [];
 }

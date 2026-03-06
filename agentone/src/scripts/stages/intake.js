@@ -1,5 +1,11 @@
+import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import path from 'node:path';
+
 const STAGE_NAME = 'intake';
 const FORCE_PROFILES = new Set(['force-simple', 'force-standard', 'force-complex']);
+const WORKDIR_ENV_KEYS = ['AGENTONE_WORKDIR', 'PIPELINE_WORKDIR', 'WORKING_DIRECTORY'];
+const WORKDIR_MAP_ENV_KEYS = ['AGENTONE_WORKDIR_MAP', 'PIPELINE_WORKDIR_MAP'];
 
 function requireEnvVars() {
   const required = ['JIRA_BASE_URL', 'JIRA_EMAIL', 'JIRA_API_TOKEN'];
@@ -141,7 +147,7 @@ function normalizeLinkedIssues(issuelinks) {
     .filter(Boolean);
 }
 
-function normalizeTicket(issue) {
+function normalizeTicket(issue, workingDirectory, repo = null, baseBranch = null) {
   const fields = issue?.fields || {};
   const renderedFields = issue?.renderedFields || {};
   const labels = Array.isArray(fields.labels) ? fields.labels : [];
@@ -164,6 +170,7 @@ function normalizeTicket(issue) {
 
   const ticket = {
     key: issue?.key || '',
+    projectKey: typeof issue?.key === 'string' && issue.key.includes('-') ? issue.key.split('-')[0] : '',
     summary: fields?.summary || '',
     description: plainTextDescription(fields, renderedFields),
     ticketType: fields?.issuetype?.name || 'Unknown',
@@ -182,9 +189,141 @@ function normalizeTicket(issue) {
     comments,
     linkedIssues: normalizeLinkedIssues(fields?.issuelinks),
     forceProfile: normalizeForceProfile(fields, labels),
+    repo,
+    baseBranch,
+    workingDirectory: workingDirectory ? path.resolve(workingDirectory) : null,
   };
 
   return ticket;
+}
+
+function parseJsonEnv(keys) {
+  for (const key of keys) {
+    const raw = process.env[key];
+    if (!raw || !raw.trim()) continue;
+
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        return parsed;
+      }
+    } catch (error) {
+      throw new Error(`${key} must contain valid JSON. ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return null;
+}
+
+function resolveMappedPath(ticket) {
+  const map = parseJsonEnv(WORKDIR_MAP_ENV_KEYS);
+  if (!map) {
+    return null;
+  }
+
+  const labelKeys = Array.isArray(ticket?.labels)
+    ? ticket.labels
+        .filter((label) => typeof label === 'string' && label.trim())
+        .map((label) => `label:${label}`)
+    : [];
+  const componentKeys = Array.isArray(ticket?.components)
+    ? ticket.components
+        .filter((component) => typeof component === 'string' && component.trim())
+        .map((component) => `component:${component}`)
+    : [];
+
+  const candidates = [
+    ticket?.key,
+    ticket?.projectKey,
+    ...labelKeys,
+    ...componentKeys,
+    'default'
+  ].filter(Boolean);
+
+  for (const key of candidates) {
+    const value = map[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
+function resolveWorkingDirectory(issue, ticket, context) {
+  const fields = issue?.fields || {};
+  const directFieldCandidates = [
+    fields.workingDirectory,
+    fields.repoPath,
+    fields.repositoryPath,
+    fields.localPath
+  ];
+
+  for (const envKey of WORKDIR_ENV_KEYS) {
+    const value = process.env[envKey];
+    if (typeof value === 'string' && value.trim()) {
+      return path.resolve(value.trim());
+    }
+  }
+
+  const mapped = resolveMappedPath(ticket);
+  if (mapped) {
+    return path.resolve(mapped);
+  }
+
+  for (const candidate of directFieldCandidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return path.resolve(candidate.trim());
+    }
+  }
+
+  const contextCandidate = context?.workingDirectory || context?.workDir || context?.state?.getWorkingDirectory?.();
+  if (typeof contextCandidate === 'string' && contextCandidate.trim()) {
+    return path.resolve(contextCandidate.trim());
+  }
+
+  if (process.env.AGENTONE_ALLOW_CWD_FALLBACK === '1') {
+    return process.cwd();
+  }
+
+  return null;
+}
+
+function runGit(args, cwd) {
+  try {
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe']
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function resolveRepoMetadata(workingDirectory) {
+  if (!workingDirectory) {
+    return { repo: null, baseBranch: null };
+  }
+
+  const repo = process.env.AGENTONE_REPO
+    || process.env.PIPELINE_REPO
+    || runGit(['remote', 'get-url', 'origin'], workingDirectory)
+    || null;
+
+  const remoteHead = runGit(['symbolic-ref', 'refs/remotes/origin/HEAD'], workingDirectory);
+  const inferredBaseBranch = remoteHead.includes('/')
+    ? remoteHead.split('/').slice(-1)[0]
+    : '';
+  const baseBranch = process.env.AGENTONE_BASE_BRANCH
+    || process.env.PIPELINE_BASE_BRANCH
+    || inferredBaseBranch
+    || 'main';
+
+  return {
+    repo: typeof repo === 'string' && repo.trim() ? repo.trim() : null,
+    baseBranch: typeof baseBranch === 'string' && baseBranch.trim() ? baseBranch.trim() : null
+  };
 }
 
 async function fetchIssue(ticketKey, credentials) {
@@ -229,7 +368,22 @@ export async function run(context) {
 
   const credentials = requireEnvVars();
   const issue = await fetchIssue(ticketKey, credentials);
-  const ticket = normalizeTicket(issue);
+  const partialTicket = normalizeTicket(issue, null);
+  const workingDirectory = resolveWorkingDirectory(issue, partialTicket, context);
+  if (!workingDirectory) {
+    throw new Error(
+      'Unable to resolve a working directory for this ticket. Set AGENTONE_WORKDIR, PIPELINE_WORKDIR, or AGENTONE_WORKDIR_MAP.'
+    );
+  }
+  if (!fs.existsSync(workingDirectory)) {
+    throw new Error(`Resolved working directory does not exist: ${workingDirectory}`);
+  }
+
+  const repoMetadata = resolveRepoMetadata(workingDirectory);
+  const ticket = normalizeTicket(issue, workingDirectory, repoMetadata.repo, repoMetadata.baseBranch);
+  if (typeof context.state?.setWorkingDirectory === 'function') {
+    context.state.setWorkingDirectory(workingDirectory, { base: true });
+  }
 
   context.state.checkpoint(STAGE_NAME, ticket);
   context.logger.log({

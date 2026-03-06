@@ -53,7 +53,17 @@ export class PipelineState {
 
     const existing = readJsonIfExists(this.runJsonPath);
     if (existing) {
-      this.state = existing;
+      this.state = {
+        ...existing,
+        stages: existing.stages || {},
+        sideEffects: Array.isArray(existing.sideEffects) ? existing.sideEffects : [],
+        humanRevisions: Array.isArray(existing.humanRevisions) ? existing.humanRevisions : [],
+        metadata: existing.metadata && typeof existing.metadata === 'object' ? existing.metadata : {},
+        workingDirectory:
+          typeof existing.workingDirectory === 'string'
+            ? existing.workingDirectory
+            : existing?.metadata?.worktreePath || existing?.metadata?.baseWorkingDirectory || null,
+      };
     } else {
       this.state = {
         runId,
@@ -62,6 +72,10 @@ export class PipelineState {
         currentStage: null,
         stages: {},
         pause: null,
+        sideEffects: [],
+        humanRevisions: [],
+        metadata: {},
+        workingDirectory: null,
         createdAt: nowIso(),
         updatedAt: nowIso(),
       };
@@ -102,7 +116,7 @@ export class PipelineState {
     if (stageName === 'completed') {
       this.state.status = 'completed';
       this.state.completedAt = nowIso();
-    } else if (this.state.status === 'PAUSED_HITL') {
+    } else if (typeof this.state.status === 'string' && this.state.status.startsWith('PAUSED_')) {
       this.state.status = 'running';
     }
 
@@ -138,11 +152,84 @@ export class PipelineState {
     this.#persistRun();
   }
 
-  pause(reason, data = null) {
-    this.state.status = 'PAUSED_HITL';
+  setMetadata(key, value) {
+    if (!key || typeof key !== 'string') {
+      throw new Error('setMetadata(key, value) requires a non-empty string key.');
+    }
+
+    if (!this.state.metadata || typeof this.state.metadata !== 'object') {
+      this.state.metadata = {};
+    }
+
+    if (value === undefined) {
+      delete this.state.metadata[key];
+    } else {
+      this.state.metadata[key] = value;
+    }
+
+    this.state.updatedAt = nowIso();
+    this.#persistRun();
+  }
+
+  getMetadata(key) {
+    if (!key || typeof key !== 'string') {
+      return undefined;
+    }
+    return this.state.metadata?.[key];
+  }
+
+  setWorkingDirectory(workingDirectory, options = {}) {
+    const normalized = typeof workingDirectory === 'string' && workingDirectory.trim()
+      ? path.resolve(workingDirectory.trim())
+      : null;
+
+    if (!normalized) {
+      throw new Error('setWorkingDirectory(workingDirectory) requires a non-empty path string.');
+    }
+
+    this.state.workingDirectory = normalized;
+    if (options.base) {
+      this.state.metadata = {
+        ...(this.state.metadata || {}),
+        baseWorkingDirectory: normalized,
+      };
+    }
+    this.state.updatedAt = nowIso();
+    this.#persistRun();
+  }
+
+  getWorkingDirectory() {
+    return this.state.workingDirectory
+      || this.state.metadata?.worktreePath
+      || this.state.metadata?.baseWorkingDirectory
+      || null;
+  }
+
+  setWorktree({ worktreePath, branchName, baseWorkingDirectory = null } = {}) {
+    if (!worktreePath || typeof worktreePath !== 'string') {
+      throw new Error('setWorktree({ worktreePath, branchName }) requires worktreePath.');
+    }
+
+    const normalizedWorktree = path.resolve(worktreePath);
+    this.state.workingDirectory = normalizedWorktree;
+    this.state.metadata = {
+      ...(this.state.metadata || {}),
+      worktreePath: normalizedWorktree,
+      worktreeBranch: branchName || null,
+      baseWorkingDirectory: baseWorkingDirectory
+        ? path.resolve(baseWorkingDirectory)
+        : this.state.metadata?.baseWorkingDirectory || null,
+    };
+    this.state.updatedAt = nowIso();
+    this.#persistRun();
+  }
+
+  pause(reason, data = null, status = 'PAUSED_HITL') {
+    this.state.status = status || 'PAUSED_HITL';
     this.state.pause = {
       reason: reason || null,
       data,
+      status: status || 'PAUSED_HITL',
       pausedAt: nowIso(),
     };
     this.state.updatedAt = nowIso();
@@ -177,6 +264,98 @@ export class PipelineState {
 
     this.state.status = 'failed';
     this.state.failedAt = nowIso();
+    this.state.updatedAt = nowIso();
+    this.#persistRun();
+  }
+
+  recordSideEffect(effect) {
+    if (!effect || typeof effect !== 'object') {
+      throw new Error('recordSideEffect(effect) requires an effect object.');
+    }
+
+    if (!Array.isArray(this.state.sideEffects)) {
+      this.state.sideEffects = [];
+    }
+
+    this.state.sideEffects.push({
+      ...effect,
+      timestamp: effect.timestamp || nowIso(),
+    });
+    this.state.updatedAt = nowIso();
+    this.#persistRun();
+
+    return this.getSideEffects();
+  }
+
+  getSideEffects() {
+    return Array.isArray(this.state.sideEffects) ? [...this.state.sideEffects] : [];
+  }
+
+  addHumanRevision(comments, stageName = null) {
+    const normalized = typeof comments === 'string' ? comments.trim() : '';
+    if (!normalized) {
+      return null;
+    }
+
+    if (!Array.isArray(this.state.humanRevisions)) {
+      this.state.humanRevisions = [];
+    }
+
+    const entry = {
+      comments: normalized,
+      stage: stageName || this.state.currentStage || null,
+      recordedAt: nowIso(),
+    };
+
+    this.state.humanRevisions.push(entry);
+    this.state.updatedAt = nowIso();
+    this.#persistRun();
+    return entry;
+  }
+
+  getLatestHumanRevision() {
+    if (!Array.isArray(this.state.humanRevisions) || this.state.humanRevisions.length === 0) {
+      return null;
+    }
+
+    return this.state.humanRevisions[this.state.humanRevisions.length - 1];
+  }
+
+  resetStages(stageNames) {
+    if (!Array.isArray(stageNames) || stageNames.length === 0) {
+      return;
+    }
+
+    for (const stageName of stageNames) {
+      if (!stageName || typeof stageName !== 'string') {
+        continue;
+      }
+
+      delete this.state.stages[stageName];
+
+      const artifactPath = path.join(this.runDirAbs, `${stageName}.json`);
+      try {
+        if (fs.existsSync(artifactPath)) {
+          fs.unlinkSync(artifactPath);
+        }
+      } catch {
+        // Leave the run resumable even if cleanup is partial.
+      }
+    }
+
+    if (stageNames.includes(this.state.currentStage)) {
+      this.state.currentStage = null;
+    }
+
+    if (stageNames.includes('completed')) {
+      delete this.state.completedAt;
+    }
+
+    if (this.state.status !== 'failed') {
+      this.state.status = 'running';
+    }
+
+    this.state.pause = null;
     this.state.updatedAt = nowIso();
     this.#persistRun();
   }
