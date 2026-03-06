@@ -307,20 +307,13 @@ function createSession(cli, args, cwd, metadata = {}) {
 
     const sessionId = generateSessionId();
 
-    const quotedArgs = args.map(arg => {
-        if (arg.includes(' ') || arg.includes('&') || arg.includes('|') || arg.includes('"') || arg.includes('!')) {
-            return `"${arg.replace(/"/g, '\\"')}"`;
-        }
-        return arg;
-    });
+    console.log(`[${new Date().toISOString()}] Spawn: ${cli} [${args.length} args]`);
 
-    console.log(`[${new Date().toISOString()}] Spawn: ${cli} ${quotedArgs.join(' ')}`);
-
-    const proc = spawn(cli, quotedArgs, {
+    const proc = spawn(cli, args, {
         cwd: cwd || BASE_DIR,
         stdio: ['pipe', 'pipe', 'pipe'],
-        shell: true,
-        env: { ...process.env, CLAUDECODE: undefined }
+        shell: false,
+        env: { ...process.env, CLAUDECODE: undefined, PATH: process.env.PATH }
     });
 
     const session = {

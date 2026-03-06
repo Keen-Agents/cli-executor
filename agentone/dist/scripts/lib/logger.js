@@ -14,7 +14,8 @@ export const EVENT_TYPES = Object.freeze([
   'RESUMED',
   'COST_UPDATE',
   'BUDGET_WARNING',
-  'BUDGET_EXCEEDED'
+  'BUDGET_EXCEEDED',
+  'AUTO_UPGRADE'
 ]);
 
 const EVENT_TYPE_SET = new Set(EVENT_TYPES);
