@@ -30,6 +30,8 @@ const IS_WINDOWS = process.platform === 'win32';
 // ── Slash command registry ───────────────────────────────────────────────────
 const SLASH_COMMANDS = [
   { cmd: '/model',    args: '[claude|codex]', desc: 'Switch or toggle primary model' },
+  { cmd: '/claude',   args: '',               desc: 'Switch to Claude' },
+  { cmd: '/codex',    args: '',               desc: 'Switch to Codex' },
   { cmd: '/spinner',  args: '[name]',         desc: 'Change spinner style' },
   { cmd: '/clear',    args: '',               desc: 'Clear screen (Ctrl+L)' },
   { cmd: '/help',     args: '',               desc: 'Show available commands' },
@@ -260,6 +262,9 @@ class KeenCLI {
     // Process reference (for kill on Ctrl+C)
     this._primaryProcRef = {};
 
+    // Scroll buffer (for resize replay)
+    this._scrollBuffer = [];
+
     // Spinner + elapsed time
     this._spinnerFrame = 0;
     this._spinnerInterval = null;
@@ -293,15 +298,20 @@ class KeenCLI {
   setup() {
     this.w(a.altOn);
     this.w(a.clear);
+    this._prevRows = this.rows;
     this.drawHeader();
     this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
     this.w(a.moveTo(this.scrollStart, 1));
     this.w(a.save);
     this.drawBottom();
 
+    this._resizeTimer = null;
     this._onResize = () => {
-      this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
-      this.drawBottom();
+      // Immediately pause spinner to prevent artifacts during resize
+      this._spinnerActive = false;
+      // Debounce — resize fires many times while dragging
+      if (this._resizeTimer) clearTimeout(this._resizeTimer);
+      this._resizeTimer = setTimeout(() => this._handleResize(), 80);
     };
     process.stdout.on('resize', this._onResize);
 
@@ -318,6 +328,7 @@ class KeenCLI {
     killProc(this._primaryProcRef.proc);
 
     if (this._spinnerInterval) clearInterval(this._spinnerInterval);
+    if (this._resizeTimer) clearTimeout(this._resizeTimer);
     if (this._onResize) process.stdout.removeListener('resize', this._onResize);
     if (this._onStdinData) process.stdin.removeListener('data', this._onStdinData);
 
@@ -332,6 +343,8 @@ class KeenCLI {
   drawBottom() {
     const r = this.rows;
     const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
+
+    this.w(a.hide); // hide cursor to prevent flicker
 
     // Row r-3: top separator
     this.w(a.moveTo(r - 3, 1) + a.clearLine + this.rule());
@@ -370,14 +383,46 @@ class KeenCLI {
       }
     }
 
-    // Park cursor on input line
-    this.w(a.moveTo(r - 2, prefixLen + 1 + visibleCursor));
+    // Park cursor on input line and show it
+    this.w(a.moveTo(r - 2, prefixLen + 1 + visibleCursor) + a.show);
+  }
+
+  // ── Resize ───────────────────────────────────────────────────────────
+  _handleResize() {
+    this.w(a.hide);
+    // Full reset — clear everything
+    this.w(a.resetScroll);
+    this.w(a.clear);
+
+    // Rebuild layout
+    this.drawHeader();
+    this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
+
+    // Replay scroll buffer (content is preserved, artifacts are gone)
+    this.w(a.moveTo(this.scrollStart, 1));
+    for (const text of this._scrollBuffer) {
+      this.w(text);
+    }
+    this.w(a.save);
+
+    // Redraw bottom bar
+    this.drawBottom();
+
+    // Re-enable spinner if we're in the middle of a turn
+    if (this.busy) {
+      this._spinnerActive = true;
+    }
+    this.w(a.show);
   }
 
   // ── Slash commands ─────────────────────────────────────────────────────
   handleSlashCommand(text) {
     const parts = text.split(/\s+/);
     const cmd = parts[0].toLowerCase();
+
+    // /claude and /codex shortcuts
+    if (cmd === '/claude') { this.setPrimaryModel('claude'); return; }
+    if (cmd === '/codex')  { this.setPrimaryModel('codex');  return; }
 
     if (cmd === '/model') {
       const arg = (parts[1] || '').toLowerCase();
@@ -410,6 +455,7 @@ class KeenCLI {
     }
 
     if (cmd === '/clear') {
+      this._scrollBuffer = [];
       this.w(a.clear);
       this.drawHeader();
       this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
@@ -490,9 +536,13 @@ class KeenCLI {
 
   // Write text into the scroll region (auto-saves cursor position)
   scrollWrite(text) {
-    this.w(a.restore);
+    // Buffer for replay on resize
+    this._scrollBuffer.push(text);
+    if (this._scrollBuffer.length > 500) this._scrollBuffer = this._scrollBuffer.slice(-250);
+
+    this.w(a.hide + a.restore);
     this.w(text);
-    this.w(a.save);
+    this.w(a.save + a.show);
   }
 
   // ── Pipeline tag detection ───────────────────────────────────────────
@@ -603,8 +653,11 @@ class KeenCLI {
     const proc = spawn('node', args, {
       cwd: this.workdir,
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: true,
-      env: { ...process.env }
+      shell: false,  // shell:true splits prompt with spaces into separate args
+      env: {
+        ...process.env,
+        BRIDGE_API_TOKEN: process.env.BRIDGE_API_TOKEN || process.env.AGENTONE_API_TOKEN || 'b3d6d5c1a50155e207c503102f7bc610'
+      }
     });
 
     this._primaryProcRef.proc = proc;
@@ -638,6 +691,7 @@ class KeenCLI {
     });
 
     this.pipelineRunning = false;
+    this._stopSpinner();
     this._primaryProcRef = {};
 
     this.scrollWrite('\n' + (result.success
@@ -651,6 +705,11 @@ class KeenCLI {
 
   // ── Spinner (renders in scroll area, not bottom bar) ─────────────────
   _startSpinner() {
+    // Stop any existing spinner interval to prevent leaks
+    if (this._spinnerInterval) {
+      clearInterval(this._spinnerInterval);
+      this._spinnerInterval = null;
+    }
     this._spinnerFrame = 0;
     this._turnStartTime = Date.now();
     this._spinnerActive = true;
@@ -671,7 +730,7 @@ class KeenCLI {
       ? `pipeline \u00b7 ${this._pipelineProfile}`
       : this.primaryModel;
     // Overwrite spinner line in-place (restore to saved pos, don't re-save)
-    this.w(a.restore + a.clearLine + `  ${mc(frame)} ${a.dim(label + ' \u00b7 ' + mm + ':' + ss)}`);
+    this.w(a.hide + a.restore + a.clearLine + `  ${mc(frame)} ${a.dim(label + ' \u00b7 ' + mm + ':' + ss)}` + a.show);
   }
 
   _clearSpinnerLine() {
@@ -724,7 +783,7 @@ class KeenCLI {
     // User prompt echo
     this.scrollWrite(`\n${a.green(a.bold('\u203A'))} ${a.bold(text)}\n\n`);
 
-    // Run primary model (streams to scroll region)
+    // Run primary model — buffer output, display only if no dispatch tags
     const isFirst = this.primaryModel === 'claude' ? this.isFirstClaude : this.isFirstCodex;
     try {
       const result = await runTurn(text, {
@@ -736,17 +795,29 @@ class KeenCLI {
         procRef: this._primaryProcRef,
         onData: (chunk) => {
           this.primaryOutput += chunk;
-          this._clearSpinnerLine();
-          // Filter out dispatch tags from display
-          const display = chunk.replace(/<PIPELINE\s+[^>]*?\/>/g, '').replace(/<SPAWN\s+[^>]*?\/>/g, '');
-          if (display) this.scrollWrite(display);
-          this.drawBottom();
+          // Buffer everything — display decision happens after model finishes.
+          // Spinner keeps running to show activity.
         }
       });
 
       // Update isFirst for the primary model
       if (this.primaryModel === 'claude') this.isFirstClaude = false;
       else this.isFirstCodex = false;
+
+      // Check for dispatch tags
+      const spawnTag = this._extractSpawnTag(this.primaryOutput);
+      const pipelineTag = this._extractPipelineTag(this.primaryOutput);
+
+      // Display buffered output only if it's a plain conversational response
+      if (!spawnTag && !pipelineTag) {
+        this._clearSpinnerLine();
+        const display = this.primaryOutput;
+        if (display.trim()) this.scrollWrite(display);
+
+        const elapsed = ((Date.now() - this._turnStartTime) / 1000).toFixed(1);
+        const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
+        this.scrollWrite('\n' + mc(`${elapsed}s`) + '\n\n');
+      }
 
       // Track conversation (used by Codex for context; Claude uses --continue)
       this.conversationHistory.push({ role: 'user', content: text });
@@ -761,7 +832,6 @@ class KeenCLI {
       }
 
       // ── Spawn tag interception (quick one-shot) ──────────────────
-      const spawnTag = this._extractSpawnTag(this.primaryOutput);
       if (spawnTag) {
         const spawnResult = await this.runSpawnFromTag(spawnTag.cli, spawnTag.prompt);
 
@@ -777,8 +847,8 @@ class KeenCLI {
       }
 
       // ── Pipeline tag interception (full multi-stage) ──────────────
-      const pipelineTag = this._extractPipelineTag(this.primaryOutput);
       if (pipelineTag) {
+        this._clearSpinnerLine();
         const pipelineResult = await this.runPipelineFromTag(pipelineTag.prompt, pipelineTag.profile);
 
         // Feed result back to dispatcher for summarization
@@ -787,7 +857,9 @@ class KeenCLI {
           : `The pipeline failed with exit code ${pipelineResult.code}. Output:\n\n${pipelineResult.output.slice(-4000)}\n\nExplain what went wrong and suggest next steps.`;
 
         this._primaryProcRef = {};
+        this._startSpinner();
         try {
+          let followUpOutput = '';
           const followUp = await runTurn(summaryPrompt, {
             workdir: this.workdir,
             isFirst: false,
@@ -796,13 +868,15 @@ class KeenCLI {
             conversationHistory: this.conversationHistory,
             procRef: this._primaryProcRef,
             onData: (chunk) => {
+              followUpOutput += chunk;
+              this._clearSpinnerLine();
               this.scrollWrite(chunk);
               this.drawBottom();
             }
           });
 
           this.conversationHistory.push({ role: 'user', content: '[pipeline result]' });
-          this.conversationHistory.push({ role: 'assistant', content: followUp.output || '' });
+          this.conversationHistory.push({ role: 'assistant', content: followUpOutput || followUp.output || '' });
           if (this.conversationHistory.length > 20) {
             this.conversationHistory = this.conversationHistory.slice(-20);
           }
@@ -813,11 +887,6 @@ class KeenCLI {
     } catch (err) {
       this.scrollWrite(a.dim(`\n[keen] error: ${err.message}\n`));
     }
-
-    // Elapsed time after response
-    const elapsed = ((Date.now() - this._turnStartTime) / 1000).toFixed(1);
-    const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
-    this.scrollWrite('\n' + mc(`${elapsed}s`) + '\n\n');
 
     this._stopSpinner();
     this._primaryProcRef = {};
@@ -910,6 +979,7 @@ class KeenCLI {
 
     // Ctrl+L — clear screen + redraw header
     if (key === '\x0c') {
+      this._scrollBuffer = [];
       this.w(a.clear);
       this.drawHeader();
       this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));

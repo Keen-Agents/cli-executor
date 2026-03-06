@@ -84,8 +84,11 @@ export async function runAgent(opts) {
         ...(opts?.label ? { label: opts.label } : {})
     };
 
-    // For codex with '-' stdin mode: send prompt as stdinData, bridge writes + closes stdin.
-    const stdinData = cli === 'codex' ? prompt : undefined;
+    // Send prompt via stdin for both CLIs to avoid Windows cmd.exe mangling
+    // multi-line prompts with angle brackets (<COMPLETED> → file redirects).
+    // Claude: `-p` with no prompt arg reads from stdin.
+    // Codex: `exec -` reads from stdin.
+    const stdinData = prompt;
 
     const spawnResult = await bridgeCall('/api/cli/spawn', {
         cli,

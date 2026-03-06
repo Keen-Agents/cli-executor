@@ -112,7 +112,7 @@ export const TIMEOUTS = {
   implement: 900_000,
   verify: 600_000,
   'fix-loop': 420_000,
-  research: 300_000,
+  research: 600_000,
   'test-suite': 600_000,
   'browser-test': 600_000,
   'security-audit': 300_000,

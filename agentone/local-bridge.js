@@ -345,10 +345,14 @@ function createSession(cli, args, cwd, metadata = {}) {
 
     console.log(`[${new Date().toISOString()}] Spawn: ${cli} [${args.length} args]`);
 
+    // Only use shell for .cmd wrappers (codex). Claude is a .exe and doesn't need it.
+    // shell: true on Windows uses cmd.exe which can fail with ENOENT in some envs.
+    const needsShell = IS_WINDOWS && cli.toLowerCase() === 'codex';
+
     const proc = spawn(cli, args, {
         cwd: cwd || BASE_DIR,
         stdio: ['pipe', 'pipe', 'pipe'],
-        shell: IS_WINDOWS,
+        shell: needsShell,
         env: { ...process.env, CLAUDECODE: undefined, PATH: process.env.PATH }
     });
 
@@ -484,78 +488,144 @@ function generateDebugHtml() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AgentOne Debug Dashboard</title>
+<title>Keen Debugger</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e8}
-.header{background:#161b22;border-bottom:1px solid #30363d;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}
-.header h1{font-size:18px;color:#58a6ff}
-.stats{display:flex;gap:16px}
-.stat{background:#21262d;padding:8px 16px;border-radius:6px;font-size:13px}
-.stat .value{font-weight:bold;color:#58a6ff}
-.controls{padding:12px 24px;background:#161b22;border-bottom:1px solid #30363d;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-.controls button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px}
-.controls button:hover{background:#30363d}
-.controls button.danger{border-color:#f85149;color:#f85149}
-.controls button.danger:hover{background:#f85149;color:#fff}
-.container{padding:16px 24px}
-.session-card{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:12px;overflow:hidden}
-.session-header{padding:12px 16px;display:flex;justify-content:space-between;align-items:center;cursor:pointer}
-.session-header:hover{background:#1c2128}
-.session-status{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}
-.session-status.running{background:#3fb950;animation:pulse 2s infinite}
-.session-status.finished{background:#8b949e}
-.session-status.error{background:#f85149}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
-.session-meta{font-size:12px;color:#8b949e;display:flex;gap:12px;align-items:center}
-.session-body{display:none;border-top:1px solid #30363d;padding:16px}
-.session-body.expanded{display:block}
-.agent-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
-.agent-Worker{background:#1f6feb33;color:#58a6ff}
-.agent-Judge{background:#8957e533;color:#bc8cff}
-.agent-TeamLead{background:#3fb95033;color:#3fb950}
-.agent-Reviewer{background:#d2992233;color:#d29922}
-.agent-default{background:#21262d;color:#8b949e}
-.conversation{margin-top:12px}
-.msg{padding:8px 12px;margin:4px 0;border-radius:6px;font-size:13px;white-space:pre-wrap;max-height:300px;overflow-y:auto;word-break:break-word}
-.msg.user{background:#0d1117;border-left:3px solid #58a6ff}
-.msg.assistant{background:#0d1117;border-left:3px solid #3fb950}
-.msg-label{font-size:11px;font-weight:bold;margin-bottom:4px}
+body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:#0a0c10;color:#e1e4e8;line-height:1.5}
+
+/* Scrollbars */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#484f58}
+
+/* Header */
+.header{background:linear-gradient(135deg,#0d1117 0%,#161b22 100%);border-bottom:1px solid #21262d;padding:16px 28px;display:flex;justify-content:space-between;align-items:center}
+.header h1{font-size:20px;font-weight:700;color:#e1e4e8;display:flex;align-items:center;gap:10px}
+.header h1 .icon{font-size:22px;filter:saturate(1.2)}
+.header h1 .brand{color:#79c0ff}
+.stats{display:flex;gap:10px;align-items:center}
+.stat{padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px}
+.stat .label{opacity:0.7}
+.stat .value{font-variant-numeric:tabular-nums}
+.stat-total{background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44}
+.stat-running{background:#23883622;color:#3fb950;border:1px solid #23883644}
+.stat-max{background:#21262d;color:#8b949e;border:1px solid #30363d}
+.stat-time{color:#8b949e;font-size:11px;padding:6px 10px}
+
+/* Controls */
+.controls{padding:10px 28px;background:#0d1117;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.filter-group{display:flex;gap:8px;align-items:center}
+.filter-group select,.filter-group input{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:6px 10px;border-radius:6px;font-size:12px;outline:none;transition:border-color .2s}
+.filter-group select:focus,.filter-group input:focus{border-color:#58a6ff}
+.filter-group input{width:200px}
+.action-group{margin-left:auto;display:flex;gap:8px;align-items:center}
+.btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500;transition:all .15s;display:inline-flex;align-items:center;gap:5px}
+.btn:hover{background:#30363d;border-color:#484f58}
+.btn-danger{border-color:#f8514922;color:#f85149}
+.btn-danger:hover{background:#f8514922;border-color:#f85149}
+.auto-label{font-size:12px;color:#8b949e;display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none}
+.auto-label input{accent-color:#58a6ff}
+
+/* Container */
+.container{padding:16px 28px}
+
+/* Session Cards */
+.session-card{background:#0d1117;border:1px solid #21262d;border-radius:10px;margin-bottom:10px;overflow:hidden;transition:box-shadow .2s,transform .15s}
+.session-card:hover{box-shadow:0 2px 12px #00000040;transform:translateY(-1px)}
+.session-card.is-running{border-top:2px solid #3fb950;border-top-left-radius:10px;border-top-right-radius:10px}
+.session-card.is-running .session-header{padding-top:11px}
+
+.session-header{padding:12px 16px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;transition:background .15s}
+.session-header:hover{background:#161b2288}
+.session-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
+.session-status{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.session-status.running{background:#3fb950;box-shadow:0 0 8px #3fb95066;animation:pulse 2s infinite}
+.session-status.finished{background:#484f58}
+.session-status.error{background:#f85149;box-shadow:0 0 6px #f8514944}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+.cli-badge{display:inline-flex;align-items:center;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;flex-shrink:0}
+.cli-claude{background:#1f6feb22;color:#79c0ff;border:1px solid #1f6feb44}
+.cli-codex{background:#23883622;color:#56d364;border:1px solid #23883644}
+.cli-unknown{background:#21262d;color:#8b949e;border:1px solid #30363d}
+
+.session-label{font-weight:600;font-size:14px;color:#e1e4e8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.session-right{display:flex;align-items:center;gap:14px;flex-shrink:0}
+.meta-item{font-size:12px;color:#8b949e;font-variant-numeric:tabular-nums;white-space:nowrap}
+.meta-item .dim{opacity:0.5}
+.meta-item.exit-ok{color:#3fb950}
+.meta-item.exit-err{color:#f85149}
+.meta-item.exit-run{color:#d29922}
+.kill-btn{background:none;border:1px solid #f8514944;color:#f85149;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;transition:all .15s}
+.kill-btn:hover{background:#f85149;color:#fff;border-color:#f85149}
+
+/* Expand/Collapse */
+.session-body{max-height:0;overflow:hidden;transition:max-height .3s ease-out,padding .3s;padding:0 16px;border-top:0 solid transparent}
+.session-body.expanded{max-height:3000px;padding:16px;border-top:1px solid #21262d;transition:max-height .5s ease-in,padding .3s}
+
+.info-row{font-size:12px;color:#6e7681;margin-bottom:12px;display:flex;gap:16px;flex-wrap:wrap}
+.info-row span{display:inline-flex;align-items:center;gap:4px}
+
+/* Conversation */
+.conversation{margin-top:8px;display:flex;flex-direction:column;gap:8px}
+.msg-pair{display:flex;flex-direction:column;gap:4px}
+.msg{padding:10px 14px;border-radius:8px;font-size:13px;white-space:pre-wrap;max-height:300px;overflow-y:auto;word-break:break-word;line-height:1.5}
+.msg.user{background:#161b22;border-left:3px solid #58a6ff}
+.msg.assistant{background:#161b22;border-left:3px solid #3fb950}
+.msg-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;padding-left:4px}
 .msg-label.user{color:#58a6ff}
 .msg-label.assistant{color:#3fb950}
-.kill-btn{background:none;border:1px solid #f85149;color:#f85149;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px}
-.kill-btn:hover{background:#f85149;color:#fff}
-.raw-output{background:#0d1117;padding:12px;border-radius:6px;font-family:'Cascadia Code',monospace;font-size:12px;white-space:pre-wrap;max-height:400px;overflow-y:auto;margin-top:8px;word-break:break-word}
-.refresh-indicator{color:#3fb950;font-size:12px}
-.filter-bar{display:flex;gap:8px;align-items:center}
-.filter-bar select,.filter-bar input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;padding:4px 8px;border-radius:4px;font-size:12px}
-.empty-state{color:#8b949e;padding:40px;text-align:center}
+.msg-meta{font-size:11px;color:#6e7681;margin-top:10px;padding-top:8px;border-top:1px solid #21262d;display:flex;gap:16px;flex-wrap:wrap}
+.msg-meta span{display:inline-flex;align-items:center;gap:4px}
+
+/* Raw Output */
+.raw-section{margin-top:12px;position:relative}
+.raw-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.raw-header span{font-size:12px;font-weight:600;color:#6e7681;text-transform:uppercase;letter-spacing:.5px}
+.copy-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;transition:all .15s}
+.copy-btn:hover{background:#30363d;color:#e1e4e8}
+.copy-btn.copied{background:#23883633;color:#3fb950;border-color:#23883644}
+.raw-output{background:#161b22;padding:14px;border-radius:8px;font-family:'Cascadia Code','Fira Code',monospace;font-size:12px;white-space:pre-wrap;max-height:400px;overflow-y:auto;word-break:break-word;line-height:1.6;border:1px solid #21262d}
+/* JSON syntax highlights */
+.raw-output .json-key{color:#79c0ff}
+.raw-output .json-str{color:#a5d6ff}
+.raw-output .json-num{color:#d29922}
+.raw-output .json-bool{color:#ff7b72}
+.raw-output .json-null{color:#8b949e}
+.raw-output .completed-tag{background:#23883622;color:#3fb950;padding:1px 4px;border-radius:3px}
+
+/* Empty State */
+.empty-state{color:#6e7681;padding:60px 40px;text-align:center}
+.empty-state .empty-icon{font-size:48px;margin-bottom:12px;opacity:.4}
+.empty-state p{font-size:14px}
 </style>
 </head>
 <body>
 <div class="header">
-    <h1>AgentOne Debug Dashboard</h1>
+    <h1><span class="icon">&#9889;</span> <span class="brand">Keen</span> Debugger</h1>
     <div class="stats">
-        <div class="stat">Total: <span class="value" id="stat-total">0</span></div>
-        <div class="stat">Running: <span class="value" id="stat-running">0</span></div>
-        <div class="stat">Max: <span class="value">${MAX_CONCURRENT}</span></div>
-        <div class="stat refresh-indicator" id="last-refresh">--</div>
+        <div class="stat stat-total"><span class="label">Total</span> <span class="value" id="stat-total">0</span></div>
+        <div class="stat stat-running"><span class="label">Running</span> <span class="value" id="stat-running">0</span></div>
+        <div class="stat stat-max"><span class="label">Max</span> <span class="value">${MAX_CONCURRENT}</span></div>
+        <span class="stat-time" id="last-refresh">--</span>
     </div>
 </div>
 <div class="controls">
-    <div class="filter-bar">
-        <label style="font-size:12px">Filter:</label>
-        <select id="filter-status"><option value="all">All</option><option value="running">Running</option><option value="finished">Finished</option></select>
+    <div class="filter-group">
+        <select id="filter-status"><option value="all">All Status</option><option value="running">Running</option><option value="finished">Finished</option></select>
         <select id="filter-agent"><option value="all">All Agents</option></select>
-        <input type="text" id="filter-search" placeholder="Search label/id..." />
+        <input type="text" id="filter-search" placeholder="Search sessions..." />
     </div>
-    <button onclick="refreshData()">Refresh Now</button>
-    <button class="danger" onclick="killAll()">Kill All</button>
-    <button class="danger" onclick="cleanupSessions()">Cleanup Finished</button>
-    <label style="font-size:12px"><input type="checkbox" id="auto-refresh" checked /> Auto (5s)</label>
+    <div class="action-group">
+        <button class="btn" onclick="refreshData()">Refresh</button>
+        <button class="btn btn-danger" onclick="killAll()">Kill All</button>
+        <button class="btn btn-danger" onclick="cleanupSessions()">Cleanup</button>
+        <label class="auto-label"><input type="checkbox" id="auto-refresh" checked /> Auto 5s</label>
+    </div>
 </div>
 <div class="container" id="sessions-container">
-    <p class="empty-state">Loading sessions...</p>
+    <div class="empty-state"><div class="empty-icon">&#9889;</div><p>Loading sessions...</p></div>
 </div>
 <script>
 const API_TOKEN='${API_TOKEN}';
@@ -578,7 +648,7 @@ async function refreshData(){
         allSessions=d.sessions||[];
         document.getElementById('stat-total').textContent=d.total;
         document.getElementById('stat-running').textContent=d.running;
-        document.getElementById('last-refresh').textContent='Updated: '+new Date().toLocaleTimeString();
+        document.getElementById('last-refresh').textContent=new Date().toLocaleTimeString();
         updateAgentFilter();
         renderSessions();
         expandedSessions.forEach(id=>{loadRaw(id);loadHistory(id)});
@@ -610,31 +680,54 @@ function getFiltered(){
 function renderSessions(){
     const c=document.getElementById('sessions-container');
     const f=getFiltered();
-    if(!f.length){c.innerHTML='<p class="empty-state">No sessions match filters.</p>';return}
+    if(!f.length){c.innerHTML='<div class="empty-state"><div class="empty-icon">&#128269;</div><p>No sessions match filters.</p></div>';return}
     f.sort((a,b)=>{if(a.running!==b.running)return a.running?-1:1;return new Date(b.startedAt)-new Date(a.startedAt)});
     c.innerHTML=f.map(s=>renderCard(s)).join('');
 }
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
+function fmtDuration(sec){
+    if(sec>=60){
+        const m=Math.floor(sec/60);
+        const s=sec%60;
+        return m+'<span class="dim">m</span> '+s+'<span class="dim">s</span>';
+    }
+    return sec+'<span class="dim">s</span>';
+}
+
 function renderCard(s){
     const sc=s.running?'running':(s.exitCode!==0?'error':'finished');
-    const ac='agent-'+(s.agentType||'default');
     const ex=expandedSessions.has(s.id);
-    const rt=s.runtimeSeconds>=60?Math.floor(s.runtimeSeconds/60)+'m '+(s.runtimeSeconds%60)+'s':s.runtimeSeconds+'s';
-    return '<div class="session-card">'
+    const cli=(s.cli||'unknown').toLowerCase();
+    const cliBadge='cli-'+(cli==='claude'||cli==='codex'?cli:'unknown');
+    const exitClass=s.running?'exit-run':(s.exitCode===0?'exit-ok':'exit-err');
+    const exitText=s.running?'running':String(s.exitCode);
+    return '<div class="session-card'+(s.running?' is-running':'')+'">'
         +'<div class="session-header" onclick="toggle(\\''+s.id+'\\')">'
-        +'<div><span class="session-status '+sc+'"></span>'
-        +'<span class="agent-badge '+ac+'">'+(s.agentType||'unknown')+'</span>'
-        +'<strong style="margin-left:8px">'+esc(s.label||s.id)+'</strong></div>'
-        +'<div class="session-meta"><span>PID: '+s.pid+'</span><span>'+rt+'</span><span>'+((s.stdoutLength/1024).toFixed(1))+'KB</span>'
+        +'<div class="session-left">'
+        +'<span class="session-status '+sc+'"></span>'
+        +'<span class="cli-badge '+cliBadge+'">'+esc(cli)+'</span>'
+        +'<span class="session-label">'+esc(s.label||s.id)+'</span>'
+        +'</div>'
+        +'<div class="session-right">'
+        +'<span class="meta-item">PID '+s.pid+'</span>'
+        +'<span class="meta-item">'+fmtDuration(s.runtimeSeconds)+'</span>'
+        +'<span class="meta-item">'+((s.stdoutLength/1024).toFixed(1))+'<span class="dim">KB</span></span>'
+        +'<span class="meta-item '+exitClass+'">'+exitText+'</span>'
         +(s.running?'<button class="kill-btn" onclick="event.stopPropagation();killSession(\\''+s.id+'\\')">Kill</button>':'')
         +'</div></div>'
         +'<div class="session-body '+(ex?'expanded':'')+'" id="body-'+s.id+'">'
-        +'<div style="font-size:12px;color:#8b949e;margin-bottom:8px">ID: '+s.id+' | CLI: '+s.cli+' | Pipeline: '+(s.pipelineRunId||'-')+' | Subtask: '+(s.subtaskId||'-')+' | Exit: '+(s.exitCode??'running')+'</div>'
-        +'<div id="hist-'+s.id+'" style="margin-bottom:8px"></div>'
-        +'<div style="font-size:12px;font-weight:bold;color:#8b949e;margin-bottom:4px">Raw Output</div>'
+        +'<div class="info-row">'
+        +'<span>ID: '+s.id+'</span>'
+        +'<span>Pipeline: '+(s.pipelineRunId||'-')+'</span>'
+        +'<span>Subtask: '+(s.subtaskId||'-')+'</span>'
+        +'</div>'
+        +'<div id="hist-'+s.id+'"></div>'
+        +'<div class="raw-section">'
+        +'<div class="raw-header"><span>Raw Output</span><button class="copy-btn" onclick="event.stopPropagation();copyRaw(\\''+s.id+'\\',this)">Copy</button></div>'
         +'<div class="raw-output" id="raw-'+s.id+'">Loading...</div>'
+        +'</div>'
         +'</div></div>';
 }
 
@@ -645,36 +738,63 @@ function toggle(id){
     if(expandedSessions.has(id)){loadRaw(id);loadHistory(id)}
 }
 
+function highlightJson(text){
+    return esc(text)
+        .replace(/&lt;\\/?COMPLETED&gt;/g,'<span class="completed-tag">$&</span>')
+        .replace(/"([^"]*)"\\s*:/g,'<span class="json-key">"$1"</span>:')
+        .replace(/:\\s*"([^"]*)"/g,': <span class="json-str">"$1"</span>')
+        .replace(/:\\s*(-?\\d+\\.?\\d*)/g,': <span class="json-num">$1</span>')
+        .replace(/:\\s*(true|false)/g,': <span class="json-bool">$1</span>')
+        .replace(/:\\s*(null)/g,': <span class="json-null">$1</span>');
+}
+
 async function loadRaw(id){
     try{
         const d=await apiFetch('/api/cli/output',{sessionId:id,full:true});
         const el=document.getElementById('raw-'+id);
-        if(el)el.textContent=d.stdout||'(no output)';
-    }catch(e){const el=document.getElementById('raw-'+id);if(el)el.textContent='Error: '+e.message}
+        if(el){
+            const text=d.stdout||'(no output)';
+            el.dataset.raw=text;
+            el.innerHTML=highlightJson(text);
+        }
+    }catch(e){const el=document.getElementById('raw-'+id);if(el){el.textContent='Error: '+e.message}}
+}
+
+function copyRaw(id,btn){
+    const el=document.getElementById('raw-'+id);
+    if(!el)return;
+    const text=el.dataset.raw||el.textContent;
+    navigator.clipboard.writeText(text).then(()=>{
+        btn.textContent='Copied!';
+        btn.classList.add('copied');
+        setTimeout(()=>{btn.textContent='Copy';btn.classList.remove('copied')},1500);
+    });
 }
 
 async function loadHistory(id){
     const el=document.getElementById('hist-'+id);
     if(!el)return;
-    el.innerHTML='<span style="font-size:12px;color:#8b949e">Loading...</span>';
+    el.innerHTML='<span style="font-size:12px;color:#6e7681">Loading history...</span>';
     try{
         const d=await apiFetch('/api/cli/history',{sessionId:id});
         if(d.history&&d.history.pairs&&d.history.pairs.length>0){
             let html='<div class="conversation">';
             d.history.pairs.forEach(p=>{
+                html+='<div class="msg-pair">';
                 if(p.user)html+='<div class="msg-label user">User</div><div class="msg user">'+esc(p.user)+'</div>';
                 if(p.assistant)html+='<div class="msg-label assistant">Assistant</div><div class="msg assistant">'+esc(p.assistant)+'</div>';
+                html+='</div>';
             });
             html+='</div>';
             let meta=[];
-            if(d.history.usage)meta.push('Tokens: in='+(d.history.usage.input_tokens||0)+' out='+(d.history.usage.output_tokens||0));
-            if(d.history.cost)meta.push('Cost: $'+d.history.cost.toFixed(4));
-            if(d.history.durationMs)meta.push('Duration: '+(d.history.durationMs/1000).toFixed(1)+'s');
-            if(d.history.numTurns)meta.push('Turns: '+d.history.numTurns);
-            if(meta.length)html+='<div style="font-size:11px;color:#8b949e;margin-top:8px">'+meta.join(' | ')+'</div>';
+            if(d.history.usage)meta.push('<span>Tokens: '+(d.history.usage.input_tokens||0)+' in / '+(d.history.usage.output_tokens||0)+' out</span>');
+            if(d.history.cost)meta.push('<span>Cost: $'+d.history.cost.toFixed(4)+'</span>');
+            if(d.history.durationMs)meta.push('<span>Duration: '+(d.history.durationMs/1000).toFixed(1)+'s</span>');
+            if(d.history.numTurns)meta.push('<span>Turns: '+d.history.numTurns+'</span>');
+            if(meta.length)html+='<div class="msg-meta">'+meta.join('')+'</div>';
             el.innerHTML=html;
         }else{
-            el.innerHTML='<span style="font-size:12px;color:#8b949e">No structured history (raw output only).</span>';
+            el.innerHTML='<span style="font-size:12px;color:#6e7681">No structured history (raw output only).</span>';
         }
     }catch(e){el.innerHTML='<span style="font-size:12px;color:#f85149">Error: '+e.message+'</span>'}
 }
