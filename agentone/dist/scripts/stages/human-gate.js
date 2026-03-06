@@ -90,14 +90,18 @@ function readDecisionFile(decisionPath) {
 }
 
 export async function run(context) {
+  const instanceName = context.stageName || STAGE_NAME;
   const requestedAt = new Date().toISOString();
   const maxWaitMs = TIMEOUTS[STAGE_NAME];
   const runId = context.state.runId;
   const runDir = path.resolve(context.runDir || context.state.getRunDir());
-  const requestPath = path.join(runDir, REQUEST_FILE);
-  const decisionPath = path.join(runDir, DECISION_FILE);
+  const instanceSuffix = instanceName !== STAGE_NAME ? `-${instanceName.replace(':', '-')}` : '';
+  const requestFile = instanceSuffix ? `human-decision-request${instanceSuffix}.json` : REQUEST_FILE;
+  const decisionFile = instanceSuffix ? `human-decision${instanceSuffix}.json` : DECISION_FILE;
+  const requestPath = path.join(runDir, requestFile);
+  const decisionPath = path.join(runDir, decisionFile);
 
-  context.state.stageStart(STAGE_NAME);
+  context.state.stageStart(instanceName);
 
   try {
     const ticket = context.state.getStageOutput('intake') || null;
@@ -109,7 +113,7 @@ export async function run(context) {
 
     const requestPayload = {
       requestedAt,
-      stage: STAGE_NAME,
+      stage: instanceName,
       runId,
       ticketKey: context.ticketKey,
       profile,
@@ -123,42 +127,42 @@ export async function run(context) {
     fs.mkdirSync(runDir, { recursive: true });
     fs.writeFileSync(requestPath, `${JSON.stringify(requestPayload, null, 2)}\n`, 'utf8');
 
-    context.state.pause('human_gate', { requestFile: REQUEST_FILE });
+    context.state.pause('human_gate', { requestFile: requestFile });
     context.logger?.log({
       type: 'PAUSED_HITL',
-      stage: STAGE_NAME,
+      stage: instanceName,
       reason: 'human_gate',
-      requestFile: REQUEST_FILE
+      requestFile: requestFile
     });
 
-    console.log('[human-gate] Pipeline paused for human review.');
-    console.log(`[human-gate] Review: logs/pipeline-runs/${runId}/human-decision-request.json`);
-    console.log(`[human-gate] To continue, create: logs/pipeline-runs/${runId}/human-decision.json`);
-    console.log('[human-gate] Format: { "decision": "approve|revise|reject", "comments": "..." }');
+    console.log(`[${instanceName}] Pipeline paused for human review.`);
+    console.log(`[${instanceName}] Review: logs/pipeline-runs/${runId}/${requestFile}`);
+    console.log(`[${instanceName}] To continue, create: logs/pipeline-runs/${runId}/${decisionFile}`);
+    console.log(`[${instanceName}] Format: { "decision": "approve|revise|reject", "comments": "..." }`);
 
     let finalDecision = null;
     while (!finalDecision) {
       const elapsedMs = Date.now() - Date.parse(requestedAt);
       if (elapsedMs >= maxWaitMs) {
         context.state.pause('budget_timeout', {
-          stage: STAGE_NAME,
+          stage: instanceName,
           reason: 'budget_timeout',
           waitDurationMs: elapsedMs,
-          requestFile: REQUEST_FILE
+          requestFile: requestFile
         });
         context.logger?.log({
           type: 'PAUSED_HITL',
-          stage: STAGE_NAME,
+          stage: instanceName,
           reason: 'budget_timeout',
           waitDurationMs: elapsedMs
         });
-        throw new Error(`Timed out waiting for ${DECISION_FILE} after ${elapsedMs}ms`);
+        throw new Error(`Timed out waiting for ${decisionFile} after ${elapsedMs}ms`);
       }
 
       try {
         finalDecision = readDecisionFile(decisionPath);
       } catch (error) {
-        console.log(`[human-gate] Invalid ${DECISION_FILE}: ${error instanceof Error ? error.message : String(error)}`);
+        console.log(`[${instanceName}] Invalid ${decisionFile}: ${error instanceof Error ? error.message : String(error)}`);
       }
 
       if (!finalDecision) {
@@ -179,23 +183,23 @@ export async function run(context) {
     if (output.decision === 'revise') {
       context.logger?.log({
         type: 'GATE_CHECK',
-        stage: STAGE_NAME,
+        stage: instanceName,
         gate: 'human_revision_requested',
         comments: output.comments
       });
     }
 
     context.state.resume(output.decision);
-    context.state.checkpoint(STAGE_NAME, output);
+    context.state.checkpoint(instanceName, output);
     context.logger?.log({
       type: 'RESUMED',
-      stage: STAGE_NAME,
+      stage: instanceName,
       decision: output.decision
     });
 
     if (output.decision === 'reject') {
       const reason = output.comments || 'Human rejected the pipeline run.';
-      context.state.fail(STAGE_NAME, reason);
+      context.state.fail(instanceName, reason);
       throw new Error(reason);
     }
 
@@ -203,7 +207,7 @@ export async function run(context) {
   } catch (error) {
     context.logger?.log({
       type: 'STAGE_FAILED',
-      stage: STAGE_NAME,
+      stage: instanceName,
       error: error instanceof Error ? error.message : String(error)
     });
     throw error;

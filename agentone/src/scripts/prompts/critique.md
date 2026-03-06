@@ -19,6 +19,8 @@ Critically review the implementation plan above. Focus on:
 
 Be specific and actionable. Reference exact parts of the plan when critiquing. Don't just say "needs improvement" — say what specifically should change and why.
 
+If the plan adequately addresses all concerns (including those from prior rounds), state clearly that there are no significant remaining issues. Do not invent minor or contradictory concerns to justify additional changes — if the plan is solid, say so.
+
 If the plan is solid and you have no significant issues, say so clearly.
 
 When you are done, wrap your critique in a COMPLETED tag:

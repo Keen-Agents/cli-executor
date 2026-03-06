@@ -13,6 +13,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const CRITIQUE_PROMPT_TEMPLATE_PATH = resolve(__dirname, '../prompts/critique.md');
 
+const CONVERGENCE_PHRASES = [
+  /no significant (?:remaining )?issues/i,
+  /plan is solid/i,
+  /no major (?:changes|issues|concerns) (?:needed|remaining|found)/i,
+  /plan adequately addresses/i,
+  /no critical (?:issues|problems|flaws)/i,
+  /well[- ]structured (?:and |plan )/i,
+  /ready for implementation/i,
+];
+const CHANGE_RATIO_THRESHOLD = 0.10;
+
 function asText(value) {
   if (typeof value === 'string') {
     return value;
@@ -31,8 +42,44 @@ function fillTemplate(template, replacements) {
   return output;
 }
 
-function buildRevisionPrompt({ ticket, currentPlan, critique, round, maxRounds }) {
-  return [
+function normalizePlanLines(text) {
+  return text
+    .toLowerCase()
+    .replace(/[#*_`~>|]/g, '')
+    .split('\n')
+    .map(line => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+function computeChangeRatio(planA, planB) {
+  const linesA = normalizePlanLines(planA);
+  const linesB = normalizePlanLines(planB);
+  if (linesA.length === 0 && linesB.length === 0) return 0;
+
+  const setA = new Set(linesA);
+  const setB = new Set(linesB);
+  let changed = 0;
+  for (const line of setB) {
+    if (!setA.has(line)) changed += 1;
+  }
+  for (const line of setA) {
+    if (!setB.has(line)) changed += 1;
+  }
+  const total = Math.max(linesA.length, linesB.length);
+  return total === 0 ? 0 : changed / total;
+}
+
+function detectCritiqueConvergence(critiqueText) {
+  for (const pattern of CONVERGENCE_PHRASES) {
+    if (pattern.test(critiqueText)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildRevisionPrompt({ ticket, currentPlan, critique, round, maxRounds, priorCritiques }) {
+  const parts = [
     'You are the original planner revising an implementation plan based on critique.',
     '',
     `Ticket: ${asText(ticket?.key)}`,
@@ -42,17 +89,32 @@ function buildRevisionPrompt({ ticket, currentPlan, critique, round, maxRounds }
     'Current Plan:',
     currentPlan,
     '',
-    'Critique To Address:',
+  ];
+
+  if (priorCritiques && priorCritiques.length > 0) {
+    parts.push('Prior Round Critiques (already addressed):');
+    for (const prior of priorCritiques) {
+      parts.push(`--- Round ${prior.round} ---`);
+      parts.push(prior.text);
+      parts.push('');
+    }
+  }
+
+  parts.push(
+    'Latest Critique To Address:',
     critique,
     '',
-    'Revise the plan to address the critique while keeping it practical and complete.',
+    'Revise the plan to address the latest critique while keeping it practical and complete.',
+    'Do not re-introduce issues that prior rounds already resolved.',
     'If the critique is already addressed, keep the plan unchanged and state that briefly inside the plan.',
     '',
     'Return only the revised plan wrapped in tags:',
     '<COMPLETED>',
     '[Revised plan]',
     '</COMPLETED>'
-  ].join('\n');
+  );
+
+  return parts.join('\n');
 }
 
 export async function run(context) {
@@ -97,21 +159,26 @@ export async function run(context) {
 
     const critiqueTemplate = readFileSync(CRITIQUE_PROMPT_TEMPLATE_PATH, 'utf8');
     const rounds = [];
+    const priorCritiques = [];
     let currentPlan = initialPlan;
-    let priorCritique = '';
     let converged = false;
+    let convergenceReason = null;
 
     for (let round = 1; round <= maxRounds; round += 1) {
+      const priorCritiqueBlock = priorCritiques.length > 0
+        ? priorCritiques.map(p => `### Round ${p.round} Critique\n${p.text}`).join('\n\n')
+        : '';
+
       let critiquePrompt = fillTemplate(critiqueTemplate, {
         '{{TICKET_KEY}}': asText(intakeOutput.key),
         '{{TICKET_SUMMARY}}': asText(intakeOutput.summary),
         '{{PLAN}}': currentPlan,
         '{{ROUND}}': String(round),
         '{{MAX_ROUNDS}}': String(maxRounds),
-        '{{PRIOR_CRITIQUE}}': priorCritique
+        '{{PRIOR_CRITIQUE}}': priorCritiqueBlock
       });
 
-      const contextBlock = assembleContext(context.state, 'cross-critique', 100000, { otherPlan: currentPlan, priorCritique });
+      const contextBlock = assembleContext(context.state, 'cross-critique', 100000, { otherPlan: currentPlan, priorCritique: priorCritiqueBlock });
       if (contextBlock) {
         critiquePrompt += '\n\n## Additional Context\n' + contextBlock;
       }
@@ -146,18 +213,36 @@ export async function run(context) {
       }
 
       const critiqueText = critiqueResult.content.trim();
+
+      // Check critique-side convergence: critic says plan is solid
+      const critiqueSignalsConverged = detectCritiqueConvergence(critiqueText);
+
       let revisedPlan = '';
       let revisionSessionId = null;
       let revisionDurationMs = null;
+      let changeRatio = null;
 
-      const shouldRevise = maxRounds > 1;
-      if (shouldRevise) {
+      if (critiqueSignalsConverged) {
+        // Critic says no significant issues — skip revision, converge
+        converged = true;
+        convergenceReason = 'critique_approved';
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'convergence',
+          round,
+          method: 'critique_approved',
+          message: 'Critic indicated plan is solid; skipping revision.'
+        });
+      } else {
+        // Critic has issues — run revision
         const revisionPrompt = buildRevisionPrompt({
           ticket: intakeOutput,
           currentPlan,
           critique: critiqueText,
           round,
-          maxRounds
+          maxRounds,
+          priorCritiques
         });
 
         const revisionResult = await runAgent({
@@ -193,11 +278,27 @@ export async function run(context) {
         revisionSessionId = revisionResult.sessionId || null;
         revisionDurationMs = revisionResult.durationMs;
 
-        if (revisedPlan === currentPlan) {
+        // Check diff-based convergence
+        changeRatio = computeChangeRatio(currentPlan, revisedPlan);
+        if (changeRatio <= CHANGE_RATIO_THRESHOLD) {
           converged = true;
+          convergenceReason = 'low_change_ratio';
         }
+
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'convergence',
+          round,
+          changeRatio: Math.round(changeRatio * 1000) / 1000,
+          threshold: CHANGE_RATIO_THRESHOLD,
+          converged
+        });
+
         currentPlan = revisedPlan || currentPlan;
       }
+
+      priorCritiques.push({ round, text: critiqueText });
 
       rounds.push({
         round,
@@ -206,11 +307,24 @@ export async function run(context) {
         critiqueSessionId: critiqueResult.sessionId || '',
         revisionSessionId,
         critiqueDurationMs: critiqueResult.durationMs,
-        revisionDurationMs
+        revisionDurationMs,
+        critiqueSignalsConverged,
+        changeRatio
       });
 
-      priorCritique = critiqueText;
       if (converged) {
+        break;
+      }
+
+      // Budget check between rounds
+      if (context.costTracker?.checkBudget?.()) {
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'budget',
+          round,
+          message: 'Budget exceeded during cross-critique; stopping early.'
+        });
         break;
       }
     }
@@ -219,7 +333,8 @@ export async function run(context) {
       rounds,
       finalPlan: currentPlan,
       totalRounds: rounds.length,
-      converged
+      converged,
+      convergenceReason
     };
 
     context.state.checkpoint(STAGE_NAME, output);

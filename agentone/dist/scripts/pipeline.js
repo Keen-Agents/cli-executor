@@ -115,6 +115,16 @@ async function runWithTimeout(stageName, timeoutMs, stageFn, context) {
   }
 }
 
+function resolveStageInstances(stageList) {
+  const counts = {};
+  return stageList.map(name => {
+    counts[name] = (counts[name] || 0) + 1;
+    return counts[name] > 1
+      ? { baseName: name, instanceName: `${name}:${counts[name]}` }
+      : { baseName: name, instanceName: name };
+  });
+}
+
 function buildStagePlan({ forcedProfile, state }) {
   if (forcedProfile) {
     const forced = PROFILES[forcedProfile];
@@ -173,13 +183,14 @@ async function runPipeline(input) {
 
   console.log(`[pipeline] Starting run ${runId}`);
 
+  const stageInstances = resolveStageInstances(stageList);
   let stageIndex = 0;
-  while (stageIndex < stageList.length) {
-    const stageName = stageList[stageIndex];
+  while (stageIndex < stageInstances.length) {
+    const { baseName: stageName, instanceName } = stageInstances[stageIndex];
     stageIndex += 1;
 
-    if (state.isCompleted(stageName)) {
-      console.log(`[pipeline] Skipping ${stageName} (already completed)`);
+    if (state.isCompleted(instanceName)) {
+      console.log(`[pipeline] Skipping ${instanceName} (already completed)`);
       continue;
     }
 
@@ -191,7 +202,7 @@ async function runPipeline(input) {
     const budgetCheck = costTracker.checkBudget();
     if (budgetCheck.status === 'exceeded') {
       state.pause('budget_exceeded', { spent: budgetCheck.spent });
-      logger.log({ type: 'BUDGET_EXCEEDED', stage: stageName, spent: budgetCheck.spent });
+      logger.log({ type: 'BUDGET_EXCEEDED', stage: instanceName, spent: budgetCheck.spent });
       console.log(`[pipeline] Budget exceeded ($${budgetCheck.spent}). Pipeline paused.`);
       break;
     }
@@ -199,7 +210,7 @@ async function runPipeline(input) {
     if (budgetCheck.status === 'warning') {
       logger.log({
         type: 'BUDGET_WARNING',
-        stage: stageName,
+        stage: instanceName,
         spent: budgetCheck.spent,
         remaining: budgetCheck.remaining
       });
@@ -213,15 +224,16 @@ async function runPipeline(input) {
       costTracker,
       config: profileConfig,
       runDir,
-      ticketKey
+      ticketKey,
+      stageName: instanceName
     };
 
     try {
-      logger.log({ type: 'STAGE_STARTED', stage: stageName });
-      const result = await runWithTimeout(stageName, stageTimeout, STAGE_MAP[stageName], context);
-      logger.log({ type: 'STAGE_COMPLETED', stage: stageName });
+      logger.log({ type: 'STAGE_STARTED', stage: instanceName });
+      const result = await runWithTimeout(instanceName, stageTimeout, STAGE_MAP[stageName], context);
+      logger.log({ type: 'STAGE_COMPLETED', stage: instanceName });
 
-      const stageCost = costTracker.getStageCost(stageName);
+      const stageCost = costTracker.getStageCost(instanceName);
       const elapsed = formatDuration(Date.now() - stageStart);
 
       if (stageName === 'classify' && !forcedProfile) {
@@ -233,6 +245,8 @@ async function runPipeline(input) {
         profileName = selectedProfile;
         profileConfig = PROFILES[selectedProfile];
         stageList = profileConfig.stages;
+        stageInstances.length = 0;
+        stageInstances.push(...resolveStageInstances(stageList));
         state.setProfile(selectedProfile);
 
         const updatedThresholds = budgetThresholds(profileConfig.budget);
@@ -241,16 +255,16 @@ async function runPipeline(input) {
           hard: updatedThresholds.hard
         };
 
-        console.log(`[pipeline] Stage: ${stageName}... ${selectedProfile} profile selected (${elapsed})`);
+        console.log(`[pipeline] Stage: ${instanceName}... ${selectedProfile} profile selected (${elapsed})`);
       } else {
         const costSuffix = stageCost.totalCost > 0 ? `, $${stageCost.totalCost}` : '';
-        console.log(`[pipeline] Stage: ${stageName}... done (${elapsed}${costSuffix})`);
+        console.log(`[pipeline] Stage: ${instanceName}... done (${elapsed}${costSuffix})`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.log({ type: 'STAGE_FAILED', stage: stageName, error: message });
-      state.fail(stageName, err);
-      console.error(`[pipeline] Stage ${stageName} failed: ${message}`);
+      logger.log({ type: 'STAGE_FAILED', stage: instanceName, error: message });
+      state.fail(instanceName, err);
+      console.error(`[pipeline] Stage ${instanceName} failed: ${message}`);
       break;
     }
   }
