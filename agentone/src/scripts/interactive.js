@@ -452,10 +452,12 @@ class KeenCLI {
       });
 
       this.secondaryOutput = result.fullOutput || result.content || result.rawStdout || '';
-      this.secondaryStatus = result.success ? 'done' : 'error';
+      this.secondaryStatus = (result.exitCode === 0 || result.success) ? 'done' : 'error';
 
-      if (!result.success) {
-        this.secondaryError = result.timedOut ? 'Timed out' : 'Failed';
+      if (this.secondaryStatus === 'error') {
+        this.secondaryError = result.timedOut ? 'Timed out'
+          : result.exitCode ? `exit ${result.exitCode}`
+          : 'Failed';
       }
     } catch (err) {
       this.secondaryStatus = 'error';

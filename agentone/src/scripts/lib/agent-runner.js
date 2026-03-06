@@ -66,7 +66,7 @@ export async function bridgeCall(endpoint, body) {
 export async function runAgent(opts) {
     const timeout = opts?.timeout ?? DEFAULT_TIMEOUT;
     const pollInterval = opts?.pollInterval ?? DEFAULT_POLL_INTERVAL;
-    const extractRegex = opts?.extractRegex ?? DEFAULT_EXTRACT_REGEX;
+    const extractRegex = 'extractRegex' in (opts || {}) ? opts.extractRegex : DEFAULT_EXTRACT_REGEX;
     const extraArgs = Array.isArray(opts?.extraArgs) ? opts.extraArgs : [];
     const cli = String(opts?.cli || '').toLowerCase();
     const prompt = String(opts?.prompt || '');
