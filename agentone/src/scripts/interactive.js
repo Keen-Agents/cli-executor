@@ -189,7 +189,7 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
     proc.on('exit', (code) => {
       // Extract the actual response from Codex output.
       // Codex echoes the prompt, then outputs the response after a marker line.
-      const response = extractCodexResponse(fullOutput, systemPrompt);
+      const response = extractCodexResponse(fullOutput);
       if (onData && response) onData(response);
       res({ code: code ?? 0, output: response || fullOutput });
     });
@@ -197,41 +197,40 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
 }
 
 /**
- * Extract just the model response from Codex stdout, stripping:
- * - Echoed system prompt / input
- * - "mcp startup:" lines
- * - "codex" header line
- * - "tokens used\nN,NNN" footer
+ * Extract just the model response from Codex stdout.
+ *
+ * Codex `exec -` output format:
+ *   [header: OpenAI Codex vX.X.X ...]
+ *   --------
+ *   [metadata lines]
+ *   --------
+ *   user
+ *   [echoed prompt]
+ *   mcp startup: ...
+ *   codex                  <- response starts AFTER this line
+ *   [actual response]
+ *   tokens used            <- response ends BEFORE this line
+ *   N,NNN
+ *   [response repeated]
  */
-function extractCodexResponse(stdout, systemPrompt) {
-  let text = stdout;
+function extractCodexResponse(stdout) {
+  const lines = stdout.split('\n');
+  let responseStart = -1;
+  let responseEnd = lines.length;
 
-  // Strip echoed system prompt if present
-  if (systemPrompt && text.startsWith(systemPrompt.slice(0, 80))) {
-    // Find end of echo — look for the "User message:" boundary repeated
-    const marker = 'User message:';
-    const lastIdx = text.lastIndexOf(marker);
-    if (lastIdx > 0) {
-      // Skip past the marker line
-      const afterMarker = text.indexOf('\n', lastIdx);
-      if (afterMarker > 0) text = text.slice(afterMarker + 1);
-    }
+  // Find the last standalone "codex" line — response starts after it
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() === 'codex') { responseStart = i + 1; break; }
   }
 
-  // Strip common Codex metadata lines
-  const lines = text.split('\n');
-  const cleaned = [];
-  let skipTokens = false;
+  if (responseStart < 0) return stdout.trim(); // no marker, return as-is
 
-  for (const line of lines) {
-    if (line.startsWith('mcp startup:')) continue;
-    if (line.trim() === 'codex') continue;
-    if (line.trim() === 'tokens used') { skipTokens = true; continue; }
-    if (skipTokens) { skipTokens = false; continue; } // skip the count line after "tokens used"
-    cleaned.push(line);
+  // Find "tokens used" after the response start
+  for (let i = responseStart; i < lines.length; i++) {
+    if (lines[i].trim() === 'tokens used') { responseEnd = i; break; }
   }
 
-  return cleaned.join('\n').trim();
+  return lines.slice(responseStart, responseEnd).join('\n').trim();
 }
 
 // ── TUI ──────────────────────────────────────────────────────────────────────
