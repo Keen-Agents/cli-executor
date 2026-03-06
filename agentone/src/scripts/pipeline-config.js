@@ -36,6 +36,7 @@ export const PROFILES = {
       'verify',
       'fix-loop',
       'test-suite',
+      'browser-test',
       'security-audit',
       'pr-create',
       'jira-close'
@@ -56,6 +57,7 @@ export const PROFILES = {
       'verify',
       'fix-loop',
       'test-suite',
+      'browser-test',
       'security-audit',
       'human-gate',
       'pr-create',
@@ -95,7 +97,7 @@ export const AGENT_DEFAULTS = {
   },
   codex: {
     timeout: 300_000,
-    model: 'gpt-5-codex',
+    model: 'gpt-5.4',
     extraArgs: []
   }
 };
@@ -112,6 +114,7 @@ export const TIMEOUTS = {
   'fix-loop': 420_000,
   research: 300_000,
   'test-suite': 600_000,
+  'browser-test': 600_000,
   'security-audit': 300_000,
   'pr-create': 180_000,
   'jira-close': 120_000

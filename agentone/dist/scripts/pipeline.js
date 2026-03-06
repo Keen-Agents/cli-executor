@@ -22,6 +22,7 @@ import { run as jiraClose } from './stages/jira-close.js';
 import { run as research } from './stages/research.js';
 import { run as testSuite } from './stages/test-suite.js';
 import { run as securityAudit } from './stages/security-audit.js';
+import { run as browserTest } from './stages/browser-test.js';
 
 const STAGE_MAP = {
   intake, classify, plan,
@@ -31,6 +32,7 @@ const STAGE_MAP = {
   implement, verify,
   'fix-loop': fixLoop,
   'test-suite': testSuite,
+  'browser-test': browserTest,
   'security-audit': securityAudit,
   'pr-create': prCreate,
   'jira-close': jiraClose,

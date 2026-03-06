@@ -3,5 +3,10 @@
         "name": "CLI Executor",
         "type": "script",
         "entry": "tools/cli-executor.js"
+    },
+    {
+        "name": "Browser Automation",
+        "type": "script",
+        "entry": "tools/browser-automation.js"
     }
 ]

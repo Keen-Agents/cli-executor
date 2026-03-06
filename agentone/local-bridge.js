@@ -3,12 +3,48 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { exec, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { chromium } from 'playwright';
 
 const DEFAULT_PORT = 3222;
 let PORT = parseInt(process.argv[2] || process.env.BRIDGE_PORT) || DEFAULT_PORT;
 const API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
 let BASE_DIR = process.cwd();
 const IS_WINDOWS = process.platform === 'win32';
+
+// Browser session tracking
+const browserSessions = new Map();
+const MAX_BROWSER_SESSIONS = 5;
+const BROWSER_SESSION_TTL_MS = parseInt(process.env.BROWSER_SESSION_TTL_MS) || 10 * 60 * 1000;
+
+function generateBrowserSessionId() {
+    return 'br-' + randomBytes(8).toString('hex');
+}
+
+function browserSessionSnapshot(bs) {
+    return {
+        id: bs.id,
+        url: bs.currentUrl || null,
+        running: bs.running,
+        startedAt: bs.startedAt,
+        closedAt: bs.closedAt,
+        pagesOpened: bs.pagesOpened,
+        screenshotsTaken: bs.screenshotsTaken,
+        headless: bs.headless,
+        label: bs.label
+    };
+}
+
+async function closeBrowserSession(bs) {
+    bs.running = false;
+    bs.closedAt = new Date().toISOString();
+    try {
+        if (bs.page && !bs.page.isClosed()) await bs.page.close().catch(() => {});
+        if (bs.context) await bs.context.close().catch(() => {});
+        if (bs.browser) await bs.browser.close().catch(() => {});
+    } catch (err) {
+        console.log(`[${new Date().toISOString()}] Browser close error (${bs.id}): ${err.message}`);
+    }
+}
 
 function killProcess(pid, force = false) {
     if (IS_WINDOWS) {
@@ -390,8 +426,27 @@ setInterval(() => {
             }
         }
     }
+    // Browser session TTL cleanup
+    for (const [id, bs] of browserSessions) {
+        if (!bs.running && bs.closedAt) {
+            const endedTime = new Date(bs.closedAt).getTime();
+            if (now - endedTime > BROWSER_SESSION_TTL_MS) {
+                browserSessions.delete(id);
+                expired++;
+            }
+        }
+        if (bs.running) {
+            const startedTime = new Date(bs.startedAt).getTime();
+            if (now - startedTime > BROWSER_SESSION_TTL_MS) {
+                console.log(`[${new Date().toISOString()}] BROWSER-TTL: Force-closing session ${id}`);
+                closeBrowserSession(bs).catch(() => {});
+                browserSessions.delete(id);
+                expired++;
+            }
+        }
+    }
     if (expired > 0) {
-        console.log(`[${new Date().toISOString()}] TTL-CLEANUP: Removed ${expired} expired session(s). Remaining: ${sessions.size}`);
+        console.log(`[${new Date().toISOString()}] TTL-CLEANUP: Removed ${expired} expired session(s). CLI: ${sessions.size}, Browser: ${browserSessions.size}`);
     }
 }, TTL_CHECK_INTERVAL_MS);
 
@@ -1226,6 +1281,130 @@ const server = http.createServer(async (req, res) => {
                 console.log(`[${new Date().toISOString()}] Image generation complete: ${files.length} file(s) in ${result.elapsedMs}ms`);
             }
 
+            // ── Browser Automation Endpoints ──
+
+            else if (url === '/api/browser/launch') {
+                if (browserSessions.size >= MAX_BROWSER_SESSIONS) {
+                    throw new Error(`Maximum browser sessions (${MAX_BROWSER_SESSIONS}) reached. Close an existing session first.`);
+                }
+                const { headless = true, viewport = { width: 1280, height: 720 }, timeout = 30000, label = 'browser session' } = data;
+                const browser = await chromium.launch({ headless });
+                const context = await browser.newContext({
+                    viewport,
+                    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                });
+                const page = await context.newPage();
+                page.setDefaultTimeout(timeout);
+                const sessionId = generateBrowserSessionId();
+                const bs = {
+                    id: sessionId, browser, context, page, currentUrl: null, running: true,
+                    startedAt: new Date().toISOString(), closedAt: null,
+                    pagesOpened: 0, screenshotsTaken: 0, headless, label
+                };
+                browserSessions.set(sessionId, bs);
+                console.log(`[${new Date().toISOString()}] BROWSER-LAUNCH: ${sessionId} (headless=${headless})`);
+                result = { sessionId, headless, viewport };
+            }
+
+            else if (url === '/api/browser/navigate') {
+                const { sessionId, url: targetUrl, waitUntil = 'load', timeout = 30000 } = data;
+                if (!sessionId) throw new Error('No sessionId provided');
+                if (!targetUrl) throw new Error('No url provided');
+                const bs = browserSessions.get(sessionId);
+                if (!bs || !bs.running) throw new Error(`Browser session ${sessionId} not found or closed`);
+                const response = await bs.page.goto(targetUrl, { waitUntil, timeout });
+                bs.currentUrl = targetUrl;
+                bs.pagesOpened++;
+                console.log(`[${new Date().toISOString()}] BROWSER-NAV: ${sessionId} -> ${targetUrl} (status: ${response?.status()})`);
+                result = { sessionId, url: targetUrl, status: response?.status() || null, title: await bs.page.title() };
+            }
+
+            else if (url === '/api/browser/click') {
+                const { sessionId, selector, timeout = 5000 } = data;
+                if (!sessionId) throw new Error('No sessionId provided');
+                if (!selector) throw new Error('No selector provided');
+                const bs = browserSessions.get(sessionId);
+                if (!bs || !bs.running) throw new Error(`Browser session ${sessionId} not found or closed`);
+                await bs.page.click(selector, { timeout });
+                await bs.page.waitForLoadState('networkidle').catch(() => {});
+                result = { sessionId, clicked: selector, url: bs.page.url(), title: await bs.page.title() };
+            }
+
+            else if (url === '/api/browser/type') {
+                const { sessionId, selector, text, delay = 50, clearFirst = false, timeout = 5000 } = data;
+                if (!sessionId) throw new Error('No sessionId provided');
+                if (!selector) throw new Error('No selector provided');
+                if (text === undefined || text === null) throw new Error('No text provided');
+                const bs = browserSessions.get(sessionId);
+                if (!bs || !bs.running) throw new Error(`Browser session ${sessionId} not found or closed`);
+                if (clearFirst) await bs.page.fill(selector, '', { timeout });
+                await bs.page.type(selector, String(text), { delay, timeout });
+                result = { sessionId, typed: selector, textLength: String(text).length };
+            }
+
+            else if (url === '/api/browser/screenshot') {
+                const { sessionId, fullPage = false, selector, format = 'png', quality } = data;
+                if (!sessionId) throw new Error('No sessionId provided');
+                const bs = browserSessions.get(sessionId);
+                if (!bs || !bs.running) throw new Error(`Browser session ${sessionId} not found or closed`);
+                const screenshotOpts = { type: format };
+                if (format === 'jpeg' && quality) screenshotOpts.quality = quality;
+                let buffer;
+                if (selector) {
+                    buffer = await bs.page.locator(selector).first().screenshot(screenshotOpts);
+                } else {
+                    buffer = await bs.page.screenshot({ ...screenshotOpts, fullPage });
+                }
+                bs.screenshotsTaken++;
+                const base64 = buffer.toString('base64');
+                console.log(`[${new Date().toISOString()}] BROWSER-SCREENSHOT: ${sessionId} (${Math.round(buffer.length / 1024)}KB)`);
+                result = { sessionId, base64, format, sizeKB: Math.round(buffer.length / 1024), url: bs.page.url(), title: await bs.page.title() };
+            }
+
+            else if (url === '/api/browser/content') {
+                const { sessionId, selector, mode = 'text', maxLength = 100000 } = data;
+                if (!sessionId) throw new Error('No sessionId provided');
+                const bs = browserSessions.get(sessionId);
+                if (!bs || !bs.running) throw new Error(`Browser session ${sessionId} not found or closed`);
+                let content;
+                if (selector) {
+                    const el = bs.page.locator(selector).first();
+                    content = mode === 'html' ? await el.innerHTML() : await el.innerText();
+                } else {
+                    content = mode === 'html' ? await bs.page.content() : await bs.page.innerText('body').catch(() => '');
+                }
+                const truncated = content.length > maxLength;
+                if (truncated) content = content.substring(0, maxLength) + '\n\n[... truncated]';
+                result = { sessionId, content, mode, selector: selector || null, length: content.length, truncated, url: bs.page.url(), title: await bs.page.title() };
+            }
+
+            else if (url === '/api/browser/evaluate') {
+                const { sessionId, expression } = data;
+                if (!sessionId) throw new Error('No sessionId provided');
+                if (!expression) throw new Error('No expression provided');
+                const bs = browserSessions.get(sessionId);
+                if (!bs || !bs.running) throw new Error(`Browser session ${sessionId} not found or closed`);
+                const evalResult = await bs.page.evaluate(expression);
+                result = { sessionId, result: evalResult, url: bs.page.url() };
+            }
+
+            else if (url === '/api/browser/close') {
+                const { sessionId } = data;
+                if (!sessionId) throw new Error('No sessionId provided');
+                const bs = browserSessions.get(sessionId);
+                if (!bs) throw new Error(`Browser session ${sessionId} not found`);
+                const wasRunning = bs.running;
+                await closeBrowserSession(bs);
+                console.log(`[${new Date().toISOString()}] BROWSER-CLOSE: ${sessionId} (wasRunning=${wasRunning})`);
+                result = { sessionId, closed: true, wasRunning };
+            }
+
+            else if (url === '/api/browser/list') {
+                const list = [];
+                for (const bs of browserSessions.values()) list.push(browserSessionSnapshot(bs));
+                result = { sessions: list, total: list.length, running: list.filter(s => s.running).length, maxSessions: MAX_BROWSER_SESSIONS };
+            }
+
             else {
                 throw new Error("Endpoint not found");
             }
@@ -1291,6 +1470,17 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log(`  POST /api/web/news           RSS news aggregation`);
     console.log(`  POST /api/web/multi-scrape   Parallel URL scraping`);
     console.log(`  POST /api/image/generate     AI image generation`);
+    console.log(`\n  BROWSER AUTOMATION`);
+    console.log(`  POST /api/browser/launch     Launch headless browser`);
+    console.log(`  POST /api/browser/navigate   Navigate to URL`);
+    console.log(`  POST /api/browser/click      Click element by selector`);
+    console.log(`  POST /api/browser/type       Type text into element`);
+    console.log(`  POST /api/browser/screenshot Capture page screenshot`);
+    console.log(`  POST /api/browser/content    Get page text/HTML`);
+    console.log(`  POST /api/browser/evaluate   Run JS in page context`);
+    console.log(`  POST /api/browser/close      Close browser session`);
+    console.log(`  POST /api/browser/list       List browser sessions`);
+    console.log(`  Browser TTL: ${BROWSER_SESSION_TTL_MS / 1000}s (env: BROWSER_SESSION_TTL_MS)`);
     console.log(`\n  DEBUG`);
     console.log(`  GET  /debug                  Debug visualization dashboard`);
     console.log(`\n  Ready for Agent commands...\n`);
