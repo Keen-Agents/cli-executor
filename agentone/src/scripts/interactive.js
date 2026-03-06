@@ -521,6 +521,67 @@ class KeenCLI {
     return text.replace(/<PIPELINE\s+[^>]*?\/>/g, '').trim();
   }
 
+  // ── Spawn tag detection ────────────────────────────────────────────────
+  _extractSpawnTag(output) {
+    const match = output.match(/<SPAWN\s+([^>]*?)\/>/);
+    if (!match) return null;
+
+    const attrs = match[1];
+    const cliMatch = attrs.match(/cli="([^"]*)"/);
+    const promptMatch = attrs.match(/prompt="([^"]*)"/);
+    if (!cliMatch || !promptMatch) return null;
+
+    const cli = cliMatch[1].toLowerCase();
+    const prompt = promptMatch[1];
+    if (!prompt || prompt.length < 2) return null;
+    if (cli !== 'claude' && cli !== 'codex') return null;
+
+    return { cli, prompt };
+  }
+
+  // ── Spawn dispatch (quick one-shot) ────────────────────────────────────
+  async runSpawnFromTag(cli, prompt) {
+    const mc = cli === 'claude' ? a.cyan : a.yellow;
+    this.scrollWrite('\n' + mc(`\u2731 ${cli}`) + a.dim(` \u00b7 ${prompt.slice(0, 60)}${prompt.length > 60 ? '...' : ''}`) + '\n\n');
+    this._turnStartTime = Date.now();
+    this._spinnerActive = true;
+    this.drawBottom();
+
+    let spawnOutput = '';
+    const procRef = {};
+    this._primaryProcRef = procRef;
+
+    try {
+      const result = await runTurn(prompt, {
+        workdir: this.workdir,
+        isFirst: true,
+        systemPrompt: `You are ${cli}. Answer the following request directly and concisely.`,
+        model: cli,
+        conversationHistory: [],
+        procRef,
+        onData: (chunk) => {
+          this._clearSpinnerLine();
+          spawnOutput += chunk;
+          this.scrollWrite(chunk);
+          this.drawBottom();
+        }
+      });
+
+      // If no streaming happened (Codex batches), spawnOutput is from onData in exit
+      if (!spawnOutput && result.output) spawnOutput = result.output;
+
+      const elapsed = ((Date.now() - this._turnStartTime) / 1000).toFixed(1);
+      this.scrollWrite('\n' + mc(`${elapsed}s`) + '\n');
+    } catch (err) {
+      this.scrollWrite(a.red(`\nError: ${err.message}\n`));
+    }
+
+    this._spinnerActive = false;
+    this._primaryProcRef = {};
+    this.drawBottom();
+    return spawnOutput;
+  }
+
   // ── Pipeline dispatch ──────────────────────────────────────────────────
   async runPipelineFromTag(prompt, profile) {
     const scriptPath = resolve(__dirname, 'pipeline.js');
@@ -676,8 +737,8 @@ class KeenCLI {
         onData: (chunk) => {
           this.primaryOutput += chunk;
           this._clearSpinnerLine();
-          // Filter out <PIPELINE .../> tag from display
-          const display = chunk.replace(/<PIPELINE\s+[^>]*?\/>/g, '');
+          // Filter out dispatch tags from display
+          const display = chunk.replace(/<PIPELINE\s+[^>]*?\/>/g, '').replace(/<SPAWN\s+[^>]*?\/>/g, '');
           if (display) this.scrollWrite(display);
           this.drawBottom();
         }
@@ -699,7 +760,42 @@ class KeenCLI {
         this.scrollWrite(a.dim(`\n[keen] exit code ${result.code}${hint ? ': ' + hint : ''}\n`));
       }
 
-      // ── Pipeline tag interception ──────────────────────────────────
+      // ── Spawn tag interception (quick one-shot) ──────────────────
+      const spawnTag = this._extractSpawnTag(this.primaryOutput);
+      if (spawnTag) {
+        const spawnResult = await this.runSpawnFromTag(spawnTag.cli, spawnTag.prompt);
+
+        // Feed spawn result back to dispatcher
+        this._primaryProcRef = {};
+        const mc = spawnTag.cli === 'claude' ? 'Claude' : 'Codex';
+        try {
+          const followUp = await runTurn(
+            `${mc} responded:\n\n${(spawnResult || '(no output)').slice(-2000)}\n\nRelay this to the user concisely.`,
+            {
+              workdir: this.workdir,
+              isFirst: false,
+              systemPrompt: this.systemPrompt,
+              model: this.primaryModel,
+              conversationHistory: this.conversationHistory,
+              procRef: this._primaryProcRef,
+              onData: (chunk) => {
+                this._clearSpinnerLine();
+                this.scrollWrite(chunk);
+                this.drawBottom();
+              }
+            }
+          );
+          this.conversationHistory.push({ role: 'user', content: `[${mc} spawn result]` });
+          this.conversationHistory.push({ role: 'assistant', content: followUp.output || '' });
+          if (this.conversationHistory.length > 20) {
+            this.conversationHistory = this.conversationHistory.slice(-20);
+          }
+        } catch (err) {
+          this.scrollWrite(a.dim(`\n[keen] relay error: ${err.message}\n`));
+        }
+      }
+
+      // ── Pipeline tag interception (full multi-stage) ──────────────
       const pipelineTag = this._extractPipelineTag(this.primaryOutput);
       if (pipelineTag) {
         const pipelineResult = await this.runPipelineFromTag(pipelineTag.prompt, pipelineTag.profile);
