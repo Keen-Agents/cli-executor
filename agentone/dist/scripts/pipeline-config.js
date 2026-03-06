@@ -35,6 +35,8 @@ export const PROFILES = {
       'implement',
       'verify',
       'fix-loop',
+      'test-suite',
+      'security-audit',
       'pr-create',
       'jira-close'
     ],
@@ -53,6 +55,8 @@ export const PROFILES = {
       'implement',
       'verify',
       'fix-loop',
+      'test-suite',
+      'security-audit',
       'human-gate',
       'pr-create',
       'jira-close'
@@ -107,6 +111,8 @@ export const TIMEOUTS = {
   verify: 600_000,
   'fix-loop': 420_000,
   research: 300_000,
+  'test-suite': 600_000,
+  'security-audit': 300_000,
   'pr-create': 180_000,
   'jira-close': 120_000
 };

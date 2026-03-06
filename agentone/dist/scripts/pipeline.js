@@ -20,6 +20,8 @@ import { run as fixLoop } from './stages/fix-loop.js';
 import { run as prCreate } from './stages/pr-create.js';
 import { run as jiraClose } from './stages/jira-close.js';
 import { run as research } from './stages/research.js';
+import { run as testSuite } from './stages/test-suite.js';
+import { run as securityAudit } from './stages/security-audit.js';
 
 const STAGE_MAP = {
   intake, classify, plan,
@@ -28,6 +30,8 @@ const STAGE_MAP = {
   'human-gate': humanGate,
   implement, verify,
   'fix-loop': fixLoop,
+  'test-suite': testSuite,
+  'security-audit': securityAudit,
   'pr-create': prCreate,
   'jira-close': jiraClose,
   research

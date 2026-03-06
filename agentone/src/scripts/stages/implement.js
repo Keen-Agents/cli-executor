@@ -140,14 +140,36 @@ export async function run(context) {
       assembledPrompt += `\n\n## Human Revision Request\n${humanRevision.comments}`;
     }
 
-    const result = await runAgent({
-      cli: 'claude',
+    // Use Codex as the primary coder (Claude as fallback).
+    // Codex is better at implementation; Claude verifies in the verify stage.
+    const primaryCli = profile === 'simple' ? 'claude' : 'codex';
+    let result = await runAgent({
+      cli: primaryCli,
       prompt: assembledPrompt,
       cwd: worktreePath,
       timeout: TIMEOUTS.implement,
-      label: `implement-${ticketKey}`,
-      metadata: { stage: STAGE_NAME, ticketKey, runId: context.state.runId }
+      label: `implement-${primaryCli}-${ticketKey}`,
+      metadata: { stage: STAGE_NAME, cli: primaryCli, ticketKey, runId: context.state.runId }
     });
+
+    // Fallback to Claude if Codex fails (timeout, crash, no output)
+    if (!result.success && !result.content && primaryCli === 'codex') {
+      context.logger?.log({
+        type: 'GATE_CHECK',
+        stage: STAGE_NAME,
+        gate: 'codex_fallback',
+        reason: result.timedOut ? 'timeout' : 'no_output',
+        message: 'Codex failed, falling back to Claude for implementation.'
+      });
+      result = await runAgent({
+        cli: 'claude',
+        prompt: assembledPrompt,
+        cwd: worktreePath,
+        timeout: TIMEOUTS.implement,
+        label: `implement-claude-fallback-${ticketKey}`,
+        metadata: { stage: STAGE_NAME, cli: 'claude', fallback: true, ticketKey, runId: context.state.runId }
+      });
+    }
 
     if (context.costTracker) {
       const callData = CostTracker.fromAgentResult(result);
