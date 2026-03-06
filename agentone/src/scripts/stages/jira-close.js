@@ -138,6 +138,15 @@ export async function run(context) {
     throw new Error("jira-close requires ticket key from stage 'intake' or context.ticketKey.");
   }
 
+  // Skip Jira close for prompt-mode runs (no Jira ticket to update)
+  const intake = context?.state?.getStageOutput?.('intake');
+  if (intake?.source === 'prompt') {
+    const skipped = { skipped: true, reason: 'prompt-mode run, no Jira ticket', ticketKey };
+    context.state.checkpoint(STAGE_NAME, skipped);
+    context.logger?.log({ type: 'STAGE_COMPLETED', stage: STAGE_NAME, skipped: true });
+    return skipped;
+  }
+
   const credentials = requireJiraCredentials();
   const { prUrl, prTitle, skipped, reason } = getPrDetails(context);
   const { runId, profile } = getRunMetadata(context);

@@ -65,8 +65,7 @@ function collectDepAudit(workDir) {
       cwd: workDir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 60_000,
-      shell: true
+      timeout: 60_000
     });
     const parsed = JSON.parse(raw);
     const vuln = parsed?.metadata?.vulnerabilities || {};
@@ -154,16 +153,19 @@ export async function run(context) {
 
     const auditText = result.content.trim();
 
-    // Detect critical/high findings
-    const criticalCount = (auditText.match(/\bCRITICAL\b/gi) || []).length;
-    const highCount = (auditText.match(/\bHIGH\b/gi) || []).length;
-    const passed = criticalCount <= 1 && highCount <= 1; // 1 mention is the severity label definition itself
+    // Detect critical/high findings — look for severity markers in formatted output
+    // Pattern matches lines like "- **CRITICAL**: ...", "### CRITICAL", "Severity: CRITICAL"
+    const criticalFindings = (auditText.match(/(?:^|\n)\s*[-*•#]+\s*\**CRITICAL\**/gi) || []).length
+      + (auditText.match(/severity:\s*CRITICAL/gi) || []).length;
+    const highFindings = (auditText.match(/(?:^|\n)\s*[-*•#]+\s*\**HIGH\**/gi) || []).length
+      + (auditText.match(/severity:\s*HIGH/gi) || []).length;
+    const passed = criticalFindings === 0 && highFindings === 0;
 
     const output = {
       report: auditText,
       passed,
-      criticalFindings: Math.max(0, criticalCount - 1),
-      highFindings: Math.max(0, highCount - 1),
+      criticalFindings,
+      highFindings,
       sessionId: result.sessionId || null,
       durationMs: result.durationMs,
       depAudit

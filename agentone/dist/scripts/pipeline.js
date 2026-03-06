@@ -250,7 +250,24 @@ const PROFILE_RANK = { simple: 0, standard: 1, complex: 2 };
 function countDiffLines(workDir) {
   if (!workDir) return 0;
   try {
-    const stat = execFileSync('git', ['diff', '--stat', 'HEAD~1'], {
+    // Use merge-base to diff against the branch point, not HEAD~1
+    // HEAD~1 may include unrelated commits
+    let base;
+    try {
+      base = execFileSync('git', ['merge-base', 'HEAD', 'origin/main'], {
+        cwd: workDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000
+      }).trim();
+    } catch {
+      // Fallback: try 'main' without origin, then HEAD~1
+      try {
+        base = execFileSync('git', ['merge-base', 'HEAD', 'main'], {
+          cwd: workDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000
+        }).trim();
+      } catch {
+        base = 'HEAD~1';
+      }
+    }
+    const stat = execFileSync('git', ['diff', '--stat', base], {
       cwd: workDir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -466,6 +483,7 @@ async function runPipeline(input) {
           stageList = profileConfig.stages;
           stageInstances.length = 0;
           stageInstances.push(...resolveStageInstances(stageList));
+          stageIndex = 0; // Reset — isCompleted() will skip already-done stages
           state.setProfile(profileName);
           const updatedThresholds = budgetThresholds(profileConfig.budget);
           costTracker.budgets = { soft: updatedThresholds.warning, hard: updatedThresholds.hard };

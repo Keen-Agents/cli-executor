@@ -155,7 +155,8 @@ function auditPasses(audit) {
 
 export function isVerificationPassed(result) {
   const lintPassed = result?.lint === null || result?.lint?.passed === true;
-  const auditPassed = result?.audit?.passed !== false;
+  // Fail closed: require audit.passed === true (not just !== false)
+  const auditPassed = result?.audit?.passed === true;
   return result?.tests?.passed === true && lintPassed && auditPassed;
 }
 

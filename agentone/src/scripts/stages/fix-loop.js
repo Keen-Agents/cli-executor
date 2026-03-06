@@ -76,12 +76,14 @@ export async function run(context) {
         ? attempts.map((item) => `Attempt ${item.attempt}: ${item.fixSummary}`).join('\n')
         : '';
 
+      // Use effectiveVerify (latest state) not the initial verify output
+      const verifySource = effectiveVerify || verify;
       const verifyNotes = [
-        `Verify summary: ${toText(verify.summary)}`,
-        `Lint passed: ${Boolean(verify?.lint?.passed)}`,
-        `Lint output: ${toText(verify?.lint?.output || '').trim()}`,
-        `Audit vulnerabilities: ${JSON.stringify(verify?.audit?.vulnerabilities || {})}`,
-        `Audit output: ${toText(verify?.audit?.output || '').trim()}`,
+        `Verify summary: ${toText(verifySource.summary)}`,
+        `Lint passed: ${Boolean(verifySource?.lint?.passed)}`,
+        `Lint output: ${toText(verifySource?.lint?.output || '').trim()}`,
+        `Audit vulnerabilities: ${JSON.stringify(verifySource?.audit?.vulnerabilities || {})}`,
+        `Audit output: ${toText(verifySource?.audit?.output || '').trim()}`,
         `Implement summary: ${toText(implement?.summary || '').trim()}`
       ].join('\n');
 

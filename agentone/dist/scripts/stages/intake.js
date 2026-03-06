@@ -408,7 +408,9 @@ export async function run(context) {
   }
 
   const promptText = context?.promptText || '';
-  const isPromptMode = Boolean(promptText) && !hasJiraCredentials();
+  // promptText takes precedence — if the user passed --prompt, use prompt mode
+  // regardless of whether Jira credentials happen to be set
+  const isPromptMode = Boolean(promptText);
 
   let ticket;
 

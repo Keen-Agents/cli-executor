@@ -74,7 +74,7 @@ echo '{"decision": "revise", "comments": "USER_FEEDBACK_HERE"}' > logs/pipeline-
 
 For the second human-gate (complex profile):
 ```bash
-echo '{"decision": "approve"}' > logs/pipeline-runs/<RUN_ID>/human-decision--human-gate--2.json
+echo '{"decision": "approve"}' > logs/pipeline-runs/<RUN_ID>/human-decision-human-gate-2.json
 ```
 
 ## Research Tasks

@@ -117,8 +117,8 @@ export async function run(context) {
       ticketKey
     });
 
-    // Spawn both agents in parallel
-    const [claudeResult, codexResult] = await Promise.all([
+    // Spawn both agents in parallel — use allSettled so one failure doesn't lose the other
+    const [claudeSettled, codexSettled] = await Promise.allSettled([
       runAgent({
         cli: 'claude',
         prompt: claudePrompt,
@@ -146,6 +146,13 @@ export async function run(context) {
         }
       })
     ]);
+
+    const claudeResult = claudeSettled.status === 'fulfilled'
+      ? claudeSettled.value
+      : { success: false, content: null, fullOutput: '', timedOut: false, durationMs: 0, sessionId: null, error: claudeSettled.reason };
+    const codexResult = codexSettled.status === 'fulfilled'
+      ? codexSettled.value
+      : { success: false, content: null, fullOutput: '', timedOut: false, durationMs: 0, sessionId: null, error: codexSettled.reason };
 
     // Record costs for both agents
     if (context.costTracker) {
