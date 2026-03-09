@@ -39,6 +39,22 @@ const SLASH_COMMANDS = [
   { cmd: '/save',     args: '[path]',         desc: 'Save conversation to file' },
 ];
 
+// ── Keen logo (ANSI block art — light-blue folder with two white "eyes") ─────
+// Blue BG fills for straight edges, ▄/▀ half-blocks for smooth top/bottom and
+// circular eyes (2-wide ▄▄/▀▀ = visually square due to 1:2 cell aspect ratio).
+const _fg = '\x1b[38;2;183;210;238m';   // light blue foreground (edges)
+const _bg = '\x1b[48;2;183;210;238m';   // light blue background (body fill)
+const _wh = '\x1b[38;2;255;255;255m';   // white foreground (eyes)
+const _r  = '\x1b[0m';                  // reset
+
+// 4-row folder logo (8 wide × 4 tall = visual square): tab+top, eyes×2, bottom
+const KEEN_LOGO = [
+  `${_bg}   ${_r}${_fg}▄▄▄▄▄${_r}`,
+  `${_bg}${_wh} ▄▄  ▄▄ ${_r}`,
+  `${_bg}${_wh} ▀▀  ▀▀ ${_r}`,
+  `${_fg}▀▀▀▀▀▀▀▀${_r}`,
+].join('\n');
+
 // ── ANSI helpers ─────────────────────────────────────────────────────────────
 const ESC = '\x1b';
 const CSI = `${ESC}[`;
@@ -79,7 +95,7 @@ const SPINNERS = {
 const SPINNER_NAMES = Object.keys(SPINNERS);
 let activeSpinnerName = SPINNER_NAMES[Math.floor(Math.random() * SPINNER_NAMES.length)];
 let SPINNER = SPINNERS[activeSpinnerName];
-const HEADER_LINES = 2;
+const HEADER_LINES = 4;
 
 const EXIT_HINTS = {
   1: 'general error', 2: 'invalid arguments', 126: 'not executable',
@@ -285,14 +301,21 @@ class KeenCLI {
 
   // ── Layout ─────────────────────────────────────────────────────────────
   drawHeader() {
-    this.w(a.moveTo(1, 1) + a.clearLine);
     const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
-    this.w(
-      a.magenta(a.bold('\u2731 Keen')) +
-      a.dim('  \u00b7  ') + mc(this.primaryModel) +
-      a.dim('  \u00b7  ') + a.gray(this.workdir)
-    );
-    this.w(a.moveTo(2, 1) + a.clearLine + a.dim('\u2500'.repeat(this.cols)));
+    const logoLines = KEEN_LOGO.split('\n');
+    const infoCol = 12;  // column where text starts (right of logo)
+
+    for (let i = 0; i < logoLines.length; i++) {
+      this.w(a.moveTo(i + 1, 1) + a.clearLine);
+      this.w(' ' + logoLines[i]);
+    }
+    // Text info to the right of the logo — single line, vertically centered
+    this.w(a.moveTo(3, infoCol) +
+      a.bold('Keen') + a.dim('  \u00b7  ') + mc(this.primaryModel) +
+      a.dim('  \u00b7  ') + a.gray(this.workdir));
+
+    // Separator
+    this.w(a.moveTo(HEADER_LINES, 1) + a.clearLine + a.dim('\u2500'.repeat(this.cols)));
   }
 
   setup() {
