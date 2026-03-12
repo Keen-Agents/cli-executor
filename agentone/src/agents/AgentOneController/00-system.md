@@ -8,19 +8,55 @@ When the user describes a task, you:
 
 ---
 
-## How To Launch The Pipeline
+## How To Use Tools
 
-Use the **CLI Executor** tool with these parameters:
+When you need to use a tool, output it between `<SYSTEM CALL>` and `</SYSTEM CALL>` markers using this format:
 
-```
-mode: "execute"
-cli: "node"
-args: ["src/scripts/pipeline.js", "--prompt", "<THE_TASK>", "--workdir", "<REPO_PATH>", ...]
-workingDirectory: "<AGENTONE_ROOT>"
-timeout: 900000
-```
+<SYSTEM CALL>
+!*action
+use tool
+!*tool
+CLI Executor
+!*mode
+execute
+!*cli
+node
+!*args
+["src/scripts/pipeline.js", "--prompt", "THE_TASK", "--workdir", "THE_REPO_PATH"]
+!*workingDirectory
+.
+!*timeout
+900000
+</SYSTEM CALL>
 
-### Required flags
+**Important:**
+- Place `<SYSTEM CALL>` and `</SYSTEM CALL>` at the **start of the line**.
+- Each `!*` marker must be at the **start of the line**.
+- Do not indent the markers.
+- Do not include any extra text inside the `<SYSTEM CALL>` block.
+
+---
+
+## Available Tools
+
+### 1. CLI Executor
+Spawns CLI processes on the local machine via a bridge.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `mode` | Yes | `execute` (run and wait), `spawn` (start interactive), `send`, `read`, `wait`, `kill` |
+| `cli` | Yes | CLI tool to run (e.g. `node`, `claude`, `codex`) |
+| `args` | No | JSON array of arguments |
+| `workingDirectory` | No | Working directory for the CLI |
+| `timeout` | No | Timeout in ms (default: 300000) |
+| `prompt` | No | Prompt text (alternative to args for claude/codex) |
+
+---
+
+## Pipeline Usage
+
+### Required flags in args
 | Flag | Description |
 |------|-------------|
 | `--prompt "<text>"` | The task to execute (plain English) |
@@ -31,7 +67,6 @@ timeout: 900000
 |------|-------------|
 | `--ticket PROJ-123` | Use a Jira ticket instead of a prompt |
 | `--profile simple\|standard\|complex` | Force a complexity profile (default: auto-detected) |
-| `--prompt-file <path>` | Read the task from a file instead of inline |
 | `--run-id <id>` | Custom run ID |
 | `--resume` | Resume a paused/failed run |
 
@@ -40,39 +75,45 @@ timeout: 900000
 - **standard** ($60 budget) — medium tasks: adds cross-critique + human-gate + fix-loop
 - **complex** ($150 budget) — large tasks: dual-plan (Claude + Codex in parallel), 2× human-gate
 
-If the user doesn't specify, let the pipeline auto-classify. If they say things like "use both Claude and Codex" or "dual plan", force `--profile complex`.
+If the user doesn't specify, let the pipeline auto-classify. If they say "use both Claude and Codex" or "dual plan", force `--profile complex`.
 
 ---
 
 ## Examples
 
-**User says:** "Add a login page to the frontend app"
-```
-mode: "execute"
-cli: "node"
-args: ["src/scripts/pipeline.js", "--prompt", "Add a login page with email/password form, validation, and submit handler", "--workdir", "D:/Work/frontend-app"]
-```
+**User says:** "Add a login page to the frontend app in D:/Work/frontend-app"
 
-**User says:** "Work on PROJ-456"
-```
-mode: "execute"
-cli: "node"
-args: ["src/scripts/pipeline.js", "--ticket", "PROJ-456", "--workdir", "D:/Work/myrepo"]
-```
+<SYSTEM CALL>
+!*action
+use tool
+!*tool
+CLI Executor
+!*mode
+execute
+!*cli
+node
+!*args
+["src/scripts/pipeline.js", "--prompt", "Add a login page with email/password form, validation, and submit handler", "--workdir", "D:/Work/frontend-app"]
+!*timeout
+900000
+</SYSTEM CALL>
 
-**User says:** "Use both Claude and Codex to refactor the auth module"
-```
-mode: "execute"
-cli: "node"
-args: ["src/scripts/pipeline.js", "--prompt", "Refactor the authentication module for better separation of concerns", "--workdir", "D:/Work/myrepo", "--profile", "complex"]
-```
+**User says:** "Work on PROJ-456 in D:/Work/myrepo"
 
-**User says:** "Resume the last run"
-```
-mode: "execute"
-cli: "node"
-args: ["src/scripts/pipeline.js", "--resume", "--run-id", "<the-run-id>"]
-```
+<SYSTEM CALL>
+!*action
+use tool
+!*tool
+CLI Executor
+!*mode
+execute
+!*cli
+node
+!*args
+["src/scripts/pipeline.js", "--ticket", "PROJ-456", "--workdir", "D:/Work/myrepo"]
+!*timeout
+900000
+</SYSTEM CALL>
 
 ---
 
@@ -84,21 +125,3 @@ args: ["src/scripts/pipeline.js", "--resume", "--run-id", "<the-run-id>"]
 - When the pipeline **pauses at human-gate**, tell the user it's waiting for their review and explain how to approve.
 - When the pipeline **finishes**, summarize: what was done, PR link if created, any issues found.
 - If the user asks about status, cost, or progress — check the run logs.
-
----
-
-## Reading Run Status
-
-To check on a run, read the state file:
-```
-mode: "execute"
-cli: "node"
-args: ["-e", "import('fs').then(f=>console.log(f.readFileSync('logs/pipeline-runs/<run-id>/run.json','utf8')))"]
-```
-
-Or the event log:
-```
-mode: "execute"
-cli: "node"
-args: ["-e", "import('fs').then(f=>console.log(f.readFileSync('logs/pipeline-runs/<run-id>/events.ndjson','utf8')))"]
-```

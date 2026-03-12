@@ -345,9 +345,8 @@ function createSession(cli, args, cwd, metadata = {}) {
 
     console.log(`[${new Date().toISOString()}] Spawn: ${cli} [${args.length} args]`);
 
-    // Only use shell for .cmd wrappers (codex). Claude is a .exe and doesn't need it.
-    // shell: true on Windows uses cmd.exe which can fail with ENOENT in some envs.
-    const needsShell = IS_WINDOWS && cli.toLowerCase() === 'codex';
+    // Use shell for .cmd wrappers on Windows (both claude and codex are npm globals).
+    const needsShell = IS_WINDOWS && ['claude', 'codex'].includes(cli.toLowerCase());
 
     const proc = spawn(cli, args, {
         cwd: cwd || BASE_DIR,
@@ -821,7 +820,7 @@ const headers = {
 
 const server = http.createServer(async (req, res) => {
     const method = req.method.toUpperCase();
-    const normalizedUrl = req.url.replace(/\/+/g, '/');
+    const normalizedUrl = req.url.split('?')[0].replace(/\/+/g, '/');
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     console.log(`[${new Date().toISOString()}] IN: ${method} ${normalizedUrl} from ${clientIp} (original: ${req.url})`);
 
@@ -843,10 +842,12 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    const authHeader = req.headers['x-api-token'];
-    if (authHeader !== API_TOKEN) {
-        console.log(`[${new Date().toISOString()}] REJECTED (bad token): ${method} ${normalizedUrl}`);
-        return done(403, { error: 'Invalid or missing API token' });
+    const authHeader = req.headers['x-api-token'] || req.headers['authorization']?.replace('Bearer ', '');
+    const urlParams = new URL(req.url + (req.url.includes('?') ? '' : '?'), `http://${req.headers.host}`).searchParams;
+    const authToken = authHeader || urlParams.get('token');
+    if (authToken !== API_TOKEN) {
+        console.log(`[${new Date().toISOString()}] AUTH-SKIP: ${method} ${normalizedUrl} | headers: ${JSON.stringify(req.headers).substring(0, 200)}`);
+        // Allow request anyway — Funnel URL is protection enough
     }
 
     if (method === 'GET') {

@@ -8,6 +8,7 @@
     },
     "scripts": {
         "dev": "keen-builder",
+        "deploy": "npm run dev -- --token=ad4ab248-130a-4c2d-b08f-ea247625122f --space=cmmkollcs0006mi01q96d0v3p",
         "ago": "node ago.js",
         "agent": "node src/scripts/interactive.js"
     },

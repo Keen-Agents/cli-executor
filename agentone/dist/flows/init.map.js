@@ -1,28 +1,19 @@
 export default {
-  "projectName": "agentone",
   "agents": [
-    {
-      "id": "agentone",
-      "name": "Agent-agentone",
-      "entry_flow": "Project",
-      "entry_node": "Start"
-    },
-    {
-      "id": "boyans-jokester",
-      "name": "BoyansJokester",
-      "entry_flow": "Chat",
-      "entry_node": "Start"
-    }
+    {}
   ],
-  "entryFile": "Project.flow.js",
-  "entryMapFile": "Project.flow.map.js",
-  "entryFlow": "Start",
-  "controller": "Project",
+  "entryFile": "undefined.flow.js",
+  "entryMapFile": "undefined.flow.map.js",
   "tools": [
     {
-      "name": "Test Tool",
+      "name": "CLI Executor",
       "type": "script",
-      "entry": "tools/test-tool.js"
+      "entry": "tools/cli-executor.js"
+    },
+    {
+      "name": "Browser Automation",
+      "type": "script",
+      "entry": "tools/browser-automation.js"
     }
   ]
 };

@@ -1,22 +1,14 @@
 // CLI Executor Tool
 // Allows agents to spawn and interact with CLI tools (claude, codex, etc.)
 // on the local PC via the bridge wrapper's session-based API.
-//
-// Modes:
-//   "execute"     — Spawn CLI, wait for it to finish, return full output (one-shot)
-//   "spawn"       — Start a CLI session, return sessionId for interactive use
-//   "send"        — Send input to a running session
-//   "read"        — Read output from a running session
-//   "wait"        — Wait for session to finish
-//   "kill"        — Kill a running session
 
-const BRIDGE_URL = process.env.AGENTONE_BRIDGE_URL || process.env.BRIDGE_URL || 'http://localhost:3222';
-const API_TOKEN = process.env.AGENTONE_API_TOKEN || process.env.BRIDGE_API_TOKEN || '';
+const BRIDGE_URL = 'https://pc.tail7c837c.ts.net';
+const API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
 
 async function bridgeCall(endpoint, body) {
-    const response = await fetch(`${BRIDGE_URL}${endpoint}`, {
+    const response = await fetch(`${BRIDGE_URL}${endpoint}?token=${API_TOKEN}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-token': API_TOKEN },
+        headers: { 'Content-Type': 'application/json', 'x-api-token': API_TOKEN, 'Authorization': `Bearer ${API_TOKEN}` },
         body: JSON.stringify(body)
     });
     if (!response.ok) {
@@ -27,25 +19,24 @@ async function bridgeCall(endpoint, body) {
 }
 
 export async function exec() {
-    const mode = dictionary.mode || 'execute';
-    const cli = dictionary.cli;
-    const prompt = dictionary.prompt;
-    const args = dictionary.args;
-    const cwd = dictionary.workingDirectory || dictionary.cwd;
-    const sessionId = dictionary.sessionId;
-    const input = dictionary.input;
-    const timeout = dictionary.timeout || 300000;
-    const planMode = dictionary.planMode || false;
+    const ctx = dictionary.TOOL_CONTEXT || dictionary;
+    const mode = ctx.mode || 'execute';
+    const cli = ctx.cli;
+    const prompt = ctx.prompt;
+    const args = ctx.args;
+    const cwd = ctx.workingDirectory || ctx.cwd;
+    const sessionId = ctx.sessionId;
+    const input = ctx.input;
+    const timeout = ctx.timeout || 300000;
+    const planMode = ctx.planMode || false;
 
     const metadata = {
-        pipelineRunId: dictionary.pipelineRunId || null,
-        agentType: dictionary.agentType || null,
-        subtaskId: dictionary.subtaskId || null,
-        parentSessionId: dictionary.parentSessionId || null,
-        label: dictionary.label || null
+        pipelineRunId: ctx.pipelineRunId || null,
+        agentType: ctx.agentType || null,
+        subtaskId: ctx.subtaskId || null,
+        parentSessionId: ctx.parentSessionId || null,
+        label: ctx.label || null
     };
-
-    writeThinking(`CLI Executor: mode=${mode}, cli=${cli || '(none)'}, agent=${metadata.agentType || '-'}, subtask=${metadata.subtaskId || '-'}`);
 
     try {
         if (mode === 'execute') {
@@ -53,28 +44,26 @@ export async function exec() {
 
             let cliArgs = [];
             if (args) {
-                cliArgs = typeof args === 'string' ? args.split(' ') : args;
+                if (typeof args === 'string') {
+                    try { cliArgs = JSON.parse(args); } catch { cliArgs = args.split(' '); }
+                } else {
+                    cliArgs = args;
+                }
             } else if (prompt) {
                 if (cli === 'claude') {
-                    const allowedTools = dictionary.allowedTools || 'Bash,Edit,Read,Write,Grep,Glob,WebSearch,WebFetch';
+                    const allowedTools = ctx.allowedTools || 'Bash,Edit,Read,Write,Grep,Glob,WebSearch,WebFetch';
                     cliArgs = ['-p', prompt, '--allowedTools', allowedTools, '--output-format', 'json'];
                     if (planMode) {
                         cliArgs.push('--permission-mode', 'plan');
-                        writeThinking('Plan mode enabled');
                     }
                 } else {
                     cliArgs = [prompt];
                 }
             }
 
-            writeThinking(`Spawning: ${cli} ${cliArgs.join(' ')}`);
-            writeThinking(`Working directory: ${cwd || '(bridge default)'}`);
-
             const spawnResult = await bridgeCall('/api/cli/spawn', {
                 cli, args: cliArgs, cwd, closeStdin: true, metadata
             });
-
-            writeThinking(`Session ${spawnResult.sessionId} started (pid: ${spawnResult.pid})`);
 
             const POLL_INTERVAL = 3000;
             const startTime = Date.now();
@@ -86,37 +75,27 @@ export async function exec() {
                     interval: POLL_INTERVAL
                 });
 
-                if (!pollResult.running) {
-                    writeThinking(`CLI exited with code ${pollResult.exitCode} after ${Math.round((Date.now() - startTime) / 1000)}s`);
-                    break;
-                }
+                if (!pollResult.running) break;
 
                 const elapsed = Date.now() - startTime;
                 if (elapsed > timeout) {
-                    writeThinking(`Session timed out after ${Math.round(timeout / 1000)}s, killing...`);
                     await bridgeCall('/api/cli/kill', { sessionId: spawnResult.sessionId }).catch(() => {});
                     dictionary.response = `CLI timed out after ${Math.round(timeout / 1000)}s.\n\nPartial output:\n${pollResult.stdout || '(no output)'}`;
                     return;
                 }
-
-                writeThinking(`Still running... (${Math.round(elapsed / 1000)}s elapsed)`);
             }
 
             await bridgeCall('/api/cli/cleanup', {}).catch(() => {});
 
             let output = pollResult.stdout || '';
-            let structuredHistory = null;
 
             if (cli === 'claude' && output.trim().startsWith('{')) {
                 try {
                     const parsed = JSON.parse(output);
-                    structuredHistory = parsed;
                     output = parsed.result || output;
-                    if (parsed.usage) {
-                        writeThinking(`Usage: input=${parsed.usage.input_tokens || 0}, output=${parsed.usage.output_tokens || 0}`);
-                    }
+                    if (parsed) dictionary.conversationHistory = parsed;
                 } catch {
-                    writeThinking('Could not parse Claude JSON output, using raw stdout');
+                    // not JSON, use raw
                 }
             }
 
@@ -124,18 +103,19 @@ export async function exec() {
             if (pollResult.exitCode !== 0) output += `\n[EXIT CODE: ${pollResult.exitCode}]`;
 
             dictionary.response = output || '(CLI completed with no output)';
-            if (structuredHistory) dictionary.conversationHistory = structuredHistory;
-
-            writeThinking(`Execution complete. Exit code: ${pollResult.exitCode}`);
-            writeThinking(`Output length: ${output.length} chars`);
-            writeThinking(`Output preview: ${output.substring(0, 500)}`);
         }
 
         else if (mode === 'spawn') {
             if (!cli) throw new Error("Missing 'cli' parameter");
 
             let cliArgs = [];
-            if (args) cliArgs = typeof args === 'string' ? args.split(' ') : args;
+            if (args) {
+                if (typeof args === 'string') {
+                    try { cliArgs = JSON.parse(args); } catch { cliArgs = args.split(' '); }
+                } else {
+                    cliArgs = args;
+                }
+            }
 
             const result = await bridgeCall('/api/cli/spawn', { cli, args: cliArgs, cwd, metadata });
 
@@ -145,7 +125,6 @@ export async function exec() {
                 status: 'running',
                 message: `CLI session started: ${cli}`
             });
-            writeThinking(`Interactive session ${result.sessionId} started`);
         }
 
         else if (mode === 'send') {
@@ -159,7 +138,7 @@ export async function exec() {
         else if (mode === 'read') {
             if (!sessionId) throw new Error("Missing 'sessionId' for read mode");
 
-            const result = await bridgeCall('/api/cli/output', { sessionId, full: dictionary.full || false });
+            const result = await bridgeCall('/api/cli/output', { sessionId, full: ctx.full || false });
 
             let output = result.stdout || '';
             if (result.stderr) output += `\n[STDERR]\n${result.stderr}`;
@@ -187,7 +166,6 @@ export async function exec() {
                     dictionary.response = output;
                     return;
                 }
-                writeThinking(`Waiting... (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
             }
 
             let output = pollResult.stdout || '';
@@ -207,8 +185,6 @@ export async function exec() {
         }
 
     } catch (error) {
-        const msg = `CLI Executor Error: ${error.message}`;
-        writeThinking(msg);
-        dictionary.response = msg;
+        dictionary.response = `CLI Executor Error: ${error.message}`;
     }
 }

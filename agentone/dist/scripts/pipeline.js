@@ -340,7 +340,7 @@ async function runPipeline(input) {
     state.setProfile(profileName);
   }
 
-  if (inputWorkingDirectory) {
+  if (inputWorkingDirectory && !(shouldResume && state.getWorkingDirectory())) {
     state.setWorkingDirectory(inputWorkingDirectory, { base: true });
   }
 
