@@ -115,7 +115,17 @@ export async function run(context) {
       throw new Error('Implement stage requires profile (simple/standard/complex).');
     }
 
-    const { worktreePath, branchName } = ensureWorktree(context, ticketKey);
+    let worktreePath, branchName;
+    if (context.noWorktree) {
+      // Use the specified workDir directly — no git worktree
+      worktreePath = context.workDir || context.workingDirectory;
+      branchName = null;
+      if (!worktreePath) {
+        throw new Error('--no-worktree requires --workdir to be set.');
+      }
+    } else {
+      ({ worktreePath, branchName } = ensureWorktree(context, ticketKey));
+    }
 
     let template;
     try {

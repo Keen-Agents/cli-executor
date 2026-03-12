@@ -77,6 +77,15 @@ export async function exec() {
 
                 if (!pollResult.running) break;
 
+                // Detect human-gate pause — return early so the agent can ask the user
+                const partialOut = pollResult.stdout || '';
+                if (partialOut.includes('[human-gate] Pipeline paused')) {
+                    const runIdMatch = partialOut.match(/Starting run (run-[^\s]+)/);
+                    const runId = runIdMatch ? runIdMatch[1] : 'unknown';
+                    dictionary.response = `PIPELINE_PAUSED_FOR_REVIEW\n\nThe pipeline is paused at the human-gate stage waiting for your approval.\nRun ID: ${runId}\nSession ID: ${spawnResult.sessionId}\n\nPlease ask the user to approve, revise, or reject.\nTo approve, call CLI Executor with:\n  mode: execute\n  cli: node\n  args: ["-e", "fetch('http://localhost:3222/api/pipeline/decide',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'${runId}',decision:'approve',comments:''})}).then(r=>r.json()).then(j=>console.log(JSON.stringify(j))).catch(e=>console.error(e))"]\n\nAfter approving, resume the pipeline by calling CLI Executor with:\n  mode: wait\n  sessionId: ${spawnResult.sessionId}\n  timeout: 900000`;
+                    return;
+                }
+
                 const elapsed = Date.now() - startTime;
                 if (elapsed > timeout) {
                     await bridgeCall('/api/cli/kill', { sessionId: spawnResult.sessionId }).catch(() => {});

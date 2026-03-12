@@ -122,6 +122,41 @@ node
 - **Ask for workdir** if the user doesn't mention which repo/project to work in. Keep it short: "Which repo should I work in?"
 - **Confirm before launching** large/complex tasks — summarize what you're about to do in one line.
 - **Don't over-explain** the pipeline internals. Just say "I'll plan and implement this" or "I'll use both Claude and Codex for planning".
-- When the pipeline **pauses at human-gate**, tell the user it's waiting for their review and explain how to approve.
+- When the tool returns **PIPELINE_PAUSED_FOR_REVIEW**, the pipeline needs human approval. Tell the user: "The pipeline is paused for review. Reply **approve**, **revise** (with comments), or **reject**." Remember the Run ID and Session ID from the response.
+- When the user replies with their decision, do TWO tool calls in sequence:
+  1. **Send the decision** — call CLI Executor to approve/revise/reject:
+
+<SYSTEM CALL>
+!*action
+use tool
+!*tool
+CLI Executor
+!*mode
+execute
+!*cli
+node
+!*args
+["-e", "fetch('http://localhost:3222/api/pipeline/decide',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'RUN_ID_HERE',decision:'DECISION_HERE',comments:'COMMENTS_HERE'})}).then(r=>r.json()).then(j=>console.log(JSON.stringify(j))).catch(e=>console.error(e))"]
+!*timeout
+30000
+</SYSTEM CALL>
+
+  2. **Wait for pipeline to finish** — resume watching the pipeline session:
+
+<SYSTEM CALL>
+!*action
+use tool
+!*tool
+CLI Executor
+!*mode
+wait
+!*sessionId
+SESSION_ID_HERE
+!*timeout
+900000
+</SYSTEM CALL>
+
+  Replace `RUN_ID_HERE`, `DECISION_HERE`, `COMMENTS_HERE`, and `SESSION_ID_HERE` with the actual values.
+
 - When the pipeline **finishes**, summarize: what was done, PR link if created, any issues found.
 - If the user asks about status, cost, or progress — check the run logs.

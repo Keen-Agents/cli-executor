@@ -1,5 +1,6 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import { exec, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -343,15 +344,27 @@ function createSession(cli, args, cwd, metadata = {}) {
 
     const sessionId = generateSessionId();
 
-    console.log(`[${new Date().toISOString()}] Spawn: ${cli} [${args.length} args]`);
+    // On Windows, npm-global CLIs are .cmd wrappers. shell:true would use cmd.exe
+    // which mangles angle brackets (<COMPLETED> → file redirects). Instead, resolve
+    // the actual .js entry point and spawn node directly — no shell needed.
+    const CLI_SCRIPTS = {
+        claude: path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js'),
+        codex: path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
+    };
 
-    // Use shell for .cmd wrappers on Windows (both claude and codex are npm globals).
-    const needsShell = IS_WINDOWS && ['claude', 'codex'].includes(cli.toLowerCase());
+    let resolvedCli = cli;
+    let resolvedArgs = args;
+    if (IS_WINDOWS && CLI_SCRIPTS[cli.toLowerCase()] && fsSync.existsSync(CLI_SCRIPTS[cli.toLowerCase()])) {
+        resolvedArgs = [CLI_SCRIPTS[cli.toLowerCase()], ...args];
+        resolvedCli = process.execPath; // node.exe
+    }
 
-    const proc = spawn(cli, args, {
+    console.log(`[${new Date().toISOString()}] Spawn: ${resolvedCli} [${resolvedArgs.length} args]`);
+
+    const proc = spawn(resolvedCli, resolvedArgs, {
         cwd: cwd || BASE_DIR,
         stdio: ['pipe', 'pipe', 'pipe'],
-        shell: needsShell,
+        shell: false,
         env: { ...process.env, CLAUDECODE: undefined, PATH: process.env.PATH }
     });
 
@@ -1528,6 +1541,48 @@ const server = http.createServer(async (req, res) => {
                 const list = [];
                 for (const bs of browserSessions.values()) list.push(browserSessionSnapshot(bs));
                 result = { sessions: list, total: list.length, running: list.filter(s => s.running).length, maxSessions: MAX_BROWSER_SESSIONS };
+            }
+
+            // Pipeline human-gate decision endpoint
+            else if (url === '/api/pipeline/decide') {
+                const { runId, decision, comments } = data;
+                if (!runId) throw new Error("Missing 'runId'");
+                if (!['approve', 'revise', 'reject'].includes(decision)) throw new Error("Invalid 'decision'. Use: approve, revise, reject");
+
+                const logsDir = path.join(BASE_DIR, 'logs', 'pipeline-runs');
+                // Find the run directory matching the runId
+                let runDir = null;
+                if (fsSync.existsSync(logsDir)) {
+                    const dirs = fsSync.readdirSync(logsDir);
+                    runDir = dirs.find(d => d === runId || d.includes(runId));
+                }
+                if (!runDir) throw new Error(`Run directory not found for runId: ${runId}`);
+
+                const decisionPath = path.join(logsDir, runDir, 'human-decision.json');
+                const payload = { decision, comments: comments || '' };
+                fsSync.writeFileSync(decisionPath, JSON.stringify(payload, null, 2), 'utf8');
+                console.log(`[${new Date().toISOString()}] Pipeline decision: ${decision} for ${runId}`);
+                result = { ok: true, runId, decision, file: decisionPath };
+            }
+
+            // List pipeline runs (for finding runIds)
+            else if (url === '/api/pipeline/list') {
+                const logsDir = path.join(BASE_DIR, 'logs', 'pipeline-runs');
+                let runs = [];
+                if (fsSync.existsSync(logsDir)) {
+                    runs = fsSync.readdirSync(logsDir)
+                        .filter(d => fsSync.statSync(path.join(logsDir, d)).isDirectory())
+                        .map(d => {
+                            const runPath = path.join(logsDir, d, 'run.json');
+                            const requestPath = path.join(logsDir, d, 'human-decision-request.json');
+                            const decisionPath = path.join(logsDir, d, 'human-decision.json');
+                            let status = 'unknown';
+                            if (fsSync.existsSync(decisionPath)) status = 'decided';
+                            else if (fsSync.existsSync(requestPath)) status = 'awaiting_decision';
+                            return { runId: d, status, hasDecision: fsSync.existsSync(decisionPath) };
+                        });
+                }
+                result = { runs };
             }
 
             else {

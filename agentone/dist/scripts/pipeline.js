@@ -142,6 +142,11 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--no-worktree') {
+      args.noWorktree = true;
+      continue;
+    }
+
     if (arg === '--prompt') {
       args.prompt = argv[i + 1] || '';
       i += 1;
@@ -404,7 +409,8 @@ async function runPipeline(input) {
       promptText,
       stageName: instanceName,
       workDir: resolveWorkingDirectory(inputWorkingDirectory, state),
-      workingDirectory: resolveWorkingDirectory(inputWorkingDirectory, state)
+      workingDirectory: resolveWorkingDirectory(inputWorkingDirectory, state),
+      noWorktree: input.noWorktree || false
     };
 
     try {
