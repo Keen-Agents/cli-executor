@@ -232,7 +232,7 @@ export async function run(context) {
       }
 
       const critiqueResult = await runAgent({
-        cli: 'claude',
+        cli: 'codex',
         prompt: critiquePrompt,
         cwd: context.workDir || undefined,
         timeout: TIMEOUTS['cross-critique'],

@@ -150,40 +150,112 @@ export async function run(context) {
       assembledPrompt += `\n\n## Human Revision Request\n${humanRevision.comments}`;
     }
 
-    // Use Claude for implementation — Codex's --sandbox read-only prevents file writes.
-    // Codex is used in dual-plan (planning only); Claude handles implementation.
-    const result = await runAgent({
-      cli: 'claude',
+    // Step 1: Codex implements the code (--full-auto allows file writes)
+    const implResult = await runAgent({
+      cli: 'codex',
       prompt: assembledPrompt,
       cwd: worktreePath,
       timeout: TIMEOUTS.implement,
-      label: `implement-claude-${ticketKey}`,
-      metadata: { stage: STAGE_NAME, cli: 'claude', ticketKey, runId: context.state.runId }
+      label: `implement-codex-${ticketKey}`,
+      extraArgs: ['--full-auto'],
+      metadata: { stage: STAGE_NAME, cli: 'codex', step: 'implement', ticketKey, runId: context.state.runId }
     });
 
     if (context.costTracker) {
-      const callData = CostTracker.fromAgentResult(result);
-      if (!callData.label) {
-        callData.label = `implement-${ticketKey}`;
-      }
+      const callData = CostTracker.fromAgentResult(implResult);
+      if (!callData.label) callData.label = `implement-codex-${ticketKey}`;
       context.costTracker.recordCall(STAGE_NAME, callData);
     }
 
-    if (result.timedOut) {
-      throw new Error(`Implement stage timed out after ${TIMEOUTS.implement}ms for ticket ${ticketKey}.`);
+    if (implResult.timedOut) {
+      throw new Error(`Implement stage (codex) timed out after ${TIMEOUTS.implement}ms for ticket ${ticketKey}.`);
     }
 
-    if (!result.content) {
-      const partialLen = (result.fullOutput || '').length;
-      throw new Error(`Implement stage did not return a <COMPLETED> tag. Partial output length: ${partialLen}.`);
+    if (!implResult.content) {
+      const partialLen = (implResult.fullOutput || '').length;
+      throw new Error(`Implement stage (codex) did not return a <COMPLETED> tag. Partial output length: ${partialLen}.`);
     }
+
+    // Step 2: Collect the diff of what Codex wrote
+    let codexDiff = '';
+    try {
+      codexDiff = execFileSync('git', ['diff', '--no-color'], {
+        cwd: worktreePath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000
+      });
+      // Include staged changes too
+      const stagedDiff = execFileSync('git', ['diff', '--cached', '--no-color'], {
+        cwd: worktreePath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000
+      });
+      if (stagedDiff) codexDiff += '\n' + stagedDiff;
+    } catch {
+      codexDiff = '(unable to collect git diff)';
+    }
+
+    // Step 3: Claude reviews Codex's code and fixes any issues
+    const reviewPrompt = [
+      `You are a senior engineer reviewing code changes made by another agent for ticket ${ticketKey}.`,
+      `**Summary:** ${ticketSummary}`,
+      '',
+      '## Implementation Plan That Was Followed',
+      planText,
+      '',
+      '## Code Changes To Review',
+      codexDiff || '(no diff detected — check for new untracked files)',
+      '',
+      '## Codex Implementation Summary',
+      implResult.content,
+      '',
+      '## Your Task',
+      '1. Review the code changes against the plan — check for correctness, missed edge cases, bugs, security issues, and code quality.',
+      '2. If you find issues, **fix them directly** in the files. You have full file system access.',
+      '3. If the code is correct and complete, state that clearly.',
+      '',
+      'When done, wrap your review in:',
+      '<COMPLETED>',
+      '[Your review: what was correct, what you fixed (if anything), and final assessment]',
+      '</COMPLETED>'
+    ].join('\n');
+
+    const reviewResult = await runAgent({
+      cli: 'claude',
+      prompt: reviewPrompt,
+      cwd: worktreePath,
+      timeout: TIMEOUTS.implement,
+      label: `implement-review-claude-${ticketKey}`,
+      metadata: { stage: STAGE_NAME, cli: 'claude', step: 'review', ticketKey, runId: context.state.runId }
+    });
+
+    if (context.costTracker) {
+      const reviewCallData = CostTracker.fromAgentResult(reviewResult);
+      if (!reviewCallData.label) reviewCallData.label = `implement-review-${ticketKey}`;
+      context.costTracker.recordCall(STAGE_NAME, reviewCallData);
+    }
+
+    if (reviewResult.timedOut) {
+      context.logger?.log({
+        type: 'STAGE_WARNING',
+        stage: STAGE_NAME,
+        message: `Claude review timed out after ${TIMEOUTS.implement}ms — proceeding with Codex implementation as-is.`
+      });
+    }
+
+    const reviewContent = reviewResult.content?.trim() || 'Review skipped or timed out.';
+    const totalDurationMs = (implResult.durationMs || 0) + (reviewResult.durationMs || 0);
 
     const output = {
-      summary: result.content,
-      fullOutput: result.fullOutput,
-      sessionId: result.sessionId,
-      durationMs: result.durationMs,
-      success: result.success,
+      summary: reviewContent,
+      codexSummary: implResult.content,
+      codexSessionId: implResult.sessionId,
+      reviewSessionId: reviewResult.sessionId || null,
+      fullOutput: implResult.fullOutput,
+      durationMs: totalDurationMs,
+      success: implResult.success,
       workingDirectory: worktreePath,
       branchName
     };

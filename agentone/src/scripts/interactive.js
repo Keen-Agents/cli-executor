@@ -15,10 +15,10 @@
  */
 
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdtempSync } from 'node:fs';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -138,6 +138,17 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, p
     if (!isFirst) args.push('--continue');
     args.push('--dangerously-skip-permissions');
 
+    // Pass system prompt via temp file to avoid Windows cmd.exe ~8KB argument limit.
+    // --append-system-prompt-file preserves Claude's built-in prompt (including MCP tools)
+    // while adding our orchestrator instructions on top.
+    let promptFile = null;
+    if (isFirst && systemPrompt) {
+      const tmpDir = mkdtempSync(join(tmpdir(), 'keen-'));
+      promptFile = join(tmpDir, 'system-prompt.txt');
+      writeFileSync(promptFile, systemPrompt, 'utf8');
+      args.push('--append-system-prompt-file', promptFile);
+    }
+
     const proc = spawn('claude', args, {
       cwd: workdir,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -147,11 +158,7 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, p
 
     if (procRef) procRef.proc = proc;
 
-    if (isFirst) {
-      proc.stdin.write(systemPrompt + '\n\n---\n\nUser message: ' + stdinContent);
-    } else {
-      proc.stdin.write(stdinContent);
-    }
+    proc.stdin.write(stdinContent);
     proc.stdin.end();
     proc.stdin.on('error', () => {});
 
