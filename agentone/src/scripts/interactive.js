@@ -285,8 +285,9 @@ class KeenCLI {
     // Process reference (for kill on Ctrl+C)
     this._primaryProcRef = {};
 
-    // Scroll buffer (for resize replay)
+    // Scroll buffer (for resize replay + scrollback)
     this._scrollBuffer = [];
+    this._scrollOffset = 0;   // 0 = at bottom, >0 = lines scrolled up
 
     // Spinner + elapsed time
     this._spinnerFrame = 0;
@@ -507,6 +508,8 @@ class KeenCLI {
       this.scrollWrite(`  ${a.cyan('Ctrl+U'.padEnd(24))} ${a.dim('Clear input line')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+W'.padEnd(24))} ${a.dim('Delete word backward')}\n`);
       this.scrollWrite(`  ${a.cyan('\u2191\u2193 arrows'.padEnd(24))} ${a.dim('History navigation')}\n`);
+      this.scrollWrite(`  ${a.cyan('PgUp / PgDn'.padEnd(24))} ${a.dim('Scroll conversation')}\n`);
+      this.scrollWrite(`  ${a.cyan('Shift+\u2191 / Shift+\u2193'.padEnd(24))} ${a.dim('Scroll 3 lines')}\n`);
       this.scrollWrite('\n');
       return;
     }
@@ -566,13 +569,61 @@ class KeenCLI {
 
   // Write text into the scroll region (auto-saves cursor position)
   scrollWrite(text) {
-    // Buffer for replay on resize
+    // Buffer for replay on resize + scrollback
     this._scrollBuffer.push(text);
-    if (this._scrollBuffer.length > 500) this._scrollBuffer = this._scrollBuffer.slice(-250);
+    if (this._scrollBuffer.length > 1000) this._scrollBuffer = this._scrollBuffer.slice(-500);
+
+    // Auto-scroll to bottom on new content
+    this._scrollOffset = 0;
 
     this.w(a.hide + a.restore);
     this.w(text);
     this.w(a.save + a.show);
+  }
+
+  // ── Scrollback (Page Up / Page Down) ──────────────────────────────────
+  _getAllDisplayLines() {
+    return this._scrollBuffer.join('').split('\n');
+  }
+
+  _scrollUp(lines) {
+    const allLines = this._getAllDisplayLines();
+    const viewHeight = this.scrollEnd - this.scrollStart;
+    const step = lines || Math.floor(viewHeight / 2);
+    const maxOffset = Math.max(0, allLines.length - viewHeight);
+    this._scrollOffset = Math.min(this._scrollOffset + step, maxOffset);
+    this._redrawScrollView();
+  }
+
+  _scrollDown(lines) {
+    const viewHeight = this.scrollEnd - this.scrollStart;
+    const step = lines || Math.floor(viewHeight / 2);
+    this._scrollOffset = Math.max(0, this._scrollOffset - step);
+    this._redrawScrollView();
+  }
+
+  _redrawScrollView() {
+    const allLines = this._getAllDisplayLines();
+    const viewHeight = this.scrollEnd - this.scrollStart;
+    const endIdx = allLines.length - this._scrollOffset;
+    const startIdx = Math.max(0, endIdx - viewHeight);
+    const visible = allLines.slice(startIdx, endIdx);
+
+    this.w(a.hide);
+    // Clear scroll region
+    for (let i = this.scrollStart; i <= this.scrollEnd; i++) {
+      this.w(a.moveTo(i, 1) + a.clearLine);
+    }
+    // Draw visible lines
+    for (let i = 0; i < visible.length; i++) {
+      this.w(a.moveTo(this.scrollStart + i, 1) + visible[i]);
+    }
+    // Scroll indicator when not at bottom
+    if (this._scrollOffset > 0) {
+      this.w(a.moveTo(this.scrollEnd, this.cols - 12) + a.dim(`\u2191 scroll \u2193`));
+    }
+    this.w(a.save + a.show);
+    this.drawBottom();
   }
 
   // ── Pipeline tag detection ───────────────────────────────────────────
@@ -1094,6 +1145,14 @@ class KeenCLI {
         }
         return;
       }
+      // Page Up — scroll back through history
+      if (hex === '1b5b357e') { this._scrollUp(); return; }
+      // Page Down — scroll forward
+      if (hex === '1b5b367e') { this._scrollDown(); return; }
+      // Shift+Up — scroll up one line
+      if (hex === '1b5b313b3241') { this._scrollUp(3); return; }
+      // Shift+Down — scroll down one line
+      if (hex === '1b5b313b3242') { this._scrollDown(3); return; }
       return; // silently ignore unknown escape sequences
     }
 
