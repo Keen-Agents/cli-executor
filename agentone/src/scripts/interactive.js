@@ -328,6 +328,7 @@ class KeenCLI {
 
   setup() {
     this.w(a.altOn);
+    this.w('\x1b[?1000h\x1b[?1006h');  // enable mouse tracking (SGR mode) for wheel scroll
     this.w(a.clear);
     this._prevRows = this.rows;
     this.drawHeader();
@@ -363,6 +364,7 @@ class KeenCLI {
     if (this._onResize) process.stdout.removeListener('resize', this._onResize);
     if (this._onStdinData) process.stdin.removeListener('data', this._onStdinData);
 
+    this.w('\x1b[?1000l\x1b[?1006l');  // disable mouse tracking
     this.w(a.resetScroll);
     this.w(a.show);
     this.w(a.altOff);
@@ -429,21 +431,13 @@ class KeenCLI {
     this.drawHeader();
     this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
 
-    // Replay scroll buffer (content is preserved, artifacts are gone)
-    this.w(a.moveTo(this.scrollStart, 1));
-    for (const text of this._scrollBuffer) {
-      this.w(text);
-    }
-    this.w(a.save);
-
-    // Redraw bottom bar
-    this.drawBottom();
+    // Redraw from buffer (respects scroll offset, shows correct viewport)
+    this._redrawScrollView();
 
     // Re-enable spinner if we're in the middle of a turn
     if (this.busy) {
       this._spinnerActive = true;
     }
-    this.w(a.show);
   }
 
   // ── Slash commands ─────────────────────────────────────────────────────
@@ -573,8 +567,12 @@ class KeenCLI {
     this._scrollBuffer.push(text);
     if (this._scrollBuffer.length > 1000) this._scrollBuffer = this._scrollBuffer.slice(-500);
 
-    // Auto-scroll to bottom on new content
-    this._scrollOffset = 0;
+    if (this._scrollOffset > 0) {
+      // Was scrolled up — snap to bottom with full redraw (text already in buffer)
+      this._scrollOffset = 0;
+      this._redrawScrollView();
+      return;
+    }
 
     this.w(a.hide + a.restore);
     this.w(text);
@@ -802,6 +800,7 @@ class KeenCLI {
   }
 
   _drawSpinnerInScroll() {
+    if (this._scrollOffset > 0) return;  // don't overwrite when user is scrolled up
     const frame = SPINNER[this._spinnerFrame % SPINNER.length];
     const elapsed = Math.floor((Date.now() - this._turnStartTime) / 1000);
     const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
@@ -1014,6 +1013,15 @@ class KeenCLI {
 
     // Ctrl+T — reserved for future use
     if (key === '\x14') return;
+
+    // Mouse wheel scroll (SGR mode) — works even while model is generating
+    const sgrMouseMatch = key.match(/\x1b\[<(\d+);\d+;\d+[Mm]/);
+    if (sgrMouseMatch) {
+      const button = parseInt(sgrMouseMatch[1]);
+      if (button === 64) this._scrollUp(3);   // wheel up
+      if (button === 65) this._scrollDown(3);  // wheel down
+      return;
+    }
 
     if (this.busy) return;
 
