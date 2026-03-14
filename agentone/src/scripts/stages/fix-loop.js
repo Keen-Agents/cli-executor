@@ -67,6 +67,33 @@ export async function run(context) {
     let finalVerifyPassed = false;
     let effectiveVerify = verify;
     let currentTestOutput = toText(verify?.tests?.output);
+
+    // When AGENTONE_SKIP_REVIEW=1, skip Claude fix attempts — return failure details for dispatcher to fix manually
+    if (process.env.AGENTONE_SKIP_REVIEW === '1') {
+      context.logger?.log({
+        type: 'STAGE_INFO',
+        stage: STAGE_NAME,
+        message: 'Fix-loop skipped (AGENTONE_SKIP_REVIEW=1) — dispatcher will fix failures manually.'
+      });
+      const output = {
+        fixed: false,
+        attempts: [],
+        totalAttempts: 0,
+        finalVerifyPassed: false,
+        effectiveVerify: verify,
+        skipped: true,
+        reason: 'AGENTONE_SKIP_REVIEW=1 — dispatcher will review and fix.',
+        failureDetails: {
+          testOutput: currentTestOutput,
+          summary: toText(verify?.summary),
+          lintOutput: toText(verify?.lint?.output || ''),
+          auditOutput: toText(verify?.audit?.output || '')
+        }
+      };
+      context.state.checkpoint(STAGE_NAME, output);
+      return output;
+    }
+
     const promptTemplate = readFileSync(FIX_PROMPT_TEMPLATE_PATH, 'utf8');
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {

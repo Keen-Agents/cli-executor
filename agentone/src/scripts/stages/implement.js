@@ -198,61 +198,80 @@ export async function run(context) {
     }
 
     // Step 3: Claude reviews Codex's code and fixes any issues
-    const reviewPrompt = [
-      `You are a senior engineer reviewing code changes made by another agent for ticket ${ticketKey}.`,
-      `**Summary:** ${ticketSummary}`,
-      '',
-      '## Implementation Plan That Was Followed',
-      planText,
-      '',
-      '## Code Changes To Review',
-      codexDiff || '(no diff detected — check for new untracked files)',
-      '',
-      '## Codex Implementation Summary',
-      implResult.content,
-      '',
-      '## Your Task',
-      '1. Review the code changes against the plan — check for correctness, missed edge cases, bugs, security issues, and code quality.',
-      '2. If you find issues, **fix them directly** in the files. You have full file system access.',
-      '3. If the code is correct and complete, state that clearly.',
-      '',
-      'When done, wrap your review in:',
-      '<COMPLETED>',
-      '[Your review: what was correct, what you fixed (if anything), and final assessment]',
-      '</COMPLETED>'
-    ].join('\n');
+    // Skip when AGENTONE_SKIP_REVIEW=1 (dispatcher will review manually)
+    const skipReview = process.env.AGENTONE_SKIP_REVIEW === '1';
+    let reviewContent = 'Review skipped — dispatcher will review.';
+    let reviewSessionId = null;
+    let reviewDurationMs = 0;
 
-    const reviewResult = await runAgent({
-      cli: 'claude',
-      prompt: reviewPrompt,
-      cwd: worktreePath,
-      timeout: TIMEOUTS.implement,
-      label: `implement-review-claude-${ticketKey}`,
-      metadata: { stage: STAGE_NAME, cli: 'claude', step: 'review', ticketKey, runId: context.state.runId }
-    });
+    if (!skipReview) {
+      const reviewPrompt = [
+        `You are a senior engineer reviewing code changes made by another agent for ticket ${ticketKey}.`,
+        `**Summary:** ${ticketSummary}`,
+        '',
+        '## Implementation Plan That Was Followed',
+        planText,
+        '',
+        '## Code Changes To Review',
+        codexDiff || '(no diff detected — check for new untracked files)',
+        '',
+        '## Codex Implementation Summary',
+        implResult.content,
+        '',
+        '## Your Task',
+        '1. Review the code changes against the plan — check for correctness, missed edge cases, bugs, security issues, and code quality.',
+        '2. If you find issues, **fix them directly** in the files. You have full file system access.',
+        '3. If the code is correct and complete, state that clearly.',
+        '',
+        'When done, wrap your review in:',
+        '<COMPLETED>',
+        '[Your review: what was correct, what you fixed (if anything), and final assessment]',
+        '</COMPLETED>'
+      ].join('\n');
 
-    if (context.costTracker) {
-      const reviewCallData = CostTracker.fromAgentResult(reviewResult);
-      if (!reviewCallData.label) reviewCallData.label = `implement-review-${ticketKey}`;
-      context.costTracker.recordCall(STAGE_NAME, reviewCallData);
-    }
+      const reviewResult = await runAgent({
+        cli: 'claude',
+        prompt: reviewPrompt,
+        cwd: worktreePath,
+        timeout: TIMEOUTS.implement,
+        label: `implement-review-claude-${ticketKey}`,
+        metadata: { stage: STAGE_NAME, cli: 'claude', step: 'review', ticketKey, runId: context.state.runId }
+      });
 
-    if (reviewResult.timedOut) {
+      if (context.costTracker) {
+        const reviewCallData = CostTracker.fromAgentResult(reviewResult);
+        if (!reviewCallData.label) reviewCallData.label = `implement-review-${ticketKey}`;
+        context.costTracker.recordCall(STAGE_NAME, reviewCallData);
+      }
+
+      if (reviewResult.timedOut) {
+        context.logger?.log({
+          type: 'STAGE_WARNING',
+          stage: STAGE_NAME,
+          message: `Claude review timed out after ${TIMEOUTS.implement}ms — proceeding with Codex implementation as-is.`
+        });
+      }
+
+      reviewContent = reviewResult.content?.trim() || 'Review skipped or timed out.';
+      reviewSessionId = reviewResult.sessionId || null;
+      reviewDurationMs = reviewResult.durationMs || 0;
+    } else {
       context.logger?.log({
-        type: 'STAGE_WARNING',
+        type: 'STAGE_INFO',
         stage: STAGE_NAME,
-        message: `Claude review timed out after ${TIMEOUTS.implement}ms — proceeding with Codex implementation as-is.`
+        message: 'Claude review skipped (AGENTONE_SKIP_REVIEW=1) — dispatcher will review diff manually.'
       });
     }
 
-    const reviewContent = reviewResult.content?.trim() || 'Review skipped or timed out.';
-    const totalDurationMs = (implResult.durationMs || 0) + (reviewResult.durationMs || 0);
+    const totalDurationMs = (implResult.durationMs || 0) + reviewDurationMs;
 
     const output = {
       summary: reviewContent,
       codexSummary: implResult.content,
+      codexDiff: codexDiff || null,
       codexSessionId: implResult.sessionId,
-      reviewSessionId: reviewResult.sessionId || null,
+      reviewSessionId,
+      reviewSkipped: skipReview,
       fullOutput: implResult.fullOutput,
       durationMs: totalDurationMs,
       success: implResult.success,
