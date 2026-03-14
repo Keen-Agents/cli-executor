@@ -15,7 +15,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdtempSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, readdirSync, mkdirSync, unlinkSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
@@ -24,6 +24,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SYSTEM_PROMPT_PATH = resolve(__dirname, 'prompts/orchestrator.md');
 const HISTORY_FILE = resolve(homedir(), '.keen_history');
+const SESSIONS_DIR = resolve(homedir(), '.keen', 'sessions');
+const MAX_SESSIONS = 50;
 const MAX_HISTORY = 500;
 const IS_WINDOWS = process.platform === 'win32';
 
@@ -32,6 +34,9 @@ const SLASH_COMMANDS = [
   { cmd: '/model',    args: '[claude|codex]', desc: 'Switch or toggle primary model' },
   { cmd: '/claude',   args: '',               desc: 'Switch to Claude' },
   { cmd: '/codex',    args: '',               desc: 'Switch to Codex' },
+  { cmd: '/sessions', args: '',               desc: 'List saved sessions' },
+  { cmd: '/resume',   args: '<id>',           desc: 'Resume a saved session' },
+  { cmd: '/new',      args: '',               desc: 'Start a fresh session' },
   { cmd: '/spinner',  args: '[name]',         desc: 'Change spinner style' },
   { cmd: '/clear',    args: '',               desc: 'Clear screen (Ctrl+L)' },
   { cmd: '/help',     args: '',               desc: 'Show available commands' },
@@ -117,13 +122,17 @@ function killProc(proc) {
 // ── CLI arg parsing ──────────────────────────────────────────────────────────
 function parseArgs(argv) {
   let workdir = process.cwd();
+  let resumeId = null;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--workdir' && argv[i + 1]) {
       workdir = resolve(argv[i + 1]);
       i++;
+    } else if (argv[i] === '--resume' && argv[i + 1]) {
+      resumeId = argv[i + 1];
+      i++;
     }
   }
-  return { workdir };
+  return { workdir, resumeId };
 }
 
 // ── Run a single orchestrator turn ──────────────────────────────────────────
@@ -276,6 +285,11 @@ class KeenCLI {
     this.isFirstClaude = true;
     this.isFirstCodex = true;
     this.conversationHistory = [];   // used for Codex context (Claude uses --continue)
+
+    // ── Session persistence ──────────────────────────────────────
+    this.sessionId = `keen-${Date.now()}`;
+    this._sessionCreated = new Date().toISOString();
+    this._ensureSessionsDir();
 
     // Per-turn output buffer
     this.primaryOutput = '';
@@ -440,6 +454,65 @@ class KeenCLI {
     }
   }
 
+  // ── Session persistence ──────────────────────────────────────────────
+  _ensureSessionsDir() {
+    try { if (!existsSync(SESSIONS_DIR)) mkdirSync(SESSIONS_DIR, { recursive: true }); } catch {}
+  }
+
+  _saveSession() {
+    if (this.conversationHistory.length === 0) return;
+    const data = {
+      id: this.sessionId,
+      created: this._sessionCreated,
+      updated: new Date().toISOString(),
+      preview: this.conversationHistory[0]?.content?.slice(0, 80) || '',
+      model: this.primaryModel,
+      history: this.conversationHistory
+    };
+    try {
+      writeFileSync(resolve(SESSIONS_DIR, `${this.sessionId}.json`), JSON.stringify(data), 'utf8');
+      this._pruneOldSessions();
+    } catch {}
+  }
+
+  _listSessions() {
+    try {
+      return readdirSync(SESSIONS_DIR)
+        .filter(f => f.endsWith('.json'))
+        .sort().reverse()
+        .map(f => { try { return JSON.parse(readFileSync(resolve(SESSIONS_DIR, f), 'utf8')); } catch { return null; } })
+        .filter(Boolean);
+    } catch { return []; }
+  }
+
+  _loadSession(partialId) {
+    const sessions = this._listSessions();
+    return sessions.find(s => s.id.includes(partialId)) || null;
+  }
+
+  _pruneOldSessions() {
+    try {
+      const files = readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json')).sort();
+      while (files.length > MAX_SESSIONS) {
+        const old = files.shift();
+        try { unlinkSync(resolve(SESSIONS_DIR, old)); } catch {}
+      }
+    } catch {}
+  }
+
+  resumeSession(partialId) {
+    const session = this._loadSession(partialId);
+    if (!session) return false;
+    this._saveSession(); // save current session first
+    this.sessionId = session.id;
+    this._sessionCreated = session.created;
+    this.conversationHistory = session.history || [];
+    this.primaryModel = session.model || 'claude';
+    this.isFirstClaude = true;
+    this.isFirstCodex = true;
+    return session;
+  }
+
   // ── Slash commands ─────────────────────────────────────────────────────
   handleSlashCommand(text) {
     const parts = text.split(/\s+/);
@@ -512,6 +585,8 @@ class KeenCLI {
       const turns = Math.floor(this.conversationHistory.length / 2);
       const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
       this.scrollWrite(`\n${a.magenta(a.bold('Status'))}\n`);
+      const shortId = this.sessionId.replace('keen-', '').slice(-8);
+      this.scrollWrite(`  ${a.cyan('Session:'.padEnd(14))} ${shortId}\n`);
       this.scrollWrite(`  ${a.cyan('Model:'.padEnd(14))} ${mc(this.primaryModel)}\n`);
       this.scrollWrite(`  ${a.cyan('Spinner:'.padEnd(14))} ${activeSpinnerName} ${SPINNER.join(' ')}\n`);
       this.scrollWrite(`  ${a.cyan('Turns:'.padEnd(14))} ${turns}\n`);
@@ -532,6 +607,67 @@ class KeenCLI {
       } catch (err) {
         this.scrollWrite(a.red(`Failed to save: ${err.message}\n`));
       }
+      return;
+    }
+
+    if (cmd === '/sessions') {
+      const sessions = this._listSessions();
+      if (sessions.length === 0) {
+        this.scrollWrite(a.dim('  No saved sessions yet.\n'));
+        return;
+      }
+      this.scrollWrite('\n' + a.magenta(a.bold('Sessions')) + '\n\n');
+      const show = sessions.slice(0, 20);
+      for (const s of show) {
+        const d = new Date(s.updated);
+        const date = d.toLocaleDateString();
+        const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const turns = Math.floor((s.history?.length || 0) / 2);
+        const shortId = s.id.replace('keen-', '').slice(-8);
+        const isCurrent = s.id === this.sessionId ? a.green(' *') : '';
+        const preview = (s.preview || '(empty)').slice(0, 50);
+        this.scrollWrite(`  ${a.cyan(shortId)}${isCurrent}  ${a.dim(date + ' ' + time)}  ${a.dim(turns + 't')}  ${preview}\n`);
+      }
+      if (sessions.length > 20) this.scrollWrite(a.dim(`  ... and ${sessions.length - 20} more\n`));
+      this.scrollWrite('\n' + a.dim('  /resume <id> to continue a session') + '\n\n');
+      return;
+    }
+
+    if (cmd === '/resume') {
+      const partialId = parts[1];
+      if (!partialId) {
+        this.scrollWrite(a.yellow('Usage: /resume <id>  (use /sessions to list)\n'));
+        return;
+      }
+      const session = this.resumeSession(partialId);
+      if (!session) {
+        this.scrollWrite(a.red(`No session matching "${partialId}"\n`));
+        return;
+      }
+      const turns = Math.floor(session.history.length / 2);
+      this.scrollWrite(a.green(`\nResumed session (${turns} turns)\n\n`));
+      // Show recent conversation for context
+      const recent = session.history.slice(-6);
+      for (const turn of recent) {
+        const prefix = turn.role === 'user' ? a.green('\u203A') : a.cyan('\u25C7');
+        const text = turn.content.slice(0, 120) + (turn.content.length > 120 ? '...' : '');
+        this.scrollWrite(`  ${prefix} ${a.dim(text)}\n`);
+      }
+      this.scrollWrite('\n');
+      this.drawHeader();
+      this.drawBottom();
+      return;
+    }
+
+    if (cmd === '/new') {
+      this._saveSession();
+      this.sessionId = `keen-${Date.now()}`;
+      this._sessionCreated = new Date().toISOString();
+      this.conversationHistory = [];
+      this.isFirstClaude = true;
+      this.isFirstCodex = true;
+      this.scrollWrite(a.green('New session started.\n'));
+      this.drawBottom();
       return;
     }
 
@@ -865,8 +1001,18 @@ class KeenCLI {
 
     // Run primary model — buffer output, display only if no dispatch tags
     const isFirst = this.primaryModel === 'claude' ? this.isFirstClaude : this.isFirstCodex;
+
+    // When resuming a session, give Claude context of the previous conversation
+    let modelInput = text;
+    if (isFirst && this.conversationHistory.length > 0 && this.primaryModel === 'claude') {
+      const ctx = this.conversationHistory.slice(-10).map(t =>
+        `[${t.role}]: ${t.content.slice(0, 500)}`
+      ).join('\n\n');
+      modelInput = `[Resumed session — previous conversation for context]\n${ctx}\n\n[Current message]\n${text}`;
+    }
+
     try {
-      const result = await runTurn(text, {
+      const result = await runTurn(modelInput, {
         workdir: this.workdir,
         isFirst,
         systemPrompt: this.systemPrompt,
@@ -970,6 +1116,7 @@ class KeenCLI {
 
     this._stopSpinner();
     this._primaryProcRef = {};
+    this._saveSession();
     this.busy = false;
     this.drawBottom();
   }
@@ -1210,6 +1357,18 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   }
 
   const cli = new KeenCLI({ workdir: args.workdir, systemPrompt });
+
+  // Resume a previous session if --resume was passed
+  if (args.resumeId) {
+    const session = cli.resumeSession(args.resumeId);
+    if (session) {
+      const turns = Math.floor(session.history.length / 2);
+      console.log(`[keen] Resumed session (${turns} turns): ${session.preview || '(no preview)'}`);
+    } else {
+      console.error(`[keen] No session matching "${args.resumeId}"`);
+      process.exit(1);
+    }
+  }
 
   const shutdown = () => { cli.cleanup(); process.exit(0); };
   process.on('exit', () => cli.cleanup());
