@@ -80,83 +80,22 @@ function ensureWorktree(context, ticketKey) {
 }
 
 /**
- * Use Claude to decompose a plan into independent subtasks for parallel implementation.
- * Returns null on failure (caller falls back to single-agent mode).
+ * Validate dispatcher-provided subtasks.
+ * Returns a valid decomposition object or null.
  */
-async function decomposeIntoSubtasks(planText, ticketKey, ticketSummary, context, worktreePath) {
-  const prompt = [
-    `You are a task decomposition agent. Break an implementation plan into independent subtasks that can be worked on in parallel by separate agents.`,
-    ``,
-    `## Ticket: ${ticketKey}`,
-    `**Summary:** ${ticketSummary}`,
-    ``,
-    `## Implementation Plan`,
-    planText,
-    ``,
-    `## Your Task`,
-    ``,
-    `Analyze this plan and split it into independent subtasks. Each subtask will be given to a separate Codex agent that works in the same codebase.`,
-    ``,
-    `Rules:`,
-    `- Each subtask must have a CLEAR, NON-OVERLAPPING file scope — no two subtasks should modify the same file`,
-    `- If two changes depend on the same file, they MUST be in the same subtask`,
-    `- Order matters: if subtask B imports from a file created in subtask A, mark that dependency`,
-    `- Simple plans (1-3 files) should be a SINGLE subtask — don't over-split`,
-    `- Maximum ${MAX_PARALLEL_AGENTS} subtasks`,
-    `- Each subtask needs: a label, the specific files it will create/modify, and clear instructions`,
-    ``,
-    `## Output Format`,
-    ``,
-    `Respond with EXACTLY this JSON inside COMPLETED tags:`,
-    ``,
-    `<COMPLETED>`,
-    `{`,
-    `  "strategy": "single" or "parallel",`,
-    `  "reasoning": "One sentence explaining why single vs parallel",`,
-    `  "subtasks": [`,
-    `    {`,
-    `      "label": "short-label",`,
-    `      "files": ["src/foo.js", "src/bar.js"],`,
-    `      "instructions": "What to implement in this subtask",`,
-    `      "dependsOn": []`,
-    `    }`,
-    `  ]`,
-    `}`,
-    `</COMPLETED>`,
-    ``,
-    `If the plan is simple enough for one agent, use strategy "single" with one subtask containing the full plan.`
-  ].join('\n');
+function validateSubtasks(subtasks) {
+  if (!Array.isArray(subtasks) || subtasks.length === 0) return null;
 
-  try {
-    const result = await runAgent({
-      cli: 'claude',
-      prompt,
-      cwd: worktreePath,
-      timeout: 120_000,
-      label: `implement-decompose-${ticketKey}`,
-      metadata: { stage: STAGE_NAME, step: 'decompose', ticketKey, runId: context.state.runId },
-      extractRegex: COMPLETED_REGEX
-    });
+  const valid = subtasks
+    .filter(s => s?.label && s?.instructions && Array.isArray(s?.files))
+    .slice(0, MAX_PARALLEL_AGENTS);
 
-    if (context.costTracker && result.sessionId) {
-      context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(result));
-    }
+  if (valid.length === 0) return null;
 
-    if (!result.success || !result.content) return null;
-
-    const parsed = JSON.parse(result.content);
-    if (!parsed?.subtasks || !Array.isArray(parsed.subtasks) || parsed.subtasks.length === 0) return null;
-
-    return parsed;
-  } catch (err) {
-    context.logger?.log({
-      type: 'GATE_CHECK',
-      stage: STAGE_NAME,
-      gate: 'decompose_failed',
-      error: err instanceof Error ? err.message : String(err)
-    });
-    return null;
-  }
+  return {
+    strategy: valid.length > 1 ? 'parallel' : 'single',
+    subtasks: valid
+  };
 }
 
 /**
@@ -266,11 +205,16 @@ export async function run(context) {
       assembledPrompt += `\n\n## Human Revision Request\n${humanRevision.comments}`;
     }
 
-    // Step 1: Decompose plan into subtasks
-    context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'decompose_start' });
-
-    const decomposition = await decomposeIntoSubtasks(planText, ticketKey, ticketSummary, context, worktreePath);
+    // Step 1: Check for dispatcher-provided subtasks or fall back to single agent
+    const decomposition = context.subtasks ? validateSubtasks(context.subtasks) : null;
     const useParallel = decomposition?.strategy === 'parallel' && decomposition.subtasks.length > 1;
+
+    context.logger?.log({
+      type: 'GATE_CHECK',
+      stage: STAGE_NAME,
+      gate: useParallel ? 'parallel_from_input' : 'single_agent',
+      subtaskCount: decomposition?.subtasks?.length || 1
+    });
 
     let implSummaries;
 

@@ -8,12 +8,11 @@ const STAGE_NAME = 'research';
 const COMPLETED_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
 const CONVERGED_SIGNAL = '<CONVERGED>';
 
-const PLANNER_JSON_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
 const MAX_RESEARCH_AGENTS = 8;
 const MIN_RESEARCH_AGENTS = 2;
 
 /**
- * Fallback: generate 3 default research angles if the planner agent fails.
+ * Fallback: generate 3 default research angles when dispatcher doesn't provide any.
  */
 function generateDefaultAngles(description) {
   const base = description.trim();
@@ -48,93 +47,16 @@ function buildAnglePrompt(topic, label, focus) {
 }
 
 /**
- * Use a planner agent to decide what research angles are needed.
- * Returns an array of {label, prompt} objects — the planner decides how many (2-8).
+ * Convert dispatcher-provided angles [{label, focus}] into research angle objects.
  */
-async function planResearchAngles(description, context, ticketKey, timeout) {
-  const plannerPrompt = [
-    `You are a research planning agent. Given a topic, decide what research angles are needed for thorough coverage.`,
-    ``,
-    `## Topic`,
-    description.trim(),
-    ``,
-    `## Your Task`,
-    `Decide the research angles needed to thoroughly investigate this topic. Each angle will be given to a separate research agent that will search the web independently.`,
-    ``,
-    `Guidelines:`,
-    `- Use ${MIN_RESEARCH_AGENTS}-${MAX_RESEARCH_AGENTS} angles depending on topic complexity`,
-    `- Simple topics (e.g., "best CLI tool for X") need 2-3 angles`,
-    `- Complex topics (e.g., "design a microservices architecture for e-commerce") need 5-8 angles`,
-    `- Each angle should cover a DISTINCT aspect — no overlap`,
-    `- Each angle needs a short label (1-3 words, lowercase, hyphens) and a focus description`,
-    ``,
-    `## Output Format`,
-    ``,
-    `Respond with EXACTLY this JSON array inside COMPLETED tags. No other text.`,
-    ``,
-    `<COMPLETED>`,
-    `[`,
-    `  {"label": "short-label", "focus": "What this angle should investigate"},`,
-    `  {"label": "another-angle", "focus": "What this angle should investigate"}`,
-    `]`,
-    `</COMPLETED>`
-  ].join('\n');
-
-  try {
-    const result = await runAgent({
-      cli: 'claude',
-      prompt: plannerPrompt,
-      cwd: context.workDir || undefined,
-      timeout: Math.min(timeout, 120_000),
-      label: `research-planner-${ticketKey}`,
-      metadata: {
-        stage: STAGE_NAME,
-        angle: 'planner',
-        ticketKey,
-        runId: context.state.runId
-      },
-      extractRegex: PLANNER_JSON_REGEX
-    });
-
-    if (context.costTracker && result.sessionId) {
-      context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(result));
-    }
-
-    if (!result.success || !result.content) {
-      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'planner_failed', reason: 'no content' });
-      return null;
-    }
-
-    const parsed = JSON.parse(result.content);
-    if (!Array.isArray(parsed) || parsed.length < MIN_RESEARCH_AGENTS) {
-      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'planner_failed', reason: 'invalid array', length: parsed?.length });
-      return null;
-    }
-
-    // Validate and cap
-    const angles = parsed
-      .filter(a => a?.label && a?.focus)
-      .slice(0, MAX_RESEARCH_AGENTS)
-      .map(a => ({
-        label: String(a.label).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30),
-        prompt: buildAnglePrompt(description.trim(), a.label, a.focus)
-      }));
-
-    if (angles.length < MIN_RESEARCH_AGENTS) {
-      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'planner_failed', reason: 'too few valid angles', count: angles.length });
-      return null;
-    }
-
-    return angles;
-  } catch (err) {
-    context.logger?.log({
-      type: 'GATE_CHECK',
-      stage: STAGE_NAME,
-      gate: 'planner_failed',
-      error: err instanceof Error ? err.message : String(err)
-    });
-    return null;
-  }
+function anglesFromInput(inputAngles, description) {
+  return inputAngles
+    .filter(a => a?.label && a?.focus)
+    .slice(0, MAX_RESEARCH_AGENTS)
+    .map(a => ({
+      label: String(a.label).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30),
+      prompt: buildAnglePrompt(description.trim(), a.label, a.focus)
+    }));
 }
 
 /**
@@ -356,16 +278,13 @@ export async function run(context) {
       results = phase1Checkpoint.results;
       angles = (phase1Checkpoint.results || []).map(r => ({ label: r.label, prompt: '' }));
     } else {
-      // ── Phase 0: Planner decides research angles ────────────────────
-      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'planner_start' });
-
-      const plannedAngles = await planResearchAngles(description, context, ticketKey, timeout);
-      if (plannedAngles) {
-        angles = plannedAngles;
+      // ── Resolve research angles: dispatcher input → default fallback ──
+      if (Array.isArray(context.angles) && context.angles.length >= MIN_RESEARCH_AGENTS) {
+        angles = anglesFromInput(context.angles, description);
         context.logger?.log({
           type: 'GATE_CHECK',
           stage: STAGE_NAME,
-          gate: 'planner_done',
+          gate: 'angles_from_input',
           angleCount: angles.length,
           labels: angles.map(a => a.label)
         });
@@ -374,7 +293,7 @@ export async function run(context) {
         context.logger?.log({
           type: 'GATE_CHECK',
           stage: STAGE_NAME,
-          gate: 'planner_fallback',
+          gate: 'angles_default',
           angleCount: angles.length,
           labels: angles.map(a => a.label)
         });

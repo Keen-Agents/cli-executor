@@ -107,7 +107,9 @@ function parseArgs(argv) {
     resume: false,
     workingDirectory: '',
     prompt: '',
-    promptFile: ''
+    promptFile: '',
+    angles: null,
+    subtasks: null
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -155,6 +157,26 @@ function parseArgs(argv) {
 
     if (arg === '--prompt-file') {
       args.promptFile = argv[i + 1] || '';
+      i += 1;
+      continue;
+    }
+
+    if (arg === '--angles') {
+      try {
+        args.angles = JSON.parse(argv[i + 1] || '[]');
+      } catch {
+        throw new Error('--angles must be valid JSON: [{"label":"...", "focus":"..."}]');
+      }
+      i += 1;
+      continue;
+    }
+
+    if (arg === '--subtasks') {
+      try {
+        args.subtasks = JSON.parse(argv[i + 1] || '[]');
+      } catch {
+        throw new Error('--subtasks must be valid JSON: [{"label":"...", "files":[], "instructions":"..."}]');
+      }
       i += 1;
       continue;
     }
@@ -417,7 +439,9 @@ async function runPipeline(input) {
       stageName: instanceName,
       workDir: resolveWorkingDirectory(inputWorkingDirectory, state),
       workingDirectory: resolveWorkingDirectory(inputWorkingDirectory, state),
-      noWorktree: input.noWorktree || false
+      noWorktree: input.noWorktree || false,
+      angles: input.angles || null,
+      subtasks: input.subtasks || null
     };
 
     try {
@@ -562,7 +586,10 @@ export async function exec(dictionary) {
   const resume = Boolean(dictionary?.resume);
   const workingDirectory = dictionary?.workingDirectory || dictionary?.workDir || '';
 
-  const result = await runPipeline({ ticketKey: effectiveKey, profile, runId, resume, workingDirectory, prompt, promptFile });
+  const angles = dictionary?.angles || null;
+  const subtasks = dictionary?.subtasks || null;
+
+  const result = await runPipeline({ ticketKey: effectiveKey, profile, runId, resume, workingDirectory, prompt, promptFile, angles, subtasks });
 
   if (dictionary && typeof dictionary === 'object') {
     dictionary.response = result;
