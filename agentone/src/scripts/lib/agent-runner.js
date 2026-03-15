@@ -220,7 +220,7 @@ function buildArgs(cli, prompt, extraArgs) {
         const defaults = AGENT_DEFAULTS.claude?.extraArgs || [];
         // Use stream-json for real-time output in the bridge debugger.
         // This streams NDJSON events as Claude works, instead of one blob at the end.
-        return ['-p', '--output-format', 'stream-json', ...defaults, ...extraArgs];
+        return ['-p', '--verbose', '--output-format', 'stream-json', ...defaults, ...extraArgs];
     }
     if (cli === 'codex') {
         const defaults = AGENT_DEFAULTS.codex?.extraArgs || [];
@@ -271,12 +271,12 @@ function parseClaudeStdout(stdout) {
                 }
             }
 
-            // Extract from result event (final output)
+            // Extract from result event (final output) — only if no assistant text yet
             if (event.type === 'result') {
                 resultObj = event;
-                if (typeof event.result === 'string') {
+                if (textParts.length === 0 && typeof event.result === 'string') {
                     textParts.push(event.result);
-                } else if (event.result?.content) {
+                } else if (textParts.length === 0 && event.result?.content) {
                     for (const block of event.result.content) {
                         if (block.type === 'text' && typeof block.text === 'string') {
                             textParts.push(block.text);

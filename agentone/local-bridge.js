@@ -369,8 +369,9 @@ function parseClaudeStreamJson(rawStdout, session) {
                 }
             }
         } else if (event.type === 'result') {
-            // Final result — extract text and metadata
-            if (typeof event.result === 'string') {
+            // Final result — extract metadata. Only use result text if no assistant text yet
+            // (result.result duplicates the last assistant message content).
+            if (currentAssistant.length === 0 && typeof event.result === 'string') {
                 currentAssistant.push(event.result);
             }
             if (event.usage) usage = event.usage;
@@ -429,10 +430,14 @@ function parseCodexHistory(rawStdout, session) {
         // Skip function calls — not human-readable
         if (item.type === 'function_call' || item.type === 'function_call_output') continue;
 
-        const text = extractCodexText(item);
+        // Try extracting from item first, then from event-level fields
+        const text = extractCodexText(item)
+            || (typeof event.agent_message === 'string' ? event.agent_message : null)
+            || extractCodexText(event);
         if (!text) continue;
 
-        if (item.role === 'user') {
+        const role = item.role || item.type;
+        if (role === 'user') {
             userMessages.push(text);
         } else {
             assistantMessages.push(text);
@@ -463,6 +468,7 @@ function parseCodexHistory(rawStdout, session) {
 
 function extractCodexText(item) {
     if (typeof item.text === 'string') return item.text;
+    if (typeof item.output_text === 'string') return item.output_text;
     if (typeof item.message === 'string') return item.message;
     if (typeof item.agent_message === 'string') return item.agent_message;
     if (Array.isArray(item.content)) {
@@ -471,6 +477,7 @@ function extractCodexText(item) {
             if (typeof chunk === 'string') parts.push(chunk);
             else if (chunk && typeof chunk.text === 'string') parts.push(chunk.text);
             else if (chunk && typeof chunk.output_text === 'string') parts.push(chunk.output_text);
+            else if (chunk && typeof chunk.content === 'string') parts.push(chunk.content);
         }
         return parts.join('\n').trim() || null;
     }
