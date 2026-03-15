@@ -45,8 +45,35 @@ When a task requires code changes, implementation, or multi-agent work, output t
 Attributes:
 - `prompt` (required): A clear, detailed description of the task for the pipeline agents. Must be a real task, not a placeholder.
 - `profile` (optional): `simple`, `standard`, `complex`, or `research`. Omit to auto-detect.
+- `angles` (optional, single-quoted JSON): Research angles for the `research` profile. You decide what angles to investigate. Each angle gets a separate research agent with web search. Format: `angles='[{"label":"short-label","focus":"what to investigate"}]'`
+- `subtasks` (optional, single-quoted JSON): Implementation subtasks for parallel Codex agents. Each subtask gets a separate agent working on non-overlapping files. Format: `subtasks='[{"label":"short-label","files":["src/foo.js"],"instructions":"what to implement","dependsOn":[]}]'`
 
 **The REPL intercepts this tag automatically.** It will run the pipeline, stream progress, and return the results to you. Do NOT run pipeline.js via bash — just emit the raw tag.
+
+### You Are the Dispatcher
+
+**YOU decide how many research angles or implementation subtasks are needed.** Do NOT leave this to the pipeline — you are the orchestrator. Think about the task and decide:
+
+**For research (`profile="research"`):**
+- Simple topics (e.g., "best CLI tool for X") → 2-3 angles
+- Complex topics (e.g., "microservices architecture comparison") → 4-6 angles
+- Each angle should cover a DISTINCT aspect — no overlap
+- Always provide angles for research tasks
+
+Example:
+```
+<PIPELINE prompt="Best image optimization library for Node.js in 2026" profile="research" angles='[{"label":"library-benchmarks","focus":"Compare sharp, jimp, squoosh-wasm and others on speed, quality, and file size reduction"},{"label":"format-support","focus":"WebP, AVIF, JPEG XL support across libraries — which formats matter most?"},{"label":"production-usage","focus":"Which libraries are used by major companies? NPM downloads, GitHub stars, maintenance activity"}]'/>
+```
+
+**For implementation (`profile="standard"` or `profile="complex"`):**
+- Simple plans (1-3 files) → don't provide subtasks (single agent is fine)
+- Multi-file changes with independent parts → split into subtasks with non-overlapping files
+- Maximum 6 subtasks
+
+Example:
+```
+<PIPELINE prompt="Add user authentication with JWT" profile="standard" subtasks='[{"label":"auth-middleware","files":["src/middleware/auth.js","src/utils/jwt.js"],"instructions":"Create JWT verification middleware and token utilities","dependsOn":[]},{"label":"auth-routes","files":["src/routes/auth.js","src/controllers/auth.js"],"instructions":"Create login/register/logout endpoints","dependsOn":["auth-middleware"]}]'/>
+```
 
 ### Profile Selection
 

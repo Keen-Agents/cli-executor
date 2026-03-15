@@ -776,9 +776,23 @@ class KeenCLI {
     const REJECT = ['TASK_DESCRIPTION', 'your task description here', '...'];
     if (!prompt || prompt.length < 5 || REJECT.includes(prompt)) return null;
 
+    // Parse angles and subtasks (single-quoted JSON to avoid conflicts with double-quote attrs)
+    let angles = null;
+    let subtasks = null;
+    const anglesMatch = attrs.match(/angles='([^']*)'/);
+    const subtasksMatch = attrs.match(/subtasks='([^']*)'/);
+    if (anglesMatch) {
+      try { angles = JSON.parse(anglesMatch[1]); } catch {}
+    }
+    if (subtasksMatch) {
+      try { subtasks = JSON.parse(subtasksMatch[1]); } catch {}
+    }
+
     return {
       prompt,
-      profile: profileMatch ? profileMatch[1] : ''
+      profile: profileMatch ? profileMatch[1] : '',
+      angles,
+      subtasks
     };
   }
 
@@ -848,10 +862,12 @@ class KeenCLI {
   }
 
   // ── Pipeline dispatch ──────────────────────────────────────────────────
-  async runPipelineFromTag(prompt, profile) {
+  async runPipelineFromTag(prompt, profile, angles, subtasks) {
     const scriptPath = resolve(__dirname, 'pipeline.js');
     const args = [scriptPath, '--prompt', prompt, '--workdir', this.workdir];
     if (profile) args.push('--profile', profile);
+    if (angles) args.push('--angles', JSON.stringify(angles));
+    if (subtasks) args.push('--subtasks', JSON.stringify(subtasks));
 
     this.pipelineRunning = true;
     this._pipelineProfile = profile || 'auto';
@@ -1075,7 +1091,7 @@ class KeenCLI {
       // ── Pipeline tag interception (full multi-stage) ──────────────
       if (pipelineTag) {
         this._clearSpinnerLine();
-        const pipelineResult = await this.runPipelineFromTag(pipelineTag.prompt, pipelineTag.profile);
+        const pipelineResult = await this.runPipelineFromTag(pipelineTag.prompt, pipelineTag.profile, pipelineTag.angles, pipelineTag.subtasks);
 
         // Feed result back to dispatcher for summarization
         const summaryPrompt = pipelineResult.success
