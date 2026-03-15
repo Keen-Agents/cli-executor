@@ -3,6 +3,7 @@
 export const STAGE_PROFILES = {
   plan: {
     sections: [
+      { key: 'research', priority: 1, maxTokens: 8000 },
       { key: 'ticket', priority: 1, maxTokens: 5000 },
       { key: 'codeOverview', priority: 1, maxTokens: 10000 },
       { key: 'repoTree', priority: 2, maxTokens: 3000 },
@@ -20,6 +21,7 @@ export const STAGE_PROFILES = {
     sections: [
       { key: 'convergedPlan', priority: 1, maxTokens: 15000 },
       { key: 'ticket', priority: 1, maxTokens: 3000 },
+      { key: 'research', priority: 2, maxTokens: 5000 },
       { key: 'relevantCode', priority: 1, maxTokens: 30000 },
       { key: 'critiqueSummary', priority: 3, maxTokens: 3000 },
     ],
@@ -130,6 +132,10 @@ function resolveContent(runState, key, extraData = {}) {
       return asText(extraData[key]);
     case 'critiqueSummary':
       return asText(extraData.critiqueSummary || critiqueOutput?.summary || planOutput?.critiqueSummary);
+    case 'research': {
+      const researchOutput = runState?.getStageOutput?.('research');
+      return asText(researchOutput?.summary) || asText(researchOutput?.researchSummary) || '';
+    }
     default:
       return '';
   }

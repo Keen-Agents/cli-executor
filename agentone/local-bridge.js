@@ -309,6 +309,84 @@ function generateSessionId() {
     return randomBytes(8).toString('hex');
 }
 
+/**
+ * Parse Codex JSONL stdout into structured conversation history.
+ * Returns null if the output doesn't look like Codex JSONL.
+ */
+function parseCodexHistory(rawStdout, session) {
+    const lines = rawStdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const events = [];
+    for (const line of lines) {
+        try { events.push(JSON.parse(line)); } catch { /* skip non-JSON */ }
+    }
+    if (events.length === 0) return null;
+
+    const userMessages = [];
+    const assistantMessages = [];
+    let usage = null;
+
+    for (const event of events) {
+        // Extract usage from turn.completed
+        if (event.type === 'turn.completed' && event.usage) {
+            usage = event.usage;
+        }
+
+        if (event.type !== 'item.completed') continue;
+        const item = event.item;
+        if (!item) continue;
+
+        // Skip function calls — not human-readable
+        if (item.type === 'function_call' || item.type === 'function_call_output') continue;
+
+        const text = extractCodexText(item);
+        if (!text) continue;
+
+        if (item.role === 'user') {
+            userMessages.push(text);
+        } else {
+            assistantMessages.push(text);
+        }
+    }
+
+    if (userMessages.length === 0 && assistantMessages.length === 0) return null;
+
+    // Build pairs: stdin prompt as user, extracted assistant messages as response
+    const pairs = [];
+    const userPrompt = (session.stdinLog && session.stdinLog.length > 0)
+        ? session.stdinLog.map(e => e.input).join('\n')
+        : (userMessages.length > 0 ? userMessages.join('\n\n') : '(prompt sent via stdin)');
+
+    pairs.push({
+        user: userPrompt,
+        assistant: assistantMessages.length > 0
+            ? assistantMessages.join('\n\n')
+            : '(no assistant text extracted)'
+    });
+
+    return {
+        pairs,
+        usage: usage || null,
+        messageCount: userMessages.length + assistantMessages.length
+    };
+}
+
+function extractCodexText(item) {
+    if (typeof item.text === 'string') return item.text;
+    if (typeof item.message === 'string') return item.message;
+    if (typeof item.agent_message === 'string') return item.agent_message;
+    if (Array.isArray(item.content)) {
+        const parts = [];
+        for (const chunk of item.content) {
+            if (typeof chunk === 'string') parts.push(chunk);
+            else if (chunk && typeof chunk.text === 'string') parts.push(chunk.text);
+            else if (chunk && typeof chunk.output_text === 'string') parts.push(chunk.output_text);
+        }
+        return parts.join('\n').trim() || null;
+    }
+    if (typeof item.content === 'string') return item.content;
+    return null;
+}
+
 function getRunningCount() {
     let count = 0;
     for (const s of sessions.values()) {
@@ -1150,6 +1228,24 @@ const server = http.createServer(async (req, res) => {
                             messageCount: 1
                         };
                         result = { sessionId, history: session.conversationHistory, running: session.running, source: 'parsed' };
+                    } else if (rawStdout.includes('\n') && rawStdout.split('\n').some(l => l.trim().startsWith('{'))) {
+                        // Codex JSONL format: multiple JSON lines with item.completed events
+                        const codexParsed = parseCodexHistory(rawStdout, session);
+                        if (codexParsed) {
+                            session.conversationHistory = codexParsed;
+                            result = { sessionId, history: codexParsed, running: session.running, source: 'codex-parsed' };
+                        } else if (session.stdinLog && session.stdinLog.length > 0) {
+                            const pairs = session.stdinLog.map(entry => ({
+                                user: entry.input,
+                                timestamp: entry.timestamp
+                            }));
+                            if (pairs.length > 0) {
+                                pairs[pairs.length - 1].assistant = session.stdout;
+                            }
+                            result = { sessionId, history: { pairs, messageCount: session.stdinLog.length }, running: session.running, source: 'stdinLog' };
+                        } else {
+                            result = { sessionId, history: null, raw: session.stdout, running: session.running, source: 'raw' };
+                        }
                     } else if (session.stdinLog && session.stdinLog.length > 0) {
                         const pairs = session.stdinLog.map(entry => ({
                             user: entry.input,

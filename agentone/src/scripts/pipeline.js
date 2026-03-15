@@ -362,7 +362,14 @@ async function runPipeline(input) {
     ? CostTracker.load(runDir, { soft: thresholds.warning, hard: thresholds.hard })
     : new CostTracker(runDir, { soft: thresholds.warning, hard: thresholds.hard });
 
-  console.log(`[pipeline] Starting run ${runId}`);
+  // On resume, reset pipeline status from 'failed' back to 'running'
+  if (shouldResume && (state.state.status === 'failed' || state.state.status?.startsWith('PAUSED_'))) {
+    state.state.status = 'running';
+    state.state.updatedAt = new Date().toISOString();
+    console.log(`[pipeline] Resuming run ${runId} (was: ${state.state.status})`);
+  } else {
+    console.log(`[pipeline] Starting run ${runId}`);
+  }
 
   const stageInstances = resolveStageInstances(stageList);
   let stageIndex = 0;
@@ -504,6 +511,7 @@ async function runPipeline(input) {
       logger.log({ type: 'STAGE_FAILED', stage: instanceName, error: message });
       state.fail(instanceName, err);
       console.error(`[pipeline] Stage ${instanceName} failed: ${message}`);
+      console.error(`[pipeline] To resume after fixing: --resume --run-id ${runId}`);
       break;
     }
   }

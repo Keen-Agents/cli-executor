@@ -1,9 +1,12 @@
 import { runAgent } from '../lib/agent-runner.js';
 import { CostTracker } from '../lib/cost-tracker.js';
-import { TIMEOUTS } from '../pipeline-config.js';
+import { TIMEOUTS, DEFAULTS } from '../pipeline-config.js';
+
+const DEBATE_SAFETY_CAP = DEFAULTS.debateSafetyCap ?? 10;
 
 const STAGE_NAME = 'research';
 const COMPLETED_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
+const CONVERGED_SIGNAL = '<CONVERGED>';
 
 /**
  * Generate 3 research angle prompts from a task description.
@@ -15,11 +18,11 @@ function generateAngles(description) {
       label: 'landscape',
       prompt: [
         `Research the following topic broadly. Identify the major options, tools, frameworks, or approaches available.`,
-        `Search the web for recent (2025-2026) information. Provide a thorough summary with sources.`,
+        `Search the web for recent (2025-2026) information. Go to primary sources — official reports, data platforms, company blogs with real numbers. Avoid listicles and aggregation blogs.`,
         '',
         `Topic: ${base}`,
         '',
-        `Focus on: What exists? What are the leading solutions? How do they compare at a high level?`,
+        `Focus on: What exists? What are the leading solutions? How do they compare at a high level? Cite URLs for every claim.`,
         '',
         'Wrap your findings in:',
         '<COMPLETED>',
@@ -31,11 +34,11 @@ function generateAngles(description) {
       label: 'tradeoffs',
       prompt: [
         `Research the trade-offs and limitations of solutions for the following topic.`,
-        `Search the web for real-world experience reports, benchmarks, and known issues (2025-2026).`,
+        `Search the web for real-world experience reports, benchmarks, and known issues (2025-2026). Go to primary sources — official reports, data platforms, GitHub issues, company blogs with real numbers.`,
         '',
         `Topic: ${base}`,
         '',
-        `Focus on: Performance characteristics, scalability limits, learning curve, maintenance burden, community health, known pitfalls.`,
+        `Focus on: Performance characteristics, scalability limits, learning curve, maintenance burden, community health, known pitfalls. Cite URLs for every claim.`,
         '',
         'Wrap your findings in:',
         '<COMPLETED>',
@@ -47,11 +50,11 @@ function generateAngles(description) {
       label: 'recommendation',
       prompt: [
         `Based on current best practices, recommend the best approach for the following topic.`,
-        `Search the web for expert opinions, recent articles, and community consensus (2025-2026).`,
+        `Search the web for expert opinions, recent articles, and community consensus (2025-2026). Go to primary sources — official reports, revenue data, market analysis. Avoid listicles.`,
         '',
         `Topic: ${base}`,
         '',
-        `Focus on: What would you recommend for a production project starting today? Why? What are the runner-up options?`,
+        `Focus on: What would you recommend for a production project starting today? Why? What are the runner-up options? Cite URLs for every claim.`,
         '',
         'Wrap your findings in:',
         '<COMPLETED>',
@@ -83,85 +86,167 @@ function mergeResults(angles, results) {
 }
 
 /**
- * Build the adversarial critique prompt for Codex.
+ * Build a debate prompt for alternating Claude/Codex adversarial rounds.
+ * @param {boolean} [isAutoMode] — if true, no fixed round limit; AIs debate until genuine convergence.
  */
-function buildCritiquePrompt(description, researchSummary) {
-  return [
-    `You are an adversarial research critic. Your job is to TEAR APART the research below — not to validate it.`,
+function buildDebatePrompt(description, researchSummary, debateHistory, round, isAutoMode = true) {
+  const cli = round % 2 === 0 ? 'Claude' : 'Codex';
+  const opponent = round % 2 === 0 ? 'Codex' : 'Claude';
+
+  const sections = [
+    `You are an adversarial research critic (${cli}). Your opponent is ${opponent}.`,
     ``,
     `## Original Research Question`,
     description.trim(),
     ``,
     `## Research Findings (from Claude agents with web search)`,
     researchSummary,
-    ``,
-    `## Your Task`,
-    ``,
-    `Rip this research apart. You are NOT here to agree. Challenge everything:`,
-    ``,
-    `1. **Cherry-picked data** — Are benchmarks being cited selectively? Are sources biased or outdated? Would different metrics tell a different story?`,
-    `2. **Missing perspectives** — What options, tools, or approaches did the research ignore? What blind spots exist?`,
-    `3. **Unsupported claims** — Which recommendations lack hard evidence? Which "best practices" are actually just popularity contests?`,
-    `4. **Logical gaps** — Does the ranking actually follow from the data? Are comparisons apples-to-apples?`,
-    `5. **Recency bias** — Is this confusing "newest" with "best"? Are stable, proven solutions being overlooked for shiny new ones?`,
-    `6. **Cost analysis holes** — Are TCO calculations realistic? Are hidden costs (infra, migration, lock-in) being ignored?`,
-    `7. **Conflicting claims** — Point out where the research contradicts itself across sections.`,
+  ];
+
+  if (debateHistory.length > 0) {
+    sections.push('');
+    sections.push(`## Debate History`);
+    for (const entry of debateHistory) {
+      const who = entry.cli === 'claude' ? 'Claude' : 'Codex';
+      sections.push('');
+      sections.push(`### Round ${entry.round + 1} (${who})`);
+      sections.push(entry.content);
+    }
+  }
+
+  sections.push('');
+  sections.push(`## Your Task (Round ${round + 1})`);
+  sections.push('');
+
+  if (round === 0) {
+    sections.push(
+      `This is the FIRST critique round. Tear apart the research above:`,
+      ``,
+      `1. **Cherry-picked data** — Are sources biased or outdated? Would different metrics tell a different story?`,
+      `2. **Missing perspectives** — What did the research ignore? What blind spots exist?`,
+      `3. **Unsupported claims** — Which recommendations lack hard evidence?`,
+      `4. **Logical gaps** — Does the ranking follow from the data?`,
+      `5. **Conflicting claims** — Point out contradictions across sections.`,
+      ``,
+      `USE YOUR WEB SEARCH to fact-check specific claims. Find counter-evidence. Cite URLs.`,
+    );
+  } else {
+    sections.push(
+      `Read the previous round's critique carefully. Counter-critique it:`,
+      ``,
+      `- Where is the previous critic WRONG? Find evidence to disprove their points. Use web search.`,
+      `- Where is the previous critic RIGHT? Concede explicitly and update the recommendation.`,
+      `- Where did the previous critic introduce NEW errors or unsupported claims? Call them out.`,
+      `- Cite URLs for every counter-argument.`,
+    );
+  }
+
+  if (isAutoMode) {
+    sections.push(
+      ``,
+      `## Convergence Rule (AUTO MODE — no fixed round limit)`,
+      ``,
+      `This debate has NO predetermined number of rounds. You will keep debating until BOTH sides`,
+      `genuinely agree. There is no pressure to converge early — take as many rounds as needed.`,
+      ``,
+      `Signal convergence ONLY when you GENUINELY believe:`,
+      `- The core factual claims have been verified or corrected by BOTH sides`,
+      `- All contradictions have been resolved with evidence`,
+      `- The final recommendation is supported by evidence from multiple sources`,
+      `- Further rounds would NOT produce meaningful new insights`,
+      ``,
+      `When you are ready to converge, respond with ${CONVERGED_SIGNAL} followed by the final recommendation.`,
+      ``,
+      `If there are ANY unresolved factual disputes, missing evidence, or unanswered counter-arguments,`,
+      `you MUST keep arguing. Do NOT agree politely. Do NOT converge just because several rounds have passed.`,
+    );
+  } else {
+    sections.push(
+      ``,
+      `## Convergence Rule`,
+      ``,
+      `If you believe the debate has converged — the research + critiques have produced a solid,`,
+      `well-validated recommendation that further argument would NOT meaningfully improve — then`,
+      `respond with ${CONVERGED_SIGNAL} followed by the final agreed recommendation.`,
+      ``,
+      `But do NOT converge prematurely. Only converge if:`,
+      `- The core factual claims have been verified or corrected`,
+      `- Contradictions have been resolved`,
+      `- The final recommendation is supported by evidence from multiple sources`,
+      ``,
+      `If there are still unresolved factual disputes, KEEP ARGUING. Do NOT agree politely.`,
+    );
+  }
+
+  sections.push(
     ``,
     `## Rules`,
     ``,
-    `- Do NOT agree with the research. Do NOT say "the research is comprehensive" or "well-structured".`,
-    `- Every sentence must identify a specific problem, ask a hard question, or challenge a specific claim.`,
-    `- Cite the exact claims you're challenging. Use quotes.`,
-    `- If you think a recommendation is wrong, say what the CORRECT recommendation is and why.`,
+    `- Do NOT agree with prior arguments just to be nice. Every sentence must add value.`,
+    `- Cite exact claims you're challenging. Use quotes.`,
+    `- If you think a recommendation is wrong, say what the CORRECT one is and why.`,
     `- Be blunt. Be specific. No filler.`,
     ``,
-    `Wrap your critique in:`,
+    `Wrap your response in:`,
     `<COMPLETED>`,
-    `[Your adversarial critique here]`,
+    `[Your critique OR ${CONVERGED_SIGNAL} + final recommendation here]`,
     `</COMPLETED>`
-  ].join('\n');
+  );
+
+  return sections.join('\n');
 }
 
 /**
- * Build the defense/convergence prompt for Claude.
+ * Build the validation prompt for Claude.
  */
-function buildDefensePrompt(description, researchSummary, critique) {
+function buildValidationPrompt(description, researchSummary, debateHistory) {
+  const debateText = debateHistory.map(d => {
+    const who = d.cli === 'claude' ? 'Claude' : 'Codex';
+    return `### Round ${d.round + 1} (${who})\n${d.content}`;
+  }).join('\n\n');
+
   return [
-    `You are a research analyst responding to a harsh adversarial critique of your team's research.`,
+    `You are a research validation agent. You have just witnessed a full adversarial debate about a research question.`,
+    `Your job is to extract a STRUCTURED VERDICT from the debate.`,
     ``,
     `## Original Research Question`,
     description.trim(),
     ``,
-    `## Your Team's Research Findings`,
+    `## Original Research Findings`,
     researchSummary,
     ``,
-    `## Adversarial Critique (from Codex)`,
-    critique,
+    `## Adversarial Debate`,
+    debateText,
     ``,
     `## Your Task`,
     ``,
-    `Respond to every point in the critique. For each challenge:`,
+    `Analyze the full debate and answer these questions:`,
     ``,
-    `- **If the critic is RIGHT**: Concede explicitly. Say "Codex is correct here" and revise your position. Update the recommendation.`,
-    `- **If the critic is WRONG**: Defend with specific evidence. Cite sources. Explain why the critique doesn't hold.`,
-    `- **If it's a grey area**: Acknowledge the nuance. Present both sides fairly. Don't pretend certainty you don't have.`,
+    `1. **Did the original #1 recommendation survive the critique?** If the critique proved fatal flaws`,
+    `   (e.g., the recommended approach is technically impossible, legally blocked, or based on false assumptions),`,
+    `   then the recommendation did NOT survive.`,
+    `2. **What is the final recommendation?** State the recommended approach clearly.`,
+    `3. **How confident are you in this recommendation?** Score 0-100 where:`,
+    `   - 0-30: Recommendation is fundamentally flawed or unvalidated`,
+    `   - 31-60: Recommendation has significant concerns but may be viable`,
+    `   - 61-80: Recommendation is solid with known caveats`,
+    `   - 81-100: Recommendation is well-supported and validated`,
     ``,
-    `Then produce a **FINAL CONVERGED SUMMARY** that incorporates the valid critiques and drops the debunked ones.`,
-    `The converged summary should be BETTER than the original — sharper, more honest, with caveats where needed.`,
+    `## Output Format`,
     ``,
-    `## Rules`,
+    `You MUST respond with EXACTLY this JSON structure inside the COMPLETED tags.`,
+    `Do NOT include any text outside the JSON. Do NOT use markdown code blocks inside the tags.`,
     ``,
-    `- Do NOT dismiss the critique wholesale. At least SOME points will be valid — find them and concede.`,
-    `- Do NOT be defensive. If the evidence doesn't support your original claim, change your position.`,
-    `- The final summary must clearly mark where you changed your mind vs. held your ground.`,
-    ``,
-    `Structure your response as:`,
-    `1. Point-by-point responses to the critique`,
-    `2. Final converged research summary`,
-    ``,
-    `Wrap everything in:`,
     `<COMPLETED>`,
-    `[Your defense + converged summary here]`,
+    `{`,
+    `  "recommendationSurvived": true or false,`,
+    `  "finalRecommendation": {`,
+    `    "name": "Name of the recommended approach",`,
+    `    "description": "One paragraph summary of what to build/do",`,
+    `    "confidence": 0-100`,
+    `  },`,
+    `  "verdict": "One paragraph explaining your reasoning"`,
+    `}`,
     `</COMPLETED>`
   ].join('\n');
 }
@@ -185,203 +270,361 @@ export async function run(context) {
     const timeout = TIMEOUTS.research || 300_000;
     const ticketKey = intakeOutput.key || 'unknown';
 
-    context.logger?.log({
-      type: 'GATE_CHECK',
-      stage: STAGE_NAME,
-      gate: 'research_spawn',
-      angleCount: angles.length
-    });
+    // ── Check for sub-stage checkpoints (resume support) ─────────────
+    const phase1Checkpoint = context.state.getStageOutput('research-phase1');
+    let researchSummary;
+    let successCount;
+    let results;
 
-    // ── Phase 1: Parallel Claude research agents (web search) ─────────
-    const agentPromises = angles.map((angle) =>
-      runAgent({
-        cli: 'claude',
-        prompt: angle.prompt,
-        cwd: context.workDir || undefined,
-        timeout,
-        label: `research-${angle.label}-${ticketKey}`,
-        metadata: {
-          stage: STAGE_NAME,
-          angle: angle.label,
-          ticketKey,
-          runId: context.state.runId
-        },
-        extraArgs: ['--allowedTools', 'WebSearch,WebFetch'],
-        extractRegex: COMPLETED_REGEX
-      })
-    );
-
-    const results = await Promise.all(
-      agentPromises.map((p) => p.catch((err) => ({
-        success: false,
-        content: null,
-        fullOutput: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        timedOut: false,
-        durationMs: 0
-      })))
-    );
-
-    // Record costs
-    for (const result of results) {
-      if (context.costTracker && result.sessionId) {
-        context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(result));
-      }
-    }
-
-    const successCount = results.filter((r) => r.success).length;
-    if (successCount === 0) {
-      throw new Error('All research agents failed. No results to synthesize.');
-    }
-
-    const researchSummary = mergeResults(angles, results);
-
-    context.logger?.log({
-      type: 'GATE_CHECK',
-      stage: STAGE_NAME,
-      gate: 'research_complete',
-      successCount,
-      totalAngles: angles.length
-    });
-
-    // ── Phase 2: Codex adversarial critique ───────────────────────────
-    context.logger?.log({
-      type: 'GATE_CHECK',
-      stage: STAGE_NAME,
-      gate: 'adversarial_critique_start'
-    });
-
-    const critiquePrompt = buildCritiquePrompt(description, researchSummary);
-    let critiqueContent = null;
-
-    try {
-      const critiqueResult = await runAgent({
-        cli: 'codex',
-        prompt: critiquePrompt,
-        cwd: context.workDir || undefined,
-        timeout,
-        label: `research-adversarial-critique-${ticketKey}`,
-        metadata: {
-          stage: STAGE_NAME,
-          angle: 'adversarial-critique',
-          ticketKey,
-          runId: context.state.runId
-        },
-        extractRegex: COMPLETED_REGEX
+    if (phase1Checkpoint) {
+      // Resume: Phase 1 already completed
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'phase1_resumed' });
+      researchSummary = phase1Checkpoint.researchSummary;
+      successCount = phase1Checkpoint.successCount;
+      results = phase1Checkpoint.results;
+    } else {
+      // ── Phase 1: Parallel Claude research agents (web search) ──────
+      context.logger?.log({
+        type: 'GATE_CHECK',
+        stage: STAGE_NAME,
+        gate: 'research_spawn',
+        angleCount: angles.length
       });
 
-      if (context.costTracker && critiqueResult.sessionId) {
-        context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(critiqueResult));
+      const agentPromises = angles.map((angle) =>
+        runAgent({
+          cli: 'claude',
+          prompt: angle.prompt,
+          cwd: context.workDir || undefined,
+          timeout,
+          label: `research-${angle.label}-${ticketKey}`,
+          metadata: {
+            stage: STAGE_NAME,
+            angle: angle.label,
+            ticketKey,
+            runId: context.state.runId
+          },
+          extraArgs: ['--allowedTools', 'WebSearch,WebFetch'],
+          extractRegex: COMPLETED_REGEX
+        })
+      );
+
+      results = await Promise.all(
+        agentPromises.map((p) => p.catch((err) => ({
+          success: false,
+          content: null,
+          fullOutput: `Error: ${err instanceof Error ? err.message : String(err)}`,
+          timedOut: false,
+          durationMs: 0
+        })))
+      );
+
+      // Record costs
+      for (const result of results) {
+        if (context.costTracker && result.sessionId) {
+          context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(result));
+        }
       }
 
-      critiqueContent = critiqueResult.content || critiqueResult.fullOutput || null;
+      successCount = results.filter((r) => r.success).length;
+      const MIN_ANGLES_REQUIRED = 2;
+
+      if (successCount === 0) {
+        throw new Error('All research agents failed. No results to synthesize.');
+      }
+
+      if (successCount < MIN_ANGLES_REQUIRED) {
+        const failedAngles = angles
+          .filter((_, i) => !results[i]?.success)
+          .map((a) => {
+            const idx = angles.indexOf(a);
+            const r = results[idx];
+            const reason = r?.timedOut ? 'timed out' : 'failed';
+            return `${a.label} (${reason})`;
+          });
+        throw new Error(
+          `Research requires at least ${MIN_ANGLES_REQUIRED} of ${angles.length} angles to succeed, ` +
+          `but only ${successCount} succeeded. Failed: ${failedAngles.join(', ')}. ` +
+          `Re-run with longer timeouts or retry.`
+        );
+      }
+
+      researchSummary = mergeResults(angles, results);
+
+      // Checkpoint Phase 1 — if debate or validation fails, we resume here
+      const phase1Data = {
+        researchSummary,
+        successCount,
+        results: results.map((r, i) => ({
+          success: r.success ?? false,
+          content: r.content || null,
+          fullOutput: r.fullOutput || null,
+          sessionId: r.sessionId || null,
+          durationMs: r.durationMs || 0,
+          timedOut: r.timedOut || false,
+          label: angles[i].label
+        }))
+      };
+      context.state.checkpoint('research-phase1', phase1Data);
 
       context.logger?.log({
         type: 'GATE_CHECK',
         stage: STAGE_NAME,
-        gate: 'adversarial_critique_done',
-        success: critiqueResult.success,
-        durationMs: critiqueResult.durationMs
-      });
-    } catch (err) {
-      // Codex critique is best-effort — don't fail the whole stage
-      context.logger?.log({
-        type: 'GATE_CHECK',
-        stage: STAGE_NAME,
-        gate: 'adversarial_critique_failed',
-        error: err instanceof Error ? err.message : String(err)
+        gate: 'research_complete',
+        successCount,
+        totalAngles: angles.length
       });
     }
 
-    // ── Phase 3: Claude defense + convergence ─────────────────────────
-    let convergedSummary = researchSummary; // fallback if debate fails
+    // ── Phase 2: Alternating adversarial debate ──────────────────────
+    const debateCheckpoint = context.state.getStageOutput('research-debate');
+    let debateHistory;
+    let converged;
 
-    if (critiqueContent) {
+    if (debateCheckpoint) {
+      // Resume: debate already completed
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'debate_resumed' });
+      debateHistory = debateCheckpoint.debateHistory;
+      converged = debateCheckpoint.converged;
+    } else {
+      const rawRounds = context.config?.maxConvergenceRounds ?? DEFAULTS.maxConvergenceRounds ?? 'auto';
+      const isAutoMode = rawRounds === 'auto' || rawRounds === -1;
+      const MAX_DEBATE_ROUNDS = isAutoMode ? DEBATE_SAFETY_CAP : Number(rawRounds);
+      debateHistory = [];
+      converged = false;
+
+      // Check for partial debate checkpoint (individual rounds saved)
+      for (let r = 0; r < MAX_DEBATE_ROUNDS; r++) {
+        const roundCheckpoint = context.state.getStageOutput(`research-debate-round-${r}`);
+        if (roundCheckpoint) {
+          debateHistory.push(roundCheckpoint);
+          if (roundCheckpoint.content?.includes(CONVERGED_SIGNAL)) {
+            converged = true;
+          }
+        }
+      }
+
+      if (debateHistory.length > 0 && !converged) {
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'debate_partial_resume',
+          completedRounds: debateHistory.length
+        });
+      }
+
+      if (!converged) {
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'debate_start',
+          mode: isAutoMode ? 'auto' : 'fixed',
+          maxRounds: MAX_DEBATE_ROUNDS,
+          safetyCap: isAutoMode ? DEBATE_SAFETY_CAP : undefined,
+          startingFrom: debateHistory.length
+        });
+
+        for (let round = debateHistory.length; round < MAX_DEBATE_ROUNDS; round++) {
+          const cli = round % 2 === 0 ? 'claude' : 'codex';
+          const extraArgs = cli === 'claude'
+            ? ['--allowedTools', 'WebSearch,WebFetch']
+            : ['-c', 'search=true', '--dangerously-bypass-approvals-and-sandbox'];
+
+          const debatePrompt = buildDebatePrompt(description, researchSummary, debateHistory, round, isAutoMode);
+
+          context.logger?.log({
+            type: 'GATE_CHECK',
+            stage: STAGE_NAME,
+            gate: 'debate_round_start',
+            round: round + 1,
+            cli
+          });
+
+          try {
+            const debateResult = await runAgent({
+              cli,
+              prompt: debatePrompt,
+              cwd: context.workDir || undefined,
+              timeout,
+              label: `debate-round-${round + 1}-${cli}-${ticketKey}`,
+              metadata: {
+                stage: STAGE_NAME,
+                angle: `debate-round-${round + 1}`,
+                cli,
+                ticketKey,
+                runId: context.state.runId
+              },
+              extraArgs,
+              extractRegex: COMPLETED_REGEX
+            });
+
+            if (context.costTracker && debateResult.sessionId) {
+              context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(debateResult));
+            }
+
+            const roundContent = debateResult.content || debateResult.fullOutput || '';
+            const roundData = { round, cli, content: roundContent };
+            debateHistory.push(roundData);
+
+            // Checkpoint each debate round individually
+            context.state.checkpoint(`research-debate-round-${round}`, roundData);
+
+            context.logger?.log({
+              type: 'GATE_CHECK',
+              stage: STAGE_NAME,
+              gate: 'debate_round_done',
+              round: round + 1,
+              cli,
+              success: debateResult.success,
+              durationMs: debateResult.durationMs
+            });
+
+            if (roundContent.includes(CONVERGED_SIGNAL)) {
+              converged = true;
+              context.logger?.log({
+                type: 'GATE_CHECK',
+                stage: STAGE_NAME,
+                gate: 'debate_converged',
+                round: round + 1,
+                cli
+              });
+              break;
+            }
+          } catch (err) {
+            context.logger?.log({
+              type: 'GATE_CHECK',
+              stage: STAGE_NAME,
+              gate: 'debate_round_failed',
+              round: round + 1,
+              cli,
+              error: err instanceof Error ? err.message : String(err)
+            });
+            break;
+          }
+        }
+      }
+
+      if (!converged && debateHistory.length >= MAX_DEBATE_ROUNDS) {
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: isAutoMode ? 'debate_safety_cap_reached' : 'debate_max_rounds_reached',
+          totalRounds: debateHistory.length,
+          safetyCap: isAutoMode ? DEBATE_SAFETY_CAP : undefined
+        });
+      }
+
+      // Checkpoint full debate result
+      context.state.checkpoint('research-debate', { debateHistory, converged });
+    }
+
+    // Build converged summary from research + debate
+    let convergedSummary = researchSummary;
+    if (debateHistory.length > 0) {
+      const debateSections = debateHistory.map(d => {
+        const who = d.cli === 'claude' ? 'Claude' : 'Codex';
+        return `\n---\n\n# Debate Round ${d.round + 1} (${who})\n\n${d.content}`;
+      });
+      convergedSummary = [researchSummary, ...debateSections].join('\n');
+    }
+
+    // ── Phase 3: Validation — did the recommendation survive? ───────
+    let validation = null;
+
+    if (debateHistory.length > 0) {
       context.logger?.log({
         type: 'GATE_CHECK',
         stage: STAGE_NAME,
-        gate: 'defense_convergence_start'
+        gate: 'validation_start'
       });
 
       try {
-        const defensePrompt = buildDefensePrompt(description, researchSummary, critiqueContent);
-        const defenseResult = await runAgent({
+        const validationPrompt = buildValidationPrompt(
+          description, researchSummary, debateHistory
+        );
+        const validationResult = await runAgent({
           cli: 'claude',
-          prompt: defensePrompt,
+          prompt: validationPrompt,
           cwd: context.workDir || undefined,
-          timeout,
-          label: `research-defense-convergence-${ticketKey}`,
+          timeout: timeout > 120_000 ? 120_000 : timeout,
+          label: `research-validation-${ticketKey}`,
           metadata: {
             stage: STAGE_NAME,
-            angle: 'defense-convergence',
+            angle: 'validation',
             ticketKey,
             runId: context.state.runId
           },
           extractRegex: COMPLETED_REGEX
         });
 
-        if (context.costTracker && defenseResult.sessionId) {
-          context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(defenseResult));
+        if (context.costTracker && validationResult.sessionId) {
+          context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(validationResult));
         }
 
-        if (defenseResult.success && defenseResult.content) {
-          convergedSummary = [
-            researchSummary,
-            '',
-            '---',
-            '',
-            '# Adversarial Critique (Codex)',
-            '',
-            critiqueContent,
-            '',
-            '---',
-            '',
-            '# Defense & Converged Summary (Claude)',
-            '',
-            defenseResult.content
-          ].join('\n');
+        if (validationResult.success && validationResult.content) {
+          try {
+            validation = JSON.parse(validationResult.content);
+          } catch {
+            context.logger?.log({
+              type: 'GATE_CHECK',
+              stage: STAGE_NAME,
+              gate: 'validation_parse_failed',
+              contentPreview: validationResult.content.slice(0, 200)
+            });
+          }
         }
 
         context.logger?.log({
           type: 'GATE_CHECK',
           stage: STAGE_NAME,
-          gate: 'defense_convergence_done',
-          success: defenseResult.success,
-          durationMs: defenseResult.durationMs
+          gate: 'validation_done',
+          success: validationResult.success,
+          recommendationSurvived: validation?.recommendationSurvived ?? null,
+          confidence: validation?.finalRecommendation?.confidence ?? null,
+          durationMs: validationResult.durationMs
         });
       } catch (err) {
-        // Defense is best-effort — fall back to research + critique
-        convergedSummary = [
-          researchSummary,
-          '',
-          '---',
-          '',
-          '# Adversarial Critique (Codex)',
-          '',
-          critiqueContent
-        ].join('\n');
-
         context.logger?.log({
           type: 'GATE_CHECK',
           stage: STAGE_NAME,
-          gate: 'defense_convergence_failed',
+          gate: 'validation_failed',
           error: err instanceof Error ? err.message : String(err)
         });
       }
+
+      // Hard fail: recommendation was killed and no viable alternative emerged
+      if (validation && validation.recommendationSurvived === false) {
+        const confidence = validation.finalRecommendation?.confidence ?? 0;
+        if (confidence < 31) {
+          throw new Error(
+            `Research recommendation did not survive adversarial review. ` +
+            `Confidence: ${confidence}/100. ` +
+            `Verdict: ${validation.verdict || 'No viable recommendation emerged from the debate.'}. ` +
+            `The pipeline cannot proceed without a validated research recommendation.`
+          );
+        }
+      }
     }
 
+    const resultAngles = (results || phase1Checkpoint?.results || []);
     const output = {
       summary: convergedSummary,
       researchSummary,
-      critique: critiqueContent,
+      debateRounds: debateHistory,
+      convergedNaturally: converged,
+      critique: debateHistory[0]?.content || null,
       angles: angles.map((a, i) => ({
         label: a.label,
-        success: results[i]?.success ?? false,
-        sessionId: results[i]?.sessionId || null,
-        durationMs: results[i]?.durationMs || 0
+        success: resultAngles[i]?.success ?? false,
+        sessionId: resultAngles[i]?.sessionId || null,
+        durationMs: resultAngles[i]?.durationMs || 0
       })),
-      hasAdversarialDebate: !!critiqueContent,
+      hasAdversarialDebate: debateHistory.length > 0,
       successCount,
-      totalAngles: angles.length
+      totalAngles: angles.length,
+      validation: validation || null,
+      recommendationSurvived: validation?.recommendationSurvived ?? null,
+      finalRecommendation: validation?.finalRecommendation || null
     };
 
     context.state.checkpoint(STAGE_NAME, output);
@@ -390,7 +633,9 @@ export async function run(context) {
       stage: STAGE_NAME,
       successCount,
       totalAngles: angles.length,
-      hasAdversarialDebate: !!critiqueContent
+      hasAdversarialDebate: debateHistory.length > 0,
+      debateRounds: debateHistory.length,
+      convergedNaturally: converged
     });
 
     return output;

@@ -78,16 +78,16 @@ export async function runAgent(opts) {
         throw new Error("runAgent requires 'prompt'");
     }
 
-    const args = buildArgs(cli, prompt, extraArgs);
     const metadata = {
         ...(opts?.metadata || {}),
         ...(opts?.label ? { label: opts.label } : {})
     };
 
-    // Send prompt via stdin for both CLIs to avoid Windows cmd.exe mangling
-    // multi-line prompts with angle brackets (<COMPLETED> → file redirects).
-    // Claude: `-p` with no prompt arg reads from stdin.
-    // Codex: `exec -` reads from stdin.
+    const args = buildArgs(cli, prompt, extraArgs);
+
+    // Both CLIs read prompt from stdin to avoid ENAMETOOLONG on long prompts:
+    // - Claude: `-p` with no positional prompt arg reads from stdin
+    // - Codex: `exec -` reads from stdin
     const stdinData = prompt;
 
     const spawnResult = await bridgeCall('/api/cli/spawn', {
@@ -95,7 +95,7 @@ export async function runAgent(opts) {
         args,
         cwd: opts?.cwd,
         closeStdin: true,
-        stdinData,
+        ...(stdinData ? { stdinData } : {}),
         metadata
     });
 
@@ -145,15 +145,20 @@ export async function runAgent(opts) {
 
         let parsedJson = null;
         let fullOutput = rawStdout;
+        let userInput = null;
+        let modelOutput = null;
 
         if (cli === 'claude') {
             const claudeParsed = parseClaudeStdout(rawStdout);
             parsedJson = claudeParsed.parsedJson;
             fullOutput = claudeParsed.fullOutput;
+            modelOutput = fullOutput;
         } else if (cli === 'codex') {
             const codexParsed = parseCodexJsonl(rawStdout);
             parsedJson = codexParsed.parsedJson;
             fullOutput = codexParsed.fullOutput;
+            userInput = codexParsed.userInput;
+            modelOutput = codexParsed.modelOutput;
         }
 
         const match = extractRegex ? fullOutput.match(extractRegex) : null;
@@ -164,6 +169,8 @@ export async function runAgent(opts) {
             success,
             content,
             fullOutput,
+            userInput,
+            modelOutput,
             rawStdout,
             rawStderr,
             sessionId,
@@ -185,7 +192,10 @@ export async function runAgent(opts) {
 function buildArgs(cli, prompt, extraArgs) {
     if (cli === 'claude') {
         const defaults = AGENT_DEFAULTS.claude?.extraArgs || [];
-        return ['-p', prompt, ...defaults, ...extraArgs];
+        // prompt is a positional arg that goes LAST (after all flags).
+        // For long prompts, we pass it via stdin instead — see runAgent().
+        // When promptArg is empty, Claude reads from stdin in -p mode.
+        return ['-p', ...defaults, ...extraArgs];
     }
     if (cli === 'codex') {
         const defaults = AGENT_DEFAULTS.codex?.extraArgs || [];
@@ -216,10 +226,13 @@ function parseClaudeStdout(stdout) {
 }
 
 /**
- * Parse Codex JSONL stdout and extract message text from item.completed events.
+ * Parse Codex JSONL stdout and extract structured output.
+ *
+ * Returns fullOutput formatted with user input and model response separated,
+ * similar to how parseClaudeStdout returns clean human-readable text.
  *
  * @param {string} stdout
- * @returns {{ parsedJson: any, fullOutput: string }}
+ * @returns {{ parsedJson: any, fullOutput: string, userInput: string | null, modelOutput: string | null }}
  */
 function parseCodexJsonl(stdout) {
     const lines = stdout
@@ -239,24 +252,80 @@ function parseCodexJsonl(stdout) {
     }
 
     if (parsedJson.length === 0) {
-        return { parsedJson: null, fullOutput: stdout };
+        // No JSON found — try plain-text extraction (non --json mode)
+        const plainText = extractCodexPlainText(stdout);
+        return { parsedJson: null, fullOutput: plainText || stdout, userInput: null, modelOutput: null };
     }
 
-    const completedMessages = [];
+    const userMessages = [];
+    const assistantMessages = [];
 
-    for (const item of parsedJson) {
-        if (item?.type !== 'item.completed') {
+    for (const event of parsedJson) {
+        if (event?.type !== 'item.completed') {
             continue;
         }
 
-        const msg = extractAgentMessage(item);
-        if (msg) {
-            completedMessages.push(msg);
+        const item = event?.item;
+        if (!item) continue;
+
+        // Skip function_call and function_call_output events — not human-readable
+        if (item.type === 'function_call' || item.type === 'function_call_output') {
+            continue;
+        }
+
+        const role = item.role || item.type;
+        const msg = extractAgentMessage(event);
+        if (!msg) continue;
+
+        if (role === 'user') {
+            userMessages.push(msg);
+        } else {
+            assistantMessages.push(msg);
         }
     }
 
-    const fullOutput = completedMessages.length > 0 ? completedMessages.join('\n\n') : stdout;
-    return { parsedJson, fullOutput };
+    const userInput = userMessages.length > 0 ? userMessages.join('\n\n') : null;
+    const modelOutput = assistantMessages.length > 0 ? assistantMessages.join('\n\n') : null;
+
+    // Build human-readable fullOutput
+    let fullOutput;
+    if (modelOutput) {
+        fullOutput = modelOutput;
+    } else if (userInput) {
+        // No assistant output extracted — unusual, include user input as context
+        fullOutput = userInput;
+    } else {
+        // Neither extracted — fall back to plain-text extraction from raw stdout
+        fullOutput = extractCodexPlainText(stdout) || stdout;
+    }
+
+    return { parsedJson, fullOutput, userInput, modelOutput };
+}
+
+/**
+ * Extract response text from plain-text Codex output (non --json mode).
+ * Looks for the "codex" marker line and extracts text between it and "tokens used".
+ *
+ * @param {string} stdout
+ * @returns {string | null}
+ */
+function extractCodexPlainText(stdout) {
+    const lines = stdout.split('\n');
+    let responseStart = -1;
+    let responseEnd = lines.length;
+
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim() === 'codex') { responseStart = i + 1; break; }
+    }
+
+    if (responseStart < 0) return null;
+
+    for (let i = responseStart; i < lines.length; i++) {
+        if (lines[i].trim() === 'tokens used') { responseEnd = i; break; }
+    }
+
+    const extracted = lines.slice(responseStart, responseEnd).join('\n').trim();
+    return extracted || null;
 }
 
 /**
