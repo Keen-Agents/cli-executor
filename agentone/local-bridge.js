@@ -1142,15 +1142,23 @@ const server = http.createServer(async (req, res) => {
                 let stdinFile = null;
                 let finalArgs = [...args];
 
-                // For Claude with stdin data: write prompt to temp file and use file-based
-                // stdin. This avoids pipe buffer deadlocks on Windows with large prompts.
-                // NOTE: --output-format stream-json is NOT auto-injected because it causes
-                // Claude to hang on Windows even with file-based stdin. Claude shows KB
-                // only when finished. If stream-json is needed, pass it in extraArgs.
+                // For Claude with stdin data: write prompt to temp file (avoids pipe
+                // buffer deadlock) and switch to stream-json for real-time output.
                 if (stdinData && cli.toLowerCase() === 'claude') {
                     const tmpDir = os.tmpdir();
                     stdinFile = path.join(tmpDir, `claude-stdin-${randomBytes(6).toString('hex')}.txt`);
                     fsSync.writeFileSync(stdinFile, stdinData, 'utf8');
+                    // Replace --output-format json with stream-json for real-time NDJSON
+                    const ofIdx = finalArgs.indexOf('--output-format');
+                    if (ofIdx !== -1 && ofIdx + 1 < finalArgs.length) {
+                        finalArgs[ofIdx + 1] = 'stream-json';
+                    } else {
+                        finalArgs.push('--output-format', 'stream-json');
+                    }
+                    // stream-json requires --verbose with -p
+                    if (!finalArgs.includes('--verbose')) {
+                        finalArgs.push('--verbose');
+                    }
                 }
 
                 const session = createSession(cli, finalArgs, cwd, metadata, { stdinFile });
@@ -1163,6 +1171,7 @@ const server = http.createServer(async (req, res) => {
                     session.stdinLog.push({ input: stdinData.slice(0, 2000), timestamp: new Date().toISOString() });
                 } else if (stdinData) {
                     // Non-Claude CLI: use pipe-based stdin (e.g. Codex)
+                    session.stdinLog.push({ input: stdinData.slice(0, 2000), timestamp: new Date().toISOString() });
                     session.process.stdin.end(stdinData, 'utf8', () => {
                         console.log(`[${new Date().toISOString()}] Stdin written and closed for session ${session.id} (${stdinData.length} bytes)`);
                     });
@@ -1379,7 +1388,7 @@ const server = http.createServer(async (req, res) => {
                         // Codex JSONL format: multiple JSON lines with item.completed events
                         const codexParsed = parseCodexHistory(rawStdout, session);
                         if (codexParsed) {
-                            session.conversationHistory = codexParsed;
+                            if (!session.running) session.conversationHistory = codexParsed;
                             result = { sessionId, history: codexParsed, running: session.running, source: 'codex-parsed' };
                         } else if (session.stdinLog && session.stdinLog.length > 0) {
                             const pairs = session.stdinLog.map(entry => ({
