@@ -82,6 +82,37 @@ export const PROFILES = {
 };
 
 /**
+ * Research cost modes — controls which CLI does the heavy token work.
+ *
+ *   normal   — current behavior: Claude+Codex alternating (most expensive, highest quality)
+ *   cheap    — Sonnet for research/re-research, Claude Opus for debate/validation only
+ *   cheapest — Codex for all research/re-research, Claude Opus for debate/validation only
+ */
+export const RESEARCH_MODES = {
+  normal: {
+    researchCli: null,          // null = use alternating bull/bear logic (current behavior)
+    reResearchCli: 'claude',    // current behavior
+    debateCli: null,            // null = alternating claude/codex
+    validationCli: 'claude',
+    claudeModel: null,          // null = default (Opus)
+  },
+  cheap: {
+    researchCli: 'claude',      // all research via Claude Sonnet
+    reResearchCli: 'claude',
+    debateCli: null,            // alternating
+    validationCli: 'claude',
+    claudeModel: 'claude-sonnet-4-6',
+  },
+  cheapest: {
+    researchCli: 'codex',       // all research via Codex
+    reResearchCli: 'codex',
+    debateCli: null,            // alternating
+    validationCli: 'claude',
+    claudeModel: null,          // debate/validation still uses Opus
+  }
+};
+
+/**
  * Auto-upgrade thresholds (architecture plan lines 169-171).
  * A run can upgrade its profile mid-flight but never downgrade.
  */

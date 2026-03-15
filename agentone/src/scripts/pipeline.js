@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { PipelineState } from './lib/state-manager.js';
 import { CostTracker } from './lib/cost-tracker.js';
 import { createLogger } from './lib/logger.js';
-import { PROFILES, TIMEOUTS, budgetThresholds, AUTO_UPGRADE } from './pipeline-config.js';
+import { PROFILES, TIMEOUTS, budgetThresholds, AUTO_UPGRADE, RESEARCH_MODES } from './pipeline-config.js';
 
 import { run as intake } from './stages/intake.js';
 import { run as classify } from './stages/classify.js';
@@ -109,7 +109,8 @@ function parseArgs(argv) {
     prompt: '',
     promptFile: '',
     angles: null,
-    subtasks: null
+    subtasks: null,
+    researchMode: ''
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -167,6 +168,12 @@ function parseArgs(argv) {
       } catch {
         throw new Error('--angles must be valid JSON: [{"label":"...", "focus":"..."}]');
       }
+      i += 1;
+      continue;
+    }
+
+    if (arg === '--research-mode') {
+      args.researchMode = argv[i + 1] || '';
       i += 1;
       continue;
     }
@@ -366,6 +373,14 @@ async function runPipeline(input) {
   let profileName = initialPlan.profileName;
   let profileConfig = initialPlan.profileConfig;
   let stageList = initialPlan.stageList;
+
+  // Merge research mode into profile config
+  if (input.researchMode) {
+    if (!RESEARCH_MODES[input.researchMode]) {
+      throw new Error(`Invalid --research-mode: ${input.researchMode}. Valid: ${Object.keys(RESEARCH_MODES).join(', ')}`);
+    }
+    profileConfig = { ...profileConfig, researchMode: input.researchMode };
+  }
 
   if (profileName) {
     state.setProfile(profileName);

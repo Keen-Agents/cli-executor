@@ -1,6 +1,6 @@
 import { runAgent } from '../lib/agent-runner.js';
 import { CostTracker } from '../lib/cost-tracker.js';
-import { TIMEOUTS, DEFAULTS } from '../pipeline-config.js';
+import { TIMEOUTS, DEFAULTS, RESEARCH_MODES, AGENT_DEFAULTS } from '../pipeline-config.js';
 
 const DEBATE_SAFETY_CAP = DEFAULTS.debateSafetyCap ?? 10;
 
@@ -14,16 +14,35 @@ const MAX_RESEARCH_AGENTS = 10;  // max total agents (bull+bear pairs)
 const MIN_RESEARCH_AGENTS = 2;
 
 /**
+ * Build extraArgs for a research/debate agent based on CLI type and research mode.
+ * @param {string} cli - 'claude' or 'codex'
+ * @param {object} researchMode - mode config from RESEARCH_MODES
+ * @param {boolean} [isResearchPhase=true] - true for research/re-research, false for debate/validation
+ *   Model override (e.g. Sonnet) only applies to research phase, not debate.
+ */
+function buildResearchExtraArgs(cli, researchMode, isResearchPhase = true) {
+  if (cli === 'codex') {
+    return ['-c', 'search=true', '--dangerously-bypass-approvals-and-sandbox'];
+  }
+  // Claude
+  const args = ['--allowedTools', 'WebSearch,WebFetch'];
+  if (isResearchPhase && researchMode.claudeModel) {
+    args.push('--model', researchMode.claudeModel);
+  }
+  return args;
+}
+
+/**
  * Fallback: generate 3 default research angles when dispatcher doesn't provide any.
  */
-function generateDefaultAngles(description) {
+function generateDefaultAngles(description, researchCli = null) {
   const base = description.trim();
   const defaultAngles = [
     { label: 'landscape', focus: 'What exists? What are the leading solutions? How do they compare at a high level?' },
     { label: 'tradeoffs', focus: 'Performance, scalability, learning curve, maintenance burden, community health, known pitfalls.' },
     { label: 'recommendation', focus: 'What would you recommend for a production project starting today? Why? Runner-up options?' }
   ];
-  return anglesFromInput(defaultAngles, base);
+  return anglesFromInput(defaultAngles, base, researchCli);
 }
 
 /**
@@ -109,7 +128,7 @@ function buildAnglePrompt(topic, label, focus, stance = 'bull') {
  * Each angle spawns TWO agents: a bull (opportunity) and a bear (risks/failures).
  * Agents alternate between Claude and Codex for diversity.
  */
-function anglesFromInput(inputAngles, description) {
+function anglesFromInput(inputAngles, description, researchCli = null) {
   const validAngles = inputAngles
     .filter(a => a?.label && a?.focus)
     .slice(0, Math.floor(MAX_RESEARCH_AGENTS / 2)); // each angle spawns 2 agents
@@ -119,19 +138,24 @@ function anglesFromInput(inputAngles, description) {
     const a = validAngles[i];
     const cleanLabel = String(a.label).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 25);
 
+    // If researchCli is set (cheap/cheapest mode), all agents use that CLI
+    // Otherwise, alternate between claude and codex (normal mode)
+    const bullCli = researchCli || (i % 2 === 0 ? 'claude' : 'codex');
+    const bearCli = researchCli || (i % 2 === 0 ? 'codex' : 'claude');
+
     // Bull agent
     agents.push({
       label: `${cleanLabel}-bull`,
       stance: 'bull',
-      cli: i % 2 === 0 ? 'claude' : 'codex',
+      cli: bullCli,
       prompt: buildAnglePrompt(description.trim(), a.label, a.focus, 'bull')
     });
 
-    // Bear agent — opposite CLI from bull
+    // Bear agent — opposite CLI from bull (unless mode overrides)
     agents.push({
       label: `${cleanLabel}-bear`,
       stance: 'bear',
-      cli: i % 2 === 0 ? 'codex' : 'claude',
+      cli: bearCli,
       prompt: buildAnglePrompt(description.trim(), a.label, a.focus, 'bear')
     });
   }
@@ -409,6 +433,19 @@ export async function run(context) {
     const timeout = TIMEOUTS.research || 300_000;
     const ticketKey = intakeOutput.key || 'unknown';
 
+    // ── Resolve research cost mode ───────────────────────────────────
+    const researchModeName = context.config?.researchMode || 'normal';
+    const researchMode = RESEARCH_MODES[researchModeName] || RESEARCH_MODES.normal;
+
+    context.logger?.log({
+      type: 'GATE_CHECK',
+      stage: STAGE_NAME,
+      gate: 'research_mode',
+      mode: researchModeName,
+      researchCli: researchMode.researchCli,
+      claudeModel: researchMode.claudeModel
+    });
+
     // ── Check for sub-stage checkpoints (resume support) ─────────────
     const phase1Checkpoint = context.state.getStageOutput('research-phase1');
     let researchSummary;
@@ -426,7 +463,7 @@ export async function run(context) {
     } else {
       // ── Resolve research angles: dispatcher input → default fallback ──
       if (Array.isArray(context.angles) && context.angles.length >= MIN_RESEARCH_AGENTS) {
-        angles = anglesFromInput(context.angles, description);
+        angles = anglesFromInput(context.angles, description, researchMode.researchCli);
         context.logger?.log({
           type: 'GATE_CHECK',
           stage: STAGE_NAME,
@@ -437,7 +474,7 @@ export async function run(context) {
           clis: angles.map(a => a.cli)
         });
       } else {
-        angles = generateDefaultAngles(description);
+        angles = generateDefaultAngles(description, researchMode.researchCli);
         context.logger?.log({
           type: 'GATE_CHECK',
           stage: STAGE_NAME,
@@ -457,9 +494,7 @@ export async function run(context) {
 
       const agentPromises = angles.map((angle) => {
         const cli = angle.cli || 'claude';
-        const extraArgs = cli === 'codex'
-          ? ['-c', 'search=true', '--dangerously-bypass-approvals-and-sandbox']
-          : ['--allowedTools', 'WebSearch,WebFetch'];
+        const extraArgs = buildResearchExtraArgs(cli, researchMode);
 
         return runAgent({
           cli,
@@ -607,10 +642,8 @@ export async function run(context) {
             break;
           }
 
-          const cli = round % 2 === 0 ? 'claude' : 'codex';
-          const extraArgs = cli === 'claude'
-            ? ['--allowedTools', 'WebSearch,WebFetch']
-            : ['-c', 'search=true', '--dangerously-bypass-approvals-and-sandbox'];
+          const cli = researchMode.debateCli || (round % 2 === 0 ? 'claude' : 'codex');
+          const extraArgs = buildResearchExtraArgs(cli, researchMode, false);
 
           const debatePrompt = buildDebatePrompt(description, researchSummary, debateHistory, round, isAutoMode);
 
@@ -681,10 +714,11 @@ export async function run(context) {
                 prompt: buildAnglePrompt(description, q.label, q.focus)
               }));
 
+              const reResearchCli = researchMode.reResearchCli || 'claude';
               const reResults = await Promise.all(
                 reResearchAngles.map(angle =>
                   runAgent({
-                    cli: 'claude',
+                    cli: reResearchCli,
                     prompt: angle.prompt,
                     signal: context.signal,
                     cwd: context.workDir || undefined,
@@ -696,7 +730,7 @@ export async function run(context) {
                       ticketKey,
                       runId: context.state.runId
                     },
-                    extraArgs: ['--allowedTools', 'WebSearch,WebFetch'],
+                    extraArgs: buildResearchExtraArgs(reResearchCli, researchMode),
                     extractRegex: COMPLETED_REGEX
                   }).catch(err => ({
                     success: false,
@@ -794,7 +828,7 @@ export async function run(context) {
           description, researchSummary, debateHistory
         );
         const validationResult = await runAgent({
-          cli: 'claude',
+          cli: researchMode.validationCli || 'claude',
           prompt: validationPrompt,
           signal: context.signal,
           cwd: context.workDir || undefined,
