@@ -218,10 +218,9 @@ export async function runAgent(opts) {
 function buildArgs(cli, prompt, extraArgs) {
     if (cli === 'claude') {
         const defaults = AGENT_DEFAULTS.claude?.extraArgs || [];
-        // NOTE: --output-format stream-json would give real-time NDJSON but deadlocks
-        // on Windows with large stdin prompts (pipe buffer contention). Stick with
-        // plain -p which outputs text. The bridge parseClaudeStreamJson is available
-        // if stream-json is ever enabled via extraArgs for specific use cases.
+        // The bridge handles stream-json by writing the prompt to a temp file
+        // (file-based stdin) to avoid pipe buffer deadlocks on Windows.
+        // Don't add --verbose/--output-format here — the bridge injects them.
         return ['-p', ...defaults, ...extraArgs];
     }
     if (cli === 'codex') {

@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { exec, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { chromium } from 'playwright';
@@ -511,7 +512,7 @@ function findByPid(pid) {
     return sessions.get(sessionId) || null;
 }
 
-function createSession(cli, args, cwd, metadata = {}) {
+function createSession(cli, args, cwd, metadata = {}, opts = {}) {
     const running = getRunningCount();
     if (running >= MAX_CONCURRENT) {
         console.log(`[${new Date().toISOString()}] WARNING: ${running}/${MAX_CONCURRENT} sessions running. Killing oldest.`);
@@ -535,14 +536,27 @@ function createSession(cli, args, cwd, metadata = {}) {
         resolvedCli = process.execPath; // node.exe
     }
 
-    console.log(`[${new Date().toISOString()}] Spawn: ${resolvedCli} [${resolvedArgs.length} args]`);
+    // Use file-based stdin to avoid pipe buffer deadlocks on Windows.
+    // When stdinFile is provided, stdin reads from a file descriptor instead of a pipe,
+    // so stdout can stream freely without contention.
+    let stdinFd = null;
+    if (opts.stdinFile) {
+        stdinFd = fsSync.openSync(opts.stdinFile, 'r');
+    }
+
+    console.log(`[${new Date().toISOString()}] Spawn: ${resolvedCli} [${resolvedArgs.length} args]${stdinFd !== null ? ' (stdin from file)' : ''}`);
 
     const proc = spawn(resolvedCli, resolvedArgs, {
         cwd: cwd || BASE_DIR,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: [stdinFd !== null ? stdinFd : 'pipe', 'pipe', 'pipe'],
         shell: false,
         env: { ...process.env, CLAUDECODE: undefined, PATH: process.env.PATH }
     });
+
+    // Close the file descriptor after spawn (child process inherited it)
+    if (stdinFd !== null) {
+        fsSync.closeSync(stdinFd);
+    }
 
     const session = {
         id: sessionId,
@@ -1125,12 +1139,30 @@ const server = http.createServer(async (req, res) => {
                 const { cli, args = [], cwd, closeStdin = false, stdinData, metadata = {} } = data;
                 if (!cli) throw new Error("No CLI tool specified. Provide 'cli' field (e.g. 'claude', 'codex')");
 
-                const session = createSession(cli, args, cwd, metadata);
+                let stdinFile = null;
+                let finalArgs = [...args];
 
-                // Write stdinData then close stdin (for codex '-' stdin prompt mode).
-                // Use .end(data) for atomic write+close — avoids pipe buffer deadlocks
-                // on Windows when stdinData exceeds the ~64KB pipe buffer limit.
-                if (stdinData) {
+                // For Claude with stdin data: write prompt to temp file and use file-based
+                // stdin. This avoids pipe buffer deadlocks on Windows with large prompts.
+                // NOTE: --output-format stream-json is NOT auto-injected because it causes
+                // Claude to hang on Windows even with file-based stdin. Claude shows KB
+                // only when finished. If stream-json is needed, pass it in extraArgs.
+                if (stdinData && cli.toLowerCase() === 'claude') {
+                    const tmpDir = os.tmpdir();
+                    stdinFile = path.join(tmpDir, `claude-stdin-${randomBytes(6).toString('hex')}.txt`);
+                    fsSync.writeFileSync(stdinFile, stdinData, 'utf8');
+                }
+
+                const session = createSession(cli, finalArgs, cwd, metadata, { stdinFile });
+
+                // Clean up temp file after process exits
+                if (stdinFile) {
+                    session.process.on('exit', () => {
+                        try { fsSync.unlinkSync(stdinFile); } catch { /* already gone */ }
+                    });
+                    session.stdinLog.push({ input: stdinData.slice(0, 2000), timestamp: new Date().toISOString() });
+                } else if (stdinData) {
+                    // Non-Claude CLI: use pipe-based stdin (e.g. Codex)
                     session.process.stdin.end(stdinData, 'utf8', () => {
                         console.log(`[${new Date().toISOString()}] Stdin written and closed for session ${session.id} (${stdinData.length} bytes)`);
                     });
