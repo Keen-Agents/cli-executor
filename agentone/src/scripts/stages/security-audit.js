@@ -136,7 +136,8 @@ export async function run(context) {
         ticketKey,
         runId: context.state.runId
       },
-      extractRegex: COMPLETED_REGEX
+      extractRegex: COMPLETED_REGEX,
+      signal: context.signal
     });
 
     if (context.costTracker) {

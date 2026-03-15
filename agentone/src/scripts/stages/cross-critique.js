@@ -242,6 +242,8 @@ export async function run(context) {
     }
 
     for (let round = rounds.length + 1; round <= maxRounds && !converged; round += 1) {
+      if (context.signal?.aborted) break;
+
       const recentPriorCritiques = priorCritiques
         .slice(-MAX_PRIOR_CRITIQUES)
         .map(p => ({ ...p, text: trimToChars(p.text, MAX_CRITIQUE_CHARS) }));
@@ -301,7 +303,8 @@ export async function run(context) {
           profile: classifyOutput.profile,
           runId: context.state.runId
         },
-        extractRegex: COMPLETED_REGEX
+        extractRegex: COMPLETED_REGEX,
+        signal: context.signal
       });
 
       if (context.costTracker) {
@@ -368,7 +371,8 @@ export async function run(context) {
             profile: classifyOutput.profile,
             runId: context.state.runId
           },
-          extractRegex: COMPLETED_REGEX
+          extractRegex: COMPLETED_REGEX,
+          signal: context.signal
         });
 
         if (context.costTracker) {

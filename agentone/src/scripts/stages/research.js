@@ -311,6 +311,7 @@ export async function run(context) {
         runAgent({
           cli: 'claude',
           prompt: angle.prompt,
+          signal: context.signal,
           cwd: context.workDir || undefined,
           timeout,
           label: `research-${angle.label}-${ticketKey}`,
@@ -442,6 +443,12 @@ export async function run(context) {
         });
 
         for (let round = debateHistory.length; round < MAX_DEBATE_ROUNDS; round++) {
+          // Check abort signal before spawning a new debate round
+          if (context.signal?.aborted) {
+            context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'debate_aborted', round: round + 1 });
+            break;
+          }
+
           const cli = round % 2 === 0 ? 'claude' : 'codex';
           const extraArgs = cli === 'claude'
             ? ['--allowedTools', 'WebSearch,WebFetch']
@@ -461,6 +468,7 @@ export async function run(context) {
             const debateResult = await runAgent({
               cli,
               prompt: debatePrompt,
+              signal: context.signal,
               cwd: context.workDir || undefined,
               timeout,
               label: `debate-round-${round + 1}-${cli}-${ticketKey}`,
@@ -548,7 +556,7 @@ export async function run(context) {
     // ── Phase 3: Validation — did the recommendation survive? ───────
     let validation = null;
 
-    if (debateHistory.length > 0) {
+    if (debateHistory.length > 0 && !context.signal?.aborted) {
       context.logger?.log({
         type: 'GATE_CHECK',
         stage: STAGE_NAME,
@@ -562,6 +570,7 @@ export async function run(context) {
         const validationResult = await runAgent({
           cli: 'claude',
           prompt: validationPrompt,
+          signal: context.signal,
           cwd: context.workDir || undefined,
           timeout: timeout > 120_000 ? 120_000 : timeout,
           label: `research-validation-${ticketKey}`,

@@ -254,7 +254,8 @@ export async function run(context) {
               ticketKey,
               runId: context.state.runId
             },
-            extractRegex: COMPLETED_REGEX
+            extractRegex: COMPLETED_REGEX,
+            signal: context.signal
           }).catch(err => ({
             success: false,
             content: null,
@@ -340,7 +341,8 @@ export async function run(context) {
         label: `implement-codex-${ticketKey}`,
         extraArgs: ['--full-auto'],
         metadata: { stage: STAGE_NAME, cli: 'codex', step: 'implement', ticketKey, runId: context.state.runId },
-        extractRegex: COMPLETED_REGEX
+        extractRegex: COMPLETED_REGEX,
+        signal: context.signal
       });
 
       if (context.costTracker) {
@@ -428,7 +430,8 @@ export async function run(context) {
         cwd: worktreePath,
         timeout: TIMEOUTS.implement,
         label: `implement-review-claude-${ticketKey}`,
-        metadata: { stage: STAGE_NAME, cli: 'claude', step: 'review', ticketKey, runId: context.state.runId }
+        metadata: { stage: STAGE_NAME, cli: 'claude', step: 'review', ticketKey, runId: context.state.runId },
+        signal: context.signal
       });
 
       if (context.costTracker) {

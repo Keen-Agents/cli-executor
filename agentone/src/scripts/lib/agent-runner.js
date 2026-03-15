@@ -63,6 +63,14 @@ export async function bridgeCall(endpoint, body) {
  *   timedOut: boolean
  * }>}
  */
+/**
+ * Kill a bridge session by ID. Safe to call if session already dead.
+ */
+export async function killSession(sessionId) {
+    if (!sessionId) return;
+    try { await bridgeCall('/api/cli/kill', { sessionId }); } catch {}
+}
+
 export async function runAgent(opts) {
     const timeout = opts?.timeout ?? DEFAULT_TIMEOUT;
     const pollInterval = opts?.pollInterval ?? DEFAULT_POLL_INTERVAL;
@@ -70,12 +78,21 @@ export async function runAgent(opts) {
     const extraArgs = Array.isArray(opts?.extraArgs) ? opts.extraArgs : [];
     const cli = String(opts?.cli || '').toLowerCase();
     const prompt = String(opts?.prompt || '');
+    const signal = opts?.signal || null;
 
     if (!cli) {
         throw new Error("runAgent requires 'cli'");
     }
     if (!prompt) {
         throw new Error("runAgent requires 'prompt'");
+    }
+
+    // Pre-flight: if already aborted, don't even spawn
+    if (signal?.aborted) {
+        return {
+            success: false, content: null, fullOutput: '', rawStdout: '', rawStderr: '',
+            sessionId: null, pid: null, durationMs: 0, exitCode: null, parsedJson: null, timedOut: true
+        };
     }
 
     const metadata = {
@@ -107,6 +124,15 @@ export async function runAgent(opts) {
     const startTime = Date.now();
 
     while (true) {
+        // Check abort signal before each poll
+        if (signal?.aborted) {
+            await bridgeCall('/api/cli/kill', { sessionId }).catch(() => {});
+            return {
+                success: false, content: null, fullOutput: '', rawStdout: '', rawStderr: '',
+                sessionId, pid, durationMs: Date.now() - startTime, exitCode: null, parsedJson: null, timedOut: true
+            };
+        }
+
         const pollResult = await bridgeCall('/api/cli/poll', {
             sessionId,
             interval: pollInterval

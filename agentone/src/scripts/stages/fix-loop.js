@@ -97,6 +97,8 @@ export async function run(context) {
     const promptTemplate = readFileSync(FIX_PROMPT_TEMPLATE_PATH, 'utf8');
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (context.signal?.aborted) break;
+
       const startedAt = Date.now();
 
       const priorFixes = attempts.length > 0
@@ -143,7 +145,8 @@ export async function run(context) {
         cwd,
         timeout: TIMEOUTS['fix-loop'],
         label: `fix-${ticketKey}-attempt-${attempt}`,
-        metadata: { stage: STAGE_NAME, ticketKey, attempt, runId: context.state.runId }
+        metadata: { stage: STAGE_NAME, ticketKey, attempt, runId: context.state.runId },
+        signal: context.signal
       });
 
       if (context.costTracker) {

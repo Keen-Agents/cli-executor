@@ -224,9 +224,13 @@ async function runWithTimeout(stageName, timeoutMs, stageFn, context) {
     return stageFn(context);
   }
 
+  const ac = new AbortController();
+  context.signal = ac.signal;
+
   let timeoutHandle;
   const timeoutPromise = new Promise((_, reject) => {
     timeoutHandle = setTimeout(() => {
+      ac.abort();
       reject(new Error(`Stage ${stageName} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
   });
