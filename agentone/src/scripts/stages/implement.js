@@ -9,6 +9,8 @@ import { assembleContext } from '../lib/context-assembler.js';
 import { CostTracker } from '../lib/cost-tracker.js';
 
 const STAGE_NAME = 'implement';
+const COMPLETED_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
+const MAX_PARALLEL_AGENTS = 6;
 
 const TEMPLATE_PATH = new URL('../prompts/implement.md', import.meta.url);
 
@@ -75,6 +77,120 @@ function ensureWorktree(context, ticketKey) {
   }
 
   return { worktreePath, branchName };
+}
+
+/**
+ * Use Claude to decompose a plan into independent subtasks for parallel implementation.
+ * Returns null on failure (caller falls back to single-agent mode).
+ */
+async function decomposeIntoSubtasks(planText, ticketKey, ticketSummary, context, worktreePath) {
+  const prompt = [
+    `You are a task decomposition agent. Break an implementation plan into independent subtasks that can be worked on in parallel by separate agents.`,
+    ``,
+    `## Ticket: ${ticketKey}`,
+    `**Summary:** ${ticketSummary}`,
+    ``,
+    `## Implementation Plan`,
+    planText,
+    ``,
+    `## Your Task`,
+    ``,
+    `Analyze this plan and split it into independent subtasks. Each subtask will be given to a separate Codex agent that works in the same codebase.`,
+    ``,
+    `Rules:`,
+    `- Each subtask must have a CLEAR, NON-OVERLAPPING file scope — no two subtasks should modify the same file`,
+    `- If two changes depend on the same file, they MUST be in the same subtask`,
+    `- Order matters: if subtask B imports from a file created in subtask A, mark that dependency`,
+    `- Simple plans (1-3 files) should be a SINGLE subtask — don't over-split`,
+    `- Maximum ${MAX_PARALLEL_AGENTS} subtasks`,
+    `- Each subtask needs: a label, the specific files it will create/modify, and clear instructions`,
+    ``,
+    `## Output Format`,
+    ``,
+    `Respond with EXACTLY this JSON inside COMPLETED tags:`,
+    ``,
+    `<COMPLETED>`,
+    `{`,
+    `  "strategy": "single" or "parallel",`,
+    `  "reasoning": "One sentence explaining why single vs parallel",`,
+    `  "subtasks": [`,
+    `    {`,
+    `      "label": "short-label",`,
+    `      "files": ["src/foo.js", "src/bar.js"],`,
+    `      "instructions": "What to implement in this subtask",`,
+    `      "dependsOn": []`,
+    `    }`,
+    `  ]`,
+    `}`,
+    `</COMPLETED>`,
+    ``,
+    `If the plan is simple enough for one agent, use strategy "single" with one subtask containing the full plan.`
+  ].join('\n');
+
+  try {
+    const result = await runAgent({
+      cli: 'claude',
+      prompt,
+      cwd: worktreePath,
+      timeout: 120_000,
+      label: `implement-decompose-${ticketKey}`,
+      metadata: { stage: STAGE_NAME, step: 'decompose', ticketKey, runId: context.state.runId },
+      extractRegex: COMPLETED_REGEX
+    });
+
+    if (context.costTracker && result.sessionId) {
+      context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(result));
+    }
+
+    if (!result.success || !result.content) return null;
+
+    const parsed = JSON.parse(result.content);
+    if (!parsed?.subtasks || !Array.isArray(parsed.subtasks) || parsed.subtasks.length === 0) return null;
+
+    return parsed;
+  } catch (err) {
+    context.logger?.log({
+      type: 'GATE_CHECK',
+      stage: STAGE_NAME,
+      gate: 'decompose_failed',
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return null;
+  }
+}
+
+/**
+ * Build an implementation prompt for a single subtask.
+ */
+function buildSubtaskPrompt(subtask, ticketKey, ticketSummary, fullPlan, profile) {
+  return [
+    `You are an expert software engineer implementing a SPECIFIC SUBTASK of a larger plan.`,
+    ``,
+    `## Ticket: ${ticketKey}`,
+    `**Summary:** ${ticketSummary}`,
+    `**Profile:** ${profile}`,
+    ``,
+    `## Full Implementation Plan (for context only)`,
+    fullPlan,
+    ``,
+    `## YOUR SUBTASK: ${subtask.label}`,
+    ``,
+    `**Files you own:** ${subtask.files.join(', ')}`,
+    ``,
+    `**Instructions:**`,
+    subtask.instructions,
+    ``,
+    `## Rules`,
+    `- ONLY modify or create the files listed above — do NOT touch other files`,
+    `- Follow existing code style and conventions`,
+    `- Write clean, production-quality code`,
+    `- Run tests after your changes if applicable`,
+    ``,
+    `## Completion`,
+    `<COMPLETED>`,
+    `[Summary of what you implemented and any issues encountered]`,
+    `</COMPLETED>`
+  ].join('\n');
 }
 
 export async function run(context) {
@@ -150,33 +266,160 @@ export async function run(context) {
       assembledPrompt += `\n\n## Human Revision Request\n${humanRevision.comments}`;
     }
 
-    // Step 1: Codex implements the code (--full-auto allows file writes)
-    const implResult = await runAgent({
-      cli: 'codex',
-      prompt: assembledPrompt,
-      cwd: worktreePath,
-      timeout: TIMEOUTS.implement,
-      label: `implement-codex-${ticketKey}`,
-      extraArgs: ['--full-auto'],
-      metadata: { stage: STAGE_NAME, cli: 'codex', step: 'implement', ticketKey, runId: context.state.runId }
-    });
+    // Step 1: Decompose plan into subtasks
+    context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'decompose_start' });
 
-    if (context.costTracker) {
-      const callData = CostTracker.fromAgentResult(implResult);
-      if (!callData.label) callData.label = `implement-codex-${ticketKey}`;
-      context.costTracker.recordCall(STAGE_NAME, callData);
+    const decomposition = await decomposeIntoSubtasks(planText, ticketKey, ticketSummary, context, worktreePath);
+    const useParallel = decomposition?.strategy === 'parallel' && decomposition.subtasks.length > 1;
+
+    let implSummaries;
+
+    if (useParallel) {
+      // ── Parallel implementation: N Codex agents on non-overlapping files ──
+      const subtasks = decomposition.subtasks.slice(0, MAX_PARALLEL_AGENTS);
+
+      context.logger?.log({
+        type: 'GATE_CHECK',
+        stage: STAGE_NAME,
+        gate: 'parallel_start',
+        subtaskCount: subtasks.length,
+        labels: subtasks.map(s => s.label),
+        reasoning: decomposition.reasoning
+      });
+
+      // Split into waves: subtasks with no dependencies run first, then dependents
+      const wave1 = subtasks.filter(s => !s.dependsOn || s.dependsOn.length === 0);
+      const wave2 = subtasks.filter(s => s.dependsOn && s.dependsOn.length > 0);
+
+      const runSubtaskWave = async (wave, waveLabel) => {
+        const promises = wave.map(subtask => {
+          const subtaskPrompt = buildSubtaskPrompt(subtask, ticketKey, ticketSummary, planText, profile);
+          return runAgent({
+            cli: 'codex',
+            prompt: subtaskPrompt,
+            cwd: worktreePath,
+            timeout: TIMEOUTS.implement,
+            label: `implement-${subtask.label}-${ticketKey}`,
+            extraArgs: ['--full-auto'],
+            metadata: {
+              stage: STAGE_NAME,
+              cli: 'codex',
+              step: 'implement',
+              subtask: subtask.label,
+              wave: waveLabel,
+              ticketKey,
+              runId: context.state.runId
+            },
+            extractRegex: COMPLETED_REGEX
+          }).catch(err => ({
+            success: false,
+            content: null,
+            fullOutput: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            timedOut: false,
+            durationMs: 0,
+            sessionId: null
+          }));
+        });
+
+        return Promise.all(promises);
+      };
+
+      // Run wave 1 (independent subtasks) in parallel
+      const wave1Results = await runSubtaskWave(wave1, 'wave1');
+
+      // Record costs for wave 1
+      for (const result of wave1Results) {
+        if (context.costTracker && result.sessionId) {
+          context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(result));
+        }
+      }
+
+      const wave1Success = wave1Results.filter(r => r.success).length;
+      context.logger?.log({
+        type: 'GATE_CHECK',
+        stage: STAGE_NAME,
+        gate: 'wave1_done',
+        success: wave1Success,
+        total: wave1.length
+      });
+
+      // Run wave 2 (dependent subtasks) if any
+      let wave2Results = [];
+      if (wave2.length > 0) {
+        wave2Results = await runSubtaskWave(wave2, 'wave2');
+        for (const result of wave2Results) {
+          if (context.costTracker && result.sessionId) {
+            context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(result));
+          }
+        }
+
+        const wave2Success = wave2Results.filter(r => r.success).length;
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'wave2_done',
+          success: wave2Success,
+          total: wave2.length
+        });
+      }
+
+      const allResults = [...wave1Results, ...wave2Results];
+      const allSubtasks = [...wave1, ...wave2];
+      const successCount = allResults.filter(r => r.success).length;
+
+      if (successCount === 0) {
+        throw new Error(`All ${allResults.length} implementation subtasks failed.`);
+      }
+
+      implSummaries = allSubtasks.map((s, i) => {
+        const r = allResults[i];
+        return `### ${s.label} (${r.success ? 'done' : 'failed'})\n${r.content || r.fullOutput || '(no output)'}`;
+      });
+
+      context.logger?.log({
+        type: 'GATE_CHECK',
+        stage: STAGE_NAME,
+        gate: 'parallel_done',
+        successCount,
+        totalSubtasks: allResults.length
+      });
+
+    } else {
+      // ── Single agent implementation (simple plans or decomposer fallback) ──
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'single_agent_start' });
+
+      const implResult = await runAgent({
+        cli: 'codex',
+        prompt: assembledPrompt,
+        cwd: worktreePath,
+        timeout: TIMEOUTS.implement,
+        label: `implement-codex-${ticketKey}`,
+        extraArgs: ['--full-auto'],
+        metadata: { stage: STAGE_NAME, cli: 'codex', step: 'implement', ticketKey, runId: context.state.runId },
+        extractRegex: COMPLETED_REGEX
+      });
+
+      if (context.costTracker) {
+        const callData = CostTracker.fromAgentResult(implResult);
+        if (!callData.label) callData.label = `implement-codex-${ticketKey}`;
+        context.costTracker.recordCall(STAGE_NAME, callData);
+      }
+
+      if (implResult.timedOut) {
+        throw new Error(`Implement stage (codex) timed out after ${TIMEOUTS.implement}ms for ticket ${ticketKey}.`);
+      }
+
+      if (!implResult.content) {
+        const partialLen = (implResult.fullOutput || '').length;
+        throw new Error(`Implement stage (codex) did not return a <COMPLETED> tag. Partial output length: ${partialLen}.`);
+      }
+
+      implSummaries = [implResult.content];
     }
 
-    if (implResult.timedOut) {
-      throw new Error(`Implement stage (codex) timed out after ${TIMEOUTS.implement}ms for ticket ${ticketKey}.`);
-    }
+    const combinedImplSummary = implSummaries.join('\n\n');
 
-    if (!implResult.content) {
-      const partialLen = (implResult.fullOutput || '').length;
-      throw new Error(`Implement stage (codex) did not return a <COMPLETED> tag. Partial output length: ${partialLen}.`);
-    }
-
-    // Step 2: Collect the diff of what Codex wrote
+    // Step 2: Collect the diff of what was written
     let codexDiff = '';
     try {
       codexDiff = execFileSync('git', ['diff', '--no-color'], {
@@ -206,7 +449,7 @@ export async function run(context) {
 
     if (!skipReview) {
       const reviewPrompt = [
-        `You are a senior engineer reviewing code changes made by another agent for ticket ${ticketKey}.`,
+        `You are a senior engineer reviewing code changes made by ${useParallel ? 'multiple agents' : 'another agent'} for ticket ${ticketKey}.`,
         `**Summary:** ${ticketSummary}`,
         '',
         '## Implementation Plan That Was Followed',
@@ -215,13 +458,19 @@ export async function run(context) {
         '## Code Changes To Review',
         codexDiff || '(no diff detected — check for new untracked files)',
         '',
-        '## Codex Implementation Summary',
-        implResult.content,
+        `## Implementation Summary${useParallel ? ' (from parallel agents)' : ''}`,
+        combinedImplSummary,
         '',
         '## Your Task',
         '1. Review the code changes against the plan — check for correctness, missed edge cases, bugs, security issues, and code quality.',
-        '2. If you find issues, **fix them directly** in the files. You have full file system access.',
-        '3. If the code is correct and complete, state that clearly.',
+        ...(useParallel ? [
+          '2. **CRITICAL — Integration review**: Multiple agents worked in parallel on different files. Check that imports, interfaces, and data flow between their changes are consistent. Fix any mismatches.',
+          '3. If you find issues, **fix them directly** in the files. You have full file system access.',
+          '4. If the code is correct and complete, state that clearly.',
+        ] : [
+          '2. If you find issues, **fix them directly** in the files. You have full file system access.',
+          '3. If the code is correct and complete, state that clearly.',
+        ]),
         '',
         'When done, wrap your review in:',
         '<COMPLETED>',
@@ -263,18 +512,15 @@ export async function run(context) {
       });
     }
 
-    const totalDurationMs = (implResult.durationMs || 0) + reviewDurationMs;
-
     const output = {
       summary: reviewContent,
-      codexSummary: implResult.content,
+      codexSummary: combinedImplSummary,
       codexDiff: codexDiff || null,
-      codexSessionId: implResult.sessionId,
       reviewSessionId,
       reviewSkipped: skipReview,
-      fullOutput: implResult.fullOutput,
-      durationMs: totalDurationMs,
-      success: implResult.success,
+      parallelMode: useParallel,
+      subtaskCount: useParallel ? decomposition.subtasks.length : 1,
+      durationMs: reviewDurationMs,
       workingDirectory: worktreePath,
       branchName
     };

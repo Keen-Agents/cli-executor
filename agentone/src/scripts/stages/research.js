@@ -8,61 +8,133 @@ const STAGE_NAME = 'research';
 const COMPLETED_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
 const CONVERGED_SIGNAL = '<CONVERGED>';
 
+const PLANNER_JSON_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
+const MAX_RESEARCH_AGENTS = 8;
+const MIN_RESEARCH_AGENTS = 2;
+
 /**
- * Generate 3 research angle prompts from a task description.
+ * Fallback: generate 3 default research angles if the planner agent fails.
  */
-function generateAngles(description) {
+function generateDefaultAngles(description) {
   const base = description.trim();
   return [
-    {
-      label: 'landscape',
-      prompt: [
-        `Research the following topic broadly. Identify the major options, tools, frameworks, or approaches available.`,
-        `Search the web for recent (2025-2026) information. Go to primary sources — official reports, data platforms, company blogs with real numbers. Avoid listicles and aggregation blogs.`,
-        '',
-        `Topic: ${base}`,
-        '',
-        `Focus on: What exists? What are the leading solutions? How do they compare at a high level? Cite URLs for every claim.`,
-        '',
-        'Wrap your findings in:',
-        '<COMPLETED>',
-        '[Your research summary here]',
-        '</COMPLETED>'
-      ].join('\n')
-    },
-    {
-      label: 'tradeoffs',
-      prompt: [
-        `Research the trade-offs and limitations of solutions for the following topic.`,
-        `Search the web for real-world experience reports, benchmarks, and known issues (2025-2026). Go to primary sources — official reports, data platforms, GitHub issues, company blogs with real numbers.`,
-        '',
-        `Topic: ${base}`,
-        '',
-        `Focus on: Performance characteristics, scalability limits, learning curve, maintenance burden, community health, known pitfalls. Cite URLs for every claim.`,
-        '',
-        'Wrap your findings in:',
-        '<COMPLETED>',
-        '[Your research summary here]',
-        '</COMPLETED>'
-      ].join('\n')
-    },
-    {
-      label: 'recommendation',
-      prompt: [
-        `Based on current best practices, recommend the best approach for the following topic.`,
-        `Search the web for expert opinions, recent articles, and community consensus (2025-2026). Go to primary sources — official reports, revenue data, market analysis. Avoid listicles.`,
-        '',
-        `Topic: ${base}`,
-        '',
-        `Focus on: What would you recommend for a production project starting today? Why? What are the runner-up options? Cite URLs for every claim.`,
-        '',
-        'Wrap your findings in:',
-        '<COMPLETED>',
-        '[Your research summary here]',
-        '</COMPLETED>'
-      ].join('\n')
+    { label: 'landscape', focus: 'What exists? What are the leading solutions? How do they compare at a high level?' },
+    { label: 'tradeoffs', focus: 'Performance, scalability, learning curve, maintenance burden, community health, known pitfalls.' },
+    { label: 'recommendation', focus: 'What would you recommend for a production project starting today? Why? Runner-up options?' }
+  ].map(a => ({
+    label: a.label,
+    prompt: buildAnglePrompt(base, a.label, a.focus)
+  }));
+}
+
+/**
+ * Build a research prompt for a single angle.
+ */
+function buildAnglePrompt(topic, label, focus) {
+  return [
+    `Research the following topic from the perspective of: **${label}**.`,
+    `Search the web for recent (2025-2026) information. Go to primary sources — official reports, data platforms, company blogs with real numbers. Avoid listicles and aggregation blogs.`,
+    '',
+    `Topic: ${topic}`,
+    '',
+    `Focus on: ${focus}`,
+    `Cite URLs for every claim.`,
+    '',
+    'Wrap your findings in:',
+    '<COMPLETED>',
+    '[Your research summary here]',
+    '</COMPLETED>'
+  ].join('\n');
+}
+
+/**
+ * Use a planner agent to decide what research angles are needed.
+ * Returns an array of {label, prompt} objects — the planner decides how many (2-8).
+ */
+async function planResearchAngles(description, context, ticketKey, timeout) {
+  const plannerPrompt = [
+    `You are a research planning agent. Given a topic, decide what research angles are needed for thorough coverage.`,
+    ``,
+    `## Topic`,
+    description.trim(),
+    ``,
+    `## Your Task`,
+    `Decide the research angles needed to thoroughly investigate this topic. Each angle will be given to a separate research agent that will search the web independently.`,
+    ``,
+    `Guidelines:`,
+    `- Use ${MIN_RESEARCH_AGENTS}-${MAX_RESEARCH_AGENTS} angles depending on topic complexity`,
+    `- Simple topics (e.g., "best CLI tool for X") need 2-3 angles`,
+    `- Complex topics (e.g., "design a microservices architecture for e-commerce") need 5-8 angles`,
+    `- Each angle should cover a DISTINCT aspect — no overlap`,
+    `- Each angle needs a short label (1-3 words, lowercase, hyphens) and a focus description`,
+    ``,
+    `## Output Format`,
+    ``,
+    `Respond with EXACTLY this JSON array inside COMPLETED tags. No other text.`,
+    ``,
+    `<COMPLETED>`,
+    `[`,
+    `  {"label": "short-label", "focus": "What this angle should investigate"},`,
+    `  {"label": "another-angle", "focus": "What this angle should investigate"}`,
+    `]`,
+    `</COMPLETED>`
+  ].join('\n');
+
+  try {
+    const result = await runAgent({
+      cli: 'claude',
+      prompt: plannerPrompt,
+      cwd: context.workDir || undefined,
+      timeout: Math.min(timeout, 120_000),
+      label: `research-planner-${ticketKey}`,
+      metadata: {
+        stage: STAGE_NAME,
+        angle: 'planner',
+        ticketKey,
+        runId: context.state.runId
+      },
+      extractRegex: PLANNER_JSON_REGEX
+    });
+
+    if (context.costTracker && result.sessionId) {
+      context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(result));
     }
-  ];
+
+    if (!result.success || !result.content) {
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'planner_failed', reason: 'no content' });
+      return null;
+    }
+
+    const parsed = JSON.parse(result.content);
+    if (!Array.isArray(parsed) || parsed.length < MIN_RESEARCH_AGENTS) {
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'planner_failed', reason: 'invalid array', length: parsed?.length });
+      return null;
+    }
+
+    // Validate and cap
+    const angles = parsed
+      .filter(a => a?.label && a?.focus)
+      .slice(0, MAX_RESEARCH_AGENTS)
+      .map(a => ({
+        label: String(a.label).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30),
+        prompt: buildAnglePrompt(description.trim(), a.label, a.focus)
+      }));
+
+    if (angles.length < MIN_RESEARCH_AGENTS) {
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'planner_failed', reason: 'too few valid angles', count: angles.length });
+      return null;
+    }
+
+    return angles;
+  } catch (err) {
+    context.logger?.log({
+      type: 'GATE_CHECK',
+      stage: STAGE_NAME,
+      gate: 'planner_failed',
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return null;
+  }
 }
 
 /**
@@ -266,7 +338,6 @@ export async function run(context) {
       throw new Error('Research stage requires a non-empty task description.');
     }
 
-    const angles = generateAngles(description);
     const timeout = TIMEOUTS.research || 300_000;
     const ticketKey = intakeOutput.key || 'unknown';
 
@@ -275,6 +346,7 @@ export async function run(context) {
     let researchSummary;
     let successCount;
     let results;
+    let angles;
 
     if (phase1Checkpoint) {
       // Resume: Phase 1 already completed
@@ -282,7 +354,32 @@ export async function run(context) {
       researchSummary = phase1Checkpoint.researchSummary;
       successCount = phase1Checkpoint.successCount;
       results = phase1Checkpoint.results;
+      angles = (phase1Checkpoint.results || []).map(r => ({ label: r.label, prompt: '' }));
     } else {
+      // ── Phase 0: Planner decides research angles ────────────────────
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'planner_start' });
+
+      const plannedAngles = await planResearchAngles(description, context, ticketKey, timeout);
+      if (plannedAngles) {
+        angles = plannedAngles;
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'planner_done',
+          angleCount: angles.length,
+          labels: angles.map(a => a.label)
+        });
+      } else {
+        angles = generateDefaultAngles(description);
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'planner_fallback',
+          angleCount: angles.length,
+          labels: angles.map(a => a.label)
+        });
+      }
+
       // ── Phase 1: Parallel Claude research agents (web search) ──────
       context.logger?.log({
         type: 'GATE_CHECK',
@@ -327,7 +424,8 @@ export async function run(context) {
       }
 
       successCount = results.filter((r) => r.success).length;
-      const MIN_ANGLES_REQUIRED = 2;
+      // Need at least half of the angles (min 2) to succeed
+      const MIN_ANGLES_REQUIRED = Math.max(2, Math.ceil(angles.length / 2));
 
       if (successCount === 0) {
         throw new Error('All research agents failed. No results to synthesize.');
