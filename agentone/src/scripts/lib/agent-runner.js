@@ -218,9 +218,11 @@ export async function runAgent(opts) {
 function buildArgs(cli, prompt, extraArgs) {
     if (cli === 'claude') {
         const defaults = AGENT_DEFAULTS.claude?.extraArgs || [];
-        // Use stream-json for real-time output in the bridge debugger.
-        // This streams NDJSON events as Claude works, instead of one blob at the end.
-        return ['-p', '--verbose', '--output-format', 'stream-json', ...defaults, ...extraArgs];
+        // NOTE: --output-format stream-json would give real-time NDJSON but deadlocks
+        // on Windows with large stdin prompts (pipe buffer contention). Stick with
+        // plain -p which outputs text. The bridge parseClaudeStreamJson is available
+        // if stream-json is ever enabled via extraArgs for specific use cases.
+        return ['-p', ...defaults, ...extraArgs];
     }
     if (cli === 'codex') {
         const defaults = AGENT_DEFAULTS.codex?.extraArgs || [];
