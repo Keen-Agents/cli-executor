@@ -1029,11 +1029,14 @@ const server = http.createServer(async (req, res) => {
 
                 const session = createSession(cli, args, cwd, metadata);
 
-                // Write stdinData then close stdin (for codex '-' stdin prompt mode)
+                // Write stdinData then close stdin (for codex '-' stdin prompt mode).
+                // Use .end(data) for atomic write+close — avoids pipe buffer deadlocks
+                // on Windows when stdinData exceeds the ~64KB pipe buffer limit.
                 if (stdinData) {
-                    session.process.stdin.write(stdinData);
-                }
-                if (closeStdin || stdinData) {
+                    session.process.stdin.end(stdinData, 'utf8', () => {
+                        console.log(`[${new Date().toISOString()}] Stdin written and closed for session ${session.id} (${stdinData.length} bytes)`);
+                    });
+                } else if (closeStdin) {
                     session.process.stdin.end();
                     console.log(`[${new Date().toISOString()}] Stdin closed for session ${session.id} (one-shot mode)`);
                 }

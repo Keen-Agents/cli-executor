@@ -130,11 +130,32 @@ function buildDebatePrompt(description, researchSummary, debateHistory, round, i
   if (debateHistory.length > 0) {
     sections.push('');
     sections.push(`## Debate History`);
-    for (const entry of debateHistory) {
+
+    // Only include full text for last 2 rounds to keep prompt size manageable.
+    // Older rounds get compressed to a short summary (key conclusions only).
+    const FULL_ROUNDS = 2;
+    const cutoff = Math.max(0, debateHistory.length - FULL_ROUNDS);
+
+    for (let i = 0; i < debateHistory.length; i++) {
+      const entry = debateHistory[i];
       const who = entry.cli === 'claude' ? 'Claude' : 'Codex';
       sections.push('');
       sections.push(`### Round ${entry.round + 1} (${who})`);
-      sections.push(entry.content);
+
+      if (i < cutoff) {
+        // Compress old rounds: first 800 chars + last 800 chars
+        const text = entry.content || '';
+        if (text.length > 2000) {
+          sections.push(`[Compressed — full text was ${text.length} chars]`);
+          sections.push(text.slice(0, 800));
+          sections.push(`\n[...truncated...]\n`);
+          sections.push(text.slice(-800));
+        } else {
+          sections.push(text);
+        }
+      } else {
+        sections.push(entry.content);
+      }
     }
   }
 

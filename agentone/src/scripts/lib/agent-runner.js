@@ -218,15 +218,10 @@ export async function runAgent(opts) {
 function buildArgs(cli, prompt, extraArgs) {
     if (cli === 'claude') {
         const defaults = AGENT_DEFAULTS.claude?.extraArgs || [];
-        // prompt is a positional arg that goes LAST (after all flags).
-        // For long prompts, we pass it via stdin instead — see runAgent().
-        // When promptArg is empty, Claude reads from stdin in -p mode.
         return ['-p', ...defaults, ...extraArgs];
     }
     if (cli === 'codex') {
         const defaults = AGENT_DEFAULTS.codex?.extraArgs || [];
-        // Use '-' to read prompt from stdin (avoids Windows cmd line length limits).
-        // The prompt is sent via the bridge's stdin write after spawn.
         return ['exec', '--json', '-', ...defaults, ...extraArgs];
     }
     return [prompt, ...extraArgs];
