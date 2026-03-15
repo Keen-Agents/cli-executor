@@ -10,7 +10,7 @@ const CONVERGED_SIGNAL = '<CONVERGED>';
 const RE_RESEARCH_REGEX = /<RE_RESEARCH>([\s\S]*?)<\/RE_RESEARCH>/;
 const MAX_RE_RESEARCH_PER_DEBATE = 2;  // max re-research rounds to prevent runaway
 
-const MAX_RESEARCH_AGENTS = 8;
+const MAX_RESEARCH_AGENTS = 10;  // max total agents (bull+bear pairs)
 const MIN_RESEARCH_AGENTS = 2;
 
 /**
@@ -18,22 +18,76 @@ const MIN_RESEARCH_AGENTS = 2;
  */
 function generateDefaultAngles(description) {
   const base = description.trim();
-  return [
+  const defaultAngles = [
     { label: 'landscape', focus: 'What exists? What are the leading solutions? How do they compare at a high level?' },
     { label: 'tradeoffs', focus: 'Performance, scalability, learning curve, maintenance burden, community health, known pitfalls.' },
     { label: 'recommendation', focus: 'What would you recommend for a production project starting today? Why? Runner-up options?' }
-  ].map(a => ({
-    label: a.label,
-    prompt: buildAnglePrompt(base, a.label, a.focus)
-  }));
+  ];
+  return anglesFromInput(defaultAngles, base);
 }
 
 /**
- * Build a research prompt for a single angle.
+ * Structured output format required from all researchers.
+ * Forces hard data over fluffy recommendations.
  */
-function buildAnglePrompt(topic, label, focus) {
+const STRUCTURED_OUTPUT_FORMAT = `
+## Required Output Structure
+
+Your research MUST include ALL of the following sections. If you cannot find data for a section, write "NOT FOUND — [what you searched for and why it matters]". Do NOT skip sections or make up numbers.
+
+### 1. Market Size & Growth
+- Total addressable market (TAM) with source name, URL, and publication date
+- Growth rate (CAGR) with source
+- If multiple sources disagree, list ALL figures and note the discrepancy
+
+### 2. Top 5 Competitors
+For each: App name, developer, install count, star rating, review count, pricing model, estimated monthly revenue (if available)
+Source: Google Play listings, AppBrain, Sensor Tower, or similar
+
+### 3. Revenue Evidence
+- Only include VERIFIED revenue numbers from named sources (IndieHackers posts, interviews, Sensor Tower estimates)
+- Distinguish between "self-reported" and "third-party estimated"
+- Flag any number older than 12 months
+
+### 4. ASO / Discoverability
+- Keyword difficulty for 3-5 relevant search terms (use ASOTools, AppTweak, or similar)
+- Current top-ranking apps for those keywords
+- Estimated search volume if available
+
+### 5. Risk Factors
+- At least 3 specific reasons this could fail
+- Regulatory risks, platform policy risks, competitive moat risks
+- What would make you NOT recommend this?
+
+### 6. Recommendation
+- Your verdict with confidence level (LOW / MEDIUM / HIGH)
+- One paragraph max
+`.trim();
+
+/**
+ * Build a research prompt for a single angle.
+ * @param {'bull' | 'bear'} stance — bull finds opportunity, bear finds why it fails
+ */
+function buildAnglePrompt(topic, label, focus, stance = 'bull') {
+  const stanceInstructions = stance === 'bear'
+    ? [
+      `You are a BEAR researcher — your job is to find evidence for why this will FAIL.`,
+      `Look for: saturated markets, strong incumbents, policy risks, inflated claims,`,
+      `outdated data being cited as current, hidden costs, and reasons users won't pay.`,
+      `Be adversarial. Your goal is to prevent bad investment decisions.`,
+    ]
+    : [
+      `You are a BULL researcher — your job is to find the genuine opportunity here.`,
+      `Look for: underserved markets, proven revenue models, successful indie case studies,`,
+      `accessible keywords, growing categories, and realistic paths to revenue.`,
+      `Be optimistic but ONLY cite verifiable data. No hype without sources.`,
+    ];
+
   return [
-    `Research the following topic from the perspective of: **${label}**.`,
+    `Research the following topic from the perspective of: **${label}** (${stance.toUpperCase()} case).`,
+    '',
+    ...stanceInstructions,
+    '',
     `Search the web for recent (2025-2026) information. Go to primary sources — official reports, data platforms, company blogs with real numbers. Avoid listicles and aggregation blogs.`,
     '',
     `Topic: ${topic}`,
@@ -41,24 +95,48 @@ function buildAnglePrompt(topic, label, focus) {
     `Focus on: ${focus}`,
     `Cite URLs for every claim.`,
     '',
+    STRUCTURED_OUTPUT_FORMAT,
+    '',
     'Wrap your findings in:',
     '<COMPLETED>',
-    '[Your research summary here]',
+    '[Your structured research here]',
     '</COMPLETED>'
   ].join('\n');
 }
 
 /**
  * Convert dispatcher-provided angles [{label, focus}] into research angle objects.
+ * Each angle spawns TWO agents: a bull (opportunity) and a bear (risks/failures).
+ * Agents alternate between Claude and Codex for diversity.
  */
 function anglesFromInput(inputAngles, description) {
-  return inputAngles
+  const validAngles = inputAngles
     .filter(a => a?.label && a?.focus)
-    .slice(0, MAX_RESEARCH_AGENTS)
-    .map(a => ({
-      label: String(a.label).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30),
-      prompt: buildAnglePrompt(description.trim(), a.label, a.focus)
-    }));
+    .slice(0, Math.floor(MAX_RESEARCH_AGENTS / 2)); // each angle spawns 2 agents
+
+  const agents = [];
+  for (let i = 0; i < validAngles.length; i++) {
+    const a = validAngles[i];
+    const cleanLabel = String(a.label).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 25);
+
+    // Bull agent
+    agents.push({
+      label: `${cleanLabel}-bull`,
+      stance: 'bull',
+      cli: i % 2 === 0 ? 'claude' : 'codex',
+      prompt: buildAnglePrompt(description.trim(), a.label, a.focus, 'bull')
+    });
+
+    // Bear agent — opposite CLI from bull
+    agents.push({
+      label: `${cleanLabel}-bear`,
+      stance: 'bear',
+      cli: i % 2 === 0 ? 'codex' : 'claude',
+      prompt: buildAnglePrompt(description.trim(), a.label, a.focus, 'bear')
+    });
+  }
+
+  return agents;
 }
 
 /**
@@ -73,8 +151,10 @@ function mergeResults(angles, results) {
     const content = result?.content || result?.fullOutput || '(no output)';
     const exitedCleanly = result?.exitCode === 0;
     const status = (result?.success || exitedCleanly) ? 'completed' : (result?.timedOut ? 'timed out' : 'failed');
+    const stance = angle.stance ? ` [${angle.stance.toUpperCase()}]` : '';
+    const cli = angle.cli ? ` (${angle.cli})` : '';
 
-    parts.push(`## ${angle.label.charAt(0).toUpperCase() + angle.label.slice(1)} (${status})\n`);
+    parts.push(`## ${angle.label.charAt(0).toUpperCase() + angle.label.slice(1)}${stance}${cli} — ${status}\n`);
     parts.push(content.trim());
     parts.push('');
   }
@@ -352,7 +432,9 @@ export async function run(context) {
           stage: STAGE_NAME,
           gate: 'angles_from_input',
           angleCount: angles.length,
-          labels: angles.map(a => a.label)
+          labels: angles.map(a => a.label),
+          stances: angles.map(a => a.stance),
+          clis: angles.map(a => a.cli)
         });
       } else {
         angles = generateDefaultAngles(description);
@@ -373,9 +455,14 @@ export async function run(context) {
         angleCount: angles.length
       });
 
-      const agentPromises = angles.map((angle) =>
-        runAgent({
-          cli: 'claude',
+      const agentPromises = angles.map((angle) => {
+        const cli = angle.cli || 'claude';
+        const extraArgs = cli === 'codex'
+          ? ['-c', 'search=true', '--dangerously-bypass-approvals-and-sandbox']
+          : ['--allowedTools', 'WebSearch,WebFetch'];
+
+        return runAgent({
+          cli,
           prompt: angle.prompt,
           signal: context.signal,
           cwd: context.workDir || undefined,
@@ -384,13 +471,15 @@ export async function run(context) {
           metadata: {
             stage: STAGE_NAME,
             angle: angle.label,
+            stance: angle.stance || 'neutral',
+            cli,
             ticketKey,
             runId: context.state.runId
           },
-          extraArgs: ['--allowedTools', 'WebSearch,WebFetch'],
+          extraArgs,
           extractRegex: COMPLETED_REGEX
-        })
-      );
+        });
+      });
 
       results = await Promise.all(
         agentPromises.map((p) => p.catch((err) => ({
