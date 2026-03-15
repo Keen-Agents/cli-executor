@@ -7,6 +7,8 @@ const DEBATE_SAFETY_CAP = DEFAULTS.debateSafetyCap ?? 10;
 const STAGE_NAME = 'research';
 const COMPLETED_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
 const CONVERGED_SIGNAL = '<CONVERGED>';
+const RE_RESEARCH_REGEX = /<RE_RESEARCH>([\s\S]*?)<\/RE_RESEARCH>/;
+const MAX_RE_RESEARCH_PER_DEBATE = 2;  // max re-research rounds to prevent runaway
 
 const MAX_RESEARCH_AGENTS = 8;
 const MIN_RESEARCH_AGENTS = 2;
@@ -69,7 +71,8 @@ function mergeResults(angles, results) {
     const angle = angles[i];
     const result = results[i];
     const content = result?.content || result?.fullOutput || '(no output)';
-    const status = result?.success ? 'completed' : (result?.timedOut ? 'timed out' : 'failed');
+    const exitedCleanly = result?.exitCode === 0;
+    const status = (result?.success || exitedCleanly) ? 'completed' : (result?.timedOut ? 'timed out' : 'failed');
 
     parts.push(`## ${angle.label.charAt(0).toUpperCase() + angle.label.slice(1)} (${status})\n`);
     parts.push(content.trim());
@@ -77,6 +80,33 @@ function mergeResults(angles, results) {
   }
 
   return parts.join('\n');
+}
+
+/**
+ * Parse RE_RESEARCH block from debate output into targeted research questions.
+ * Expected format inside tags: JSON array of {label, focus} objects, or newline-separated questions.
+ */
+function parseReResearchBlock(content) {
+  const match = content.match(RE_RESEARCH_REGEX);
+  if (!match) return null;
+
+  const raw = match[1].trim();
+  // Try JSON array first
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.label && parsed[0]?.focus) {
+      return parsed.slice(0, 3); // max 3 targeted questions
+    }
+  } catch {}
+
+  // Fallback: numbered lines like "1. Research X\n2. Research Y"
+  const lines = raw.split(/\n/).map(l => l.replace(/^\d+\.\s*/, '').trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+
+  return lines.slice(0, 3).map((line, i) => ({
+    label: `gap-${i + 1}`,
+    focus: line
+  }));
 }
 
 /**
@@ -173,6 +203,21 @@ function buildDebatePrompt(description, researchSummary, debateHistory, round, i
   }
 
   sections.push(
+    ``,
+    `## Re-Research Signal`,
+    ``,
+    `If your critique reveals that the research is MISSING critical data that would change the`,
+    `recommendation (e.g., outdated sources, unchecked competitor data, missing market stats),`,
+    `you can request targeted re-research by including a <RE_RESEARCH> block:`,
+    ``,
+    `<RE_RESEARCH>`,
+    `[{"label": "short-label", "focus": "What specific data to research and why it matters"}]`,
+    `</RE_RESEARCH>`,
+    ``,
+    `The pipeline will spawn new research agents to fill these gaps, merge findings into the`,
+    `research summary, and the debate will continue with the enriched data. Use this when your`,
+    `web search alone cannot answer the question and dedicated deep research is needed.`,
+    `Maximum 3 targeted questions per block. Only use this for CRITICAL gaps, not minor details.`,
     ``,
     `## Rules`,
     ``,
@@ -343,7 +388,9 @@ export async function run(context) {
         }
       }
 
-      successCount = results.filter((r) => r.success).length;
+      // Count as success if extractRegex matched OR if the agent exited cleanly (code 0)
+      // with output. Agents sometimes forget <COMPLETED> tags but still produce valid research.
+      successCount = results.filter((r) => r.success || (r.exitCode === 0 && (r.content || r.fullOutput))).length;
       // Need at least half of the angles (min 2) to succeed
       const MIN_ANGLES_REQUIRED = Math.max(2, Math.ceil(angles.length / 2));
 
@@ -410,6 +457,7 @@ export async function run(context) {
       const MAX_DEBATE_ROUNDS = isAutoMode ? DEBATE_SAFETY_CAP : Number(rawRounds);
       debateHistory = [];
       converged = false;
+      let reResearchCount = 0;
 
       // Check for partial debate checkpoint (individual rounds saved)
       for (let r = 0; r < MAX_DEBATE_ROUNDS; r++) {
@@ -503,6 +551,74 @@ export async function run(context) {
               success: debateResult.success,
               durationMs: debateResult.durationMs
             });
+
+            // ── Re-research: if debate identified critical gaps, spawn targeted agents ──
+            const reResearchQuestions = parseReResearchBlock(roundContent);
+            if (reResearchQuestions && reResearchCount < MAX_RE_RESEARCH_PER_DEBATE && !context.signal?.aborted) {
+              reResearchCount++;
+              context.logger?.log({
+                type: 'GATE_CHECK',
+                stage: STAGE_NAME,
+                gate: 're_research_start',
+                round: round + 1,
+                questionCount: reResearchQuestions.length,
+                labels: reResearchQuestions.map(q => q.label),
+                reResearchRound: reResearchCount
+              });
+
+              const reResearchAngles = reResearchQuestions.map(q => ({
+                label: q.label,
+                prompt: buildAnglePrompt(description, q.label, q.focus)
+              }));
+
+              const reResults = await Promise.all(
+                reResearchAngles.map(angle =>
+                  runAgent({
+                    cli: 'claude',
+                    prompt: angle.prompt,
+                    signal: context.signal,
+                    cwd: context.workDir || undefined,
+                    timeout,
+                    label: `re-research-${angle.label}-${ticketKey}`,
+                    metadata: {
+                      stage: STAGE_NAME,
+                      angle: `re-research-${angle.label}`,
+                      ticketKey,
+                      runId: context.state.runId
+                    },
+                    extraArgs: ['--allowedTools', 'WebSearch,WebFetch'],
+                    extractRegex: COMPLETED_REGEX
+                  }).catch(err => ({
+                    success: false,
+                    content: null,
+                    fullOutput: `Error: ${err instanceof Error ? err.message : String(err)}`,
+                    exitCode: null
+                  }))
+                )
+              );
+
+              // Record costs
+              for (const rr of reResults) {
+                if (context.costTracker && rr.sessionId) {
+                  context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(rr));
+                }
+              }
+
+              const reResearchSummary = mergeResults(reResearchAngles, reResults);
+              const reSuccessCount = reResults.filter(r => r.success || (r.exitCode === 0 && (r.content || r.fullOutput))).length;
+
+              // Merge into main research summary
+              researchSummary += `\n\n---\n\n# Re-Research (triggered by debate round ${round + 1})\n\n${reResearchSummary}`;
+
+              context.logger?.log({
+                type: 'GATE_CHECK',
+                stage: STAGE_NAME,
+                gate: 're_research_done',
+                round: round + 1,
+                successCount: reSuccessCount,
+                totalQuestions: reResearchQuestions.length
+              });
+            }
 
             if (roundContent.includes(CONVERGED_SIGNAL)) {
               converged = true;
