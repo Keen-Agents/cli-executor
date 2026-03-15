@@ -218,7 +218,9 @@ export async function runAgent(opts) {
 function buildArgs(cli, prompt, extraArgs) {
     if (cli === 'claude') {
         const defaults = AGENT_DEFAULTS.claude?.extraArgs || [];
-        return ['-p', ...defaults, ...extraArgs];
+        // Use stream-json for real-time output in the bridge debugger.
+        // This streams NDJSON events as Claude works, instead of one blob at the end.
+        return ['-p', '--output-format', 'stream-json', ...defaults, ...extraArgs];
     }
     if (cli === 'codex') {
         const defaults = AGENT_DEFAULTS.codex?.extraArgs || [];
@@ -228,22 +230,78 @@ function buildArgs(cli, prompt, extraArgs) {
 }
 
 /**
+ * Parse Claude stdout — handles both legacy single-JSON and stream-json NDJSON.
  * @param {string} stdout
  * @returns {{ parsedJson: any, fullOutput: string }}
  */
 function parseClaudeStdout(stdout) {
     const trimmed = stdout.trim();
-    if (!trimmed || !trimmed.startsWith('{')) {
+    if (!trimmed) {
         return { parsedJson: null, fullOutput: stdout };
     }
 
-    try {
-        const parsedJson = JSON.parse(trimmed);
-        const fullOutput = typeof parsedJson?.result === 'string' ? parsedJson.result : stdout;
-        return { parsedJson, fullOutput };
-    } catch {
-        return { parsedJson: null, fullOutput: stdout };
+    // Legacy single-JSON format (no --output-format stream-json)
+    if (trimmed.startsWith('{') && !trimmed.includes('\n')) {
+        try {
+            const parsedJson = JSON.parse(trimmed);
+            const fullOutput = typeof parsedJson?.result === 'string' ? parsedJson.result : stdout;
+            return { parsedJson, fullOutput };
+        } catch {
+            return { parsedJson: null, fullOutput: stdout };
+        }
     }
+
+    // Stream-JSON NDJSON format: multiple JSON lines
+    const lines = trimmed.split(/\r?\n/).filter(Boolean);
+    const events = [];
+    const textParts = [];
+    let resultObj = null;
+
+    for (const line of lines) {
+        try {
+            const event = JSON.parse(line);
+            events.push(event);
+
+            // Extract text from assistant message events
+            if (event.type === 'assistant' && event.message?.content) {
+                for (const block of event.message.content) {
+                    if (block.type === 'text' && typeof block.text === 'string') {
+                        textParts.push(block.text);
+                    }
+                }
+            }
+
+            // Extract from result event (final output)
+            if (event.type === 'result') {
+                resultObj = event;
+                if (typeof event.result === 'string') {
+                    textParts.push(event.result);
+                } else if (event.result?.content) {
+                    for (const block of event.result.content) {
+                        if (block.type === 'text' && typeof block.text === 'string') {
+                            textParts.push(block.text);
+                        }
+                    }
+                }
+            }
+        } catch {
+            // Non-JSON line, skip
+        }
+    }
+
+    if (events.length === 0) {
+        // Fallback: try as single JSON blob
+        try {
+            const parsedJson = JSON.parse(trimmed);
+            const fullOutput = typeof parsedJson?.result === 'string' ? parsedJson.result : stdout;
+            return { parsedJson, fullOutput };
+        } catch {
+            return { parsedJson: null, fullOutput: stdout };
+        }
+    }
+
+    const fullOutput = textParts.join('').trim() || stdout;
+    return { parsedJson: resultObj || events, fullOutput };
 }
 
 /**

@@ -310,6 +310,97 @@ function generateSessionId() {
 }
 
 /**
+ * Parse Claude stream-json NDJSON stdout into structured conversation history.
+ * This format is produced by --output-format stream-json and streams in real time.
+ * Returns null if the output doesn't look like Claude stream-json.
+ */
+function parseClaudeStreamJson(rawStdout, session) {
+    const lines = rawStdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const events = [];
+    for (const line of lines) {
+        try { events.push(JSON.parse(line)); } catch { /* skip non-JSON */ }
+    }
+    if (events.length === 0) return null;
+
+    // Check if this looks like Claude stream-json (has system, assistant, or result events)
+    const hasClaudeEvents = events.some(e =>
+        e.type === 'system' || e.type === 'assistant' || e.type === 'result' || e.type === 'user'
+    );
+    if (!hasClaudeEvents) return null;
+
+    const pairs = [];
+    let currentUser = null;
+    let currentAssistant = [];
+    let usage = null;
+    let cost = null;
+    let durationMs = null;
+    let numTurns = null;
+
+    for (const event of events) {
+        if (event.type === 'user') {
+            // Save previous pair
+            if (currentUser || currentAssistant.length > 0) {
+                pairs.push({
+                    user: currentUser || '(prompt sent via stdin)',
+                    assistant: currentAssistant.join('') || '(thinking...)'
+                });
+                currentAssistant = [];
+            }
+            // Extract user message text
+            if (typeof event.message?.content === 'string') {
+                currentUser = event.message.content;
+            } else if (Array.isArray(event.message?.content)) {
+                const texts = event.message.content
+                    .filter(b => b.type === 'text')
+                    .map(b => b.text);
+                currentUser = texts.join('\n') || JSON.stringify(event.message.content);
+            } else {
+                currentUser = '(user message)';
+            }
+        } else if (event.type === 'assistant') {
+            // Extract assistant text blocks
+            if (Array.isArray(event.message?.content)) {
+                for (const block of event.message.content) {
+                    if (block.type === 'text' && typeof block.text === 'string') {
+                        currentAssistant.push(block.text);
+                    } else if (block.type === 'tool_use') {
+                        currentAssistant.push(`[Tool: ${block.name}]`);
+                    }
+                }
+            }
+        } else if (event.type === 'result') {
+            // Final result — extract text and metadata
+            if (typeof event.result === 'string') {
+                currentAssistant.push(event.result);
+            }
+            if (event.usage) usage = event.usage;
+            if (event.total_cost_usd) cost = event.total_cost_usd;
+            if (event.duration_ms) durationMs = event.duration_ms;
+            if (event.num_turns) numTurns = event.num_turns;
+        }
+    }
+
+    // Push final pair
+    if (currentUser || currentAssistant.length > 0) {
+        pairs.push({
+            user: currentUser || (session.stdinLog?.[0]?.input) || '(prompt sent via stdin)',
+            assistant: currentAssistant.join('') || '(in progress...)'
+        });
+    }
+
+    if (pairs.length === 0) return null;
+
+    return {
+        pairs,
+        usage: usage || null,
+        cost: cost || null,
+        durationMs: durationMs || null,
+        numTurns: numTurns || null,
+        messageCount: pairs.length * 2
+    };
+}
+
+/**
  * Parse Codex JSONL stdout into structured conversation history.
  * Returns null if the output doesn't look like Codex JSONL.
  */
@@ -1185,16 +1276,30 @@ const server = http.createServer(async (req, res) => {
                 const session = sessions.get(sessionId);
                 if (!session) throw new Error(`Session ${sessionId} not found`);
 
-                if (session.conversationHistory) {
+                if (session.conversationHistory && !session.running) {
                     result = { sessionId, history: session.conversationHistory, running: session.running, source: 'cached' };
                 } else {
+                    // Clear cache for running sessions so we get fresh data
+                    if (session.running) session.conversationHistory = null;
+
                     let parsed = null;
                     const rawStdout = session.stdout.trim();
-                    if (rawStdout.startsWith('{')) {
+
+                    // Try Claude stream-json NDJSON format first (multiple JSON lines)
+                    if (rawStdout.includes('\n') && session.cli === 'claude') {
+                        const claudeStream = parseClaudeStreamJson(rawStdout, session);
+                        if (claudeStream) {
+                            if (!session.running) session.conversationHistory = claudeStream;
+                            result = { sessionId, history: claudeStream, running: session.running, source: 'claude-stream' };
+                        }
+                    }
+
+                    // Try legacy single-JSON Claude format
+                    if (!result && rawStdout.startsWith('{')) {
                         try { parsed = JSON.parse(rawStdout); } catch { /* not JSON */ }
                     }
 
-                    if (parsed && parsed.messages) {
+                    if (!result && parsed && parsed.messages) {
                         const pairs = [];
                         let currentPair = {};
                         for (const msg of parsed.messages) {
@@ -1217,7 +1322,7 @@ const server = http.createServer(async (req, res) => {
                             messageCount: parsed.messages.length
                         };
                         result = { sessionId, history: session.conversationHistory, running: session.running, source: 'parsed' };
-                    } else if (parsed && parsed.result) {
+                    } else if (!result && parsed && parsed.result) {
                         const prompt = (session.args || []).find((a, i, arr) => arr[i - 1] === '-p') || '(prompt)';
                         const pairs = [{ user: prompt, assistant: parsed.result }];
                         session.conversationHistory = {
@@ -1231,7 +1336,7 @@ const server = http.createServer(async (req, res) => {
                             messageCount: 1
                         };
                         result = { sessionId, history: session.conversationHistory, running: session.running, source: 'parsed' };
-                    } else if (rawStdout.includes('\n') && rawStdout.split('\n').some(l => l.trim().startsWith('{'))) {
+                    } else if (!result && rawStdout.includes('\n') && rawStdout.split('\n').some(l => l.trim().startsWith('{'))) {
                         // Codex JSONL format: multiple JSON lines with item.completed events
                         const codexParsed = parseCodexHistory(rawStdout, session);
                         if (codexParsed) {
@@ -1249,7 +1354,8 @@ const server = http.createServer(async (req, res) => {
                         } else {
                             result = { sessionId, history: null, raw: session.stdout, running: session.running, source: 'raw' };
                         }
-                    } else if (session.stdinLog && session.stdinLog.length > 0) {
+                    }
+                    if (!result && session.stdinLog && session.stdinLog.length > 0) {
                         const pairs = session.stdinLog.map(entry => ({
                             user: entry.input,
                             timestamp: entry.timestamp
@@ -1258,7 +1364,8 @@ const server = http.createServer(async (req, res) => {
                             pairs[pairs.length - 1].assistant = session.stdout;
                         }
                         result = { sessionId, history: { pairs, messageCount: session.stdinLog.length }, running: session.running, source: 'stdinLog' };
-                    } else {
+                    }
+                    if (!result) {
                         result = { sessionId, history: null, raw: session.stdout, running: session.running, source: 'raw' };
                     }
                 }
