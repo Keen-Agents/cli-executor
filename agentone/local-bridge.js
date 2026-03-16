@@ -546,11 +546,13 @@ function createSession(cli, args, cwd, metadata = {}, opts = {}) {
 
     console.log(`[${new Date().toISOString()}] Spawn: ${resolvedCli} [${resolvedArgs.length} args]${stdinFd !== null ? ' (stdin from file)' : ''}`);
 
-    // Build PATH with common SDK locations so child agents find them
-    const extraPaths = [
-        'C:\\flutter\\flutter\\bin',
-        'C:\\flutter\\flutter\\bin\\cache\\dart-sdk\\bin'
-    ].filter(p => fsSync.existsSync(p));
+    // Allow operators to inject extra PATH entries for child agents (e.g. SDK paths).
+    // Set AGENTONE_EXTRA_PATH to a path-delimiter-separated list of directories.
+    const extraPathEnv = process.env.AGENTONE_EXTRA_PATH || '';
+    const extraPaths = extraPathEnv
+        .split(path.delimiter)
+        .map(p => p.trim())
+        .filter(p => p && fsSync.existsSync(p));
     const childPath = extraPaths.length > 0
         ? [...extraPaths, process.env.PATH].join(path.delimiter)
         : process.env.PATH;

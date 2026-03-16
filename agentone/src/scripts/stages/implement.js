@@ -124,7 +124,7 @@ function buildSubtaskPrompt(subtask, ticketKey, ticketSummary, fullPlan, profile
     `- Follow existing code style and conventions`,
     `- Write clean, production-quality code`,
     `- Run tests after your changes if applicable`,
-    `- Flutter SDK is at C:\\flutter\\flutter\\bin (already on PATH). Dart SDK is at C:\\flutter\\flutter\\bin\\cache\\dart-sdk\\bin`,
+    `- If this is a Flutter project, ensure flutter and dart are on PATH before running commands`,
     ``,
     `## Completion`,
     `<COMPLETED>`,
