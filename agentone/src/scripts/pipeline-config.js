@@ -5,7 +5,7 @@ export const DEFAULTS = {
   pollInterval: 3_000,
   stepTimeout: 300_000,
   maxConvergenceRounds: 'auto',
-  debateSafetyCap: 10,
+  debateSafetyCap: 9,
   maxFixAttempts: 2,
   completedRegex: /<COMPLETED>([\s\S]*?)<\/COMPLETED>/
 };
@@ -51,6 +51,28 @@ export const PROFILES = {
       'intake',
       'classify',
       'research',
+      'dual-plan',
+      'cross-critique',
+      'human-gate',
+      'implement',
+      'verify',
+      'fix-loop',
+      'test-suite',
+      'browser-test',
+      'security-audit',
+      'human-gate',
+      'pr-create',
+      'jira-close'
+    ],
+    budget: 150,
+    maxConvergenceRounds: 'auto',
+    maxFixAttempts: 3,
+    adversarialCritique: true
+  },
+  'complex-no-research': {
+    stages: [
+      'intake',
+      'classify',
       'dual-plan',
       'cross-critique',
       'human-gate',
@@ -139,7 +161,7 @@ export const TIMEOUTS = {
   classify: 120_000,
   plan: 3_600_000,
   'dual-plan': 3_600_000,
-  'cross-critique': 3_600_000,
+  'cross-critique': 10_800_000,
   'human-gate': 86_400_000,
   implement: 14_400_000,
   verify: 3_600_000,

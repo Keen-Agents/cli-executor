@@ -124,6 +124,7 @@ function buildSubtaskPrompt(subtask, ticketKey, ticketSummary, fullPlan, profile
     `- Follow existing code style and conventions`,
     `- Write clean, production-quality code`,
     `- Run tests after your changes if applicable`,
+    `- Flutter SDK is at C:\\flutter\\flutter\\bin (already on PATH). Dart SDK is at C:\\flutter\\flutter\\bin\\cache\\dart-sdk\\bin`,
     ``,
     `## Completion`,
     `<COMPLETED>`,
@@ -205,8 +206,83 @@ export async function run(context) {
       assembledPrompt += `\n\n## Human Revision Request\n${humanRevision.comments}`;
     }
 
-    // Step 1: Check for dispatcher-provided subtasks or fall back to single agent
-    const decomposition = context.subtasks ? validateSubtasks(context.subtasks) : null;
+    // Step 1: Check for subtasks — from dispatcher, or auto-decompose via Claude
+    let decomposition = context.subtasks ? validateSubtasks(context.subtasks) : null;
+
+    if (!decomposition) {
+      // Auto-decompose: Claude reads the plan and splits into parallel subtasks.
+      // Write the plan to a file so Claude's prompt stays small (~2KB) and it
+      // can read the file with its built-in Read tool instead of processing
+      // a 60KB+ inline prompt that causes timeouts.
+      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'auto_decompose_start' });
+
+      const planFilePath = path.join(worktreePath, '__PLAN_FOR_DECOMPOSE.md');
+      await fsp.writeFile(planFilePath, planText, 'utf8');
+
+      const decomposePrompt = [
+        'You are a senior engineer splitting an implementation plan into parallel subtasks for multiple agents.',
+        'Each agent will work independently on non-overlapping files. They all see the full plan for context.',
+        '',
+        `## Plan Location`,
+        `The full implementation plan is in the file: ${planFilePath}`,
+        `Read it now with your Read tool, then decompose it into subtasks.`,
+        '',
+        '## Rules',
+        '- Split into 3-6 subtasks that can run IN PARALLEL (no file overlap)',
+        '- Each subtask must list EXACT file paths it will create/modify',
+        '- NO two subtasks can touch the same file',
+        '- Wave 1 subtasks have no dependencies (foundation: models, database, config)',
+        '- Wave 2 subtasks depend on wave 1 (services, UI, features)',
+        '- Be specific in instructions — each agent only sees its subtask + the full plan',
+        '',
+        '## Output Format',
+        'Return ONLY valid JSON inside <COMPLETED> tags:',
+        '<COMPLETED>',
+        '{"subtasks": [',
+        '  {"label": "short-name", "files": ["lib/path/file.dart"], "instructions": "detailed instructions", "dependsOn": []}',
+        ']}',
+        '</COMPLETED>',
+      ].join('\n');
+
+      const decomposeResult = await runAgent({
+        cli: 'claude',
+        prompt: decomposePrompt,
+        cwd: worktreePath,
+        timeout: TIMEOUTS.implement || 600_000,
+        label: `implement-decompose-${ticketKey}`,
+        metadata: { stage: STAGE_NAME, step: 'decompose', ticketKey, runId: context.state.runId },
+        extractRegex: COMPLETED_REGEX,
+        signal: context.signal
+      });
+
+      // Clean up the temp plan file
+      try { await fsp.unlink(planFilePath); } catch { /* ignore */ }
+
+      if (context.costTracker) {
+        context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(decomposeResult));
+      }
+
+      if (decomposeResult.content) {
+        try {
+          const parsed = JSON.parse(decomposeResult.content.trim());
+          decomposition = validateSubtasks(parsed.subtasks || parsed);
+          context.logger?.log({
+            type: 'GATE_CHECK',
+            stage: STAGE_NAME,
+            gate: 'auto_decompose_done',
+            subtaskCount: decomposition?.subtasks?.length || 0,
+            labels: decomposition?.subtasks?.map(s => s.label) || []
+          });
+        } catch (e) {
+          context.logger?.log({
+            type: 'STAGE_WARNING',
+            stage: STAGE_NAME,
+            message: `Auto-decompose JSON parse failed: ${e.message}. Falling back to single agent.`
+          });
+        }
+      }
+    }
+
     const useParallel = decomposition?.strategy === 'parallel' && decomposition.subtasks.length > 1;
 
     context.logger?.log({
@@ -244,7 +320,7 @@ export async function run(context) {
             cwd: worktreePath,
             timeout: TIMEOUTS.implement,
             label: `implement-${subtask.label}-${ticketKey}`,
-            extraArgs: ['--full-auto'],
+            extraArgs: ['--dangerously-bypass-approvals-and-sandbox'],
             metadata: {
               stage: STAGE_NAME,
               cli: 'codex',

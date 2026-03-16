@@ -546,11 +546,20 @@ function createSession(cli, args, cwd, metadata = {}, opts = {}) {
 
     console.log(`[${new Date().toISOString()}] Spawn: ${resolvedCli} [${resolvedArgs.length} args]${stdinFd !== null ? ' (stdin from file)' : ''}`);
 
+    // Build PATH with common SDK locations so child agents find them
+    const extraPaths = [
+        'C:\\flutter\\flutter\\bin',
+        'C:\\flutter\\flutter\\bin\\cache\\dart-sdk\\bin'
+    ].filter(p => fsSync.existsSync(p));
+    const childPath = extraPaths.length > 0
+        ? [...extraPaths, process.env.PATH].join(path.delimiter)
+        : process.env.PATH;
+
     const proc = spawn(resolvedCli, resolvedArgs, {
         cwd: cwd || BASE_DIR,
         stdio: [stdinFd !== null ? stdinFd : 'pipe', 'pipe', 'pipe'],
         shell: false,
-        env: { ...process.env, CLAUDECODE: undefined, PATH: process.env.PATH }
+        env: { ...process.env, CLAUDECODE: undefined, PATH: childPath }
     });
 
     // Close the file descriptor after spawn (child process inherited it)
@@ -764,13 +773,13 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:#0a0c1
 
 /* Expand/Collapse */
 .session-body{max-height:0;overflow:hidden;transition:max-height .3s ease-out,padding .3s;padding:0 16px;border-top:0 solid transparent}
-.session-body.expanded{max-height:3000px;padding:16px;border-top:1px solid #21262d;transition:max-height .5s ease-in,padding .3s}
+.session-body.expanded{max-height:5000px;padding:16px;border-top:1px solid #21262d;transition:max-height .5s ease-in,padding .3s;overflow-y:auto}
 
 .info-row{font-size:12px;color:#6e7681;margin-bottom:12px;display:flex;gap:16px;flex-wrap:wrap}
 .info-row span{display:inline-flex;align-items:center;gap:4px}
 
 /* Conversation */
-.conversation{margin-top:8px;display:flex;flex-direction:column;gap:8px}
+.conversation{margin-top:8px;display:flex;flex-direction:column;gap:8px;max-height:500px;overflow-y:auto;padding-right:4px}
 .msg-pair{display:flex;flex-direction:column;gap:4px}
 .msg{padding:10px 14px;border-radius:8px;font-size:13px;white-space:pre-wrap;max-height:300px;overflow-y:auto;word-break:break-word;line-height:1.5}
 .msg.user{background:#161b22;border-left:3px solid #58a6ff}
@@ -844,6 +853,7 @@ async function apiGet(ep){
     return r.json();
 }
 
+let prevFilteredIds=null;
 async function refreshData(){
     try{
         const d=await apiGet('/api/cli/list');
@@ -852,9 +862,37 @@ async function refreshData(){
         document.getElementById('stat-running').textContent=d.running;
         document.getElementById('last-refresh').textContent=new Date().toLocaleTimeString();
         updateAgentFilter();
-        renderSessions();
+        const f=getFiltered();
+        f.sort((a,b)=>{if(a.running!==b.running)return a.running?-1:1;return new Date(b.startedAt)-new Date(a.startedAt)});
+        const currentIds=f.map(s=>s.id).join(',');
+        if(currentIds!==prevFilteredIds){
+            prevFilteredIds=currentIds;
+            renderSessions();
+        }else{
+            updateCardsInPlace(f);
+        }
         expandedSessions.forEach(id=>{loadRaw(id);loadHistory(id)});
     }catch(e){console.error('Refresh failed:',e)}
+}
+function updateCardsInPlace(sessions){
+    let needsFullRender=false;
+    sessions.forEach(s=>{
+        const card=document.querySelector('[data-sid="'+s.id+'"]');
+        if(!card)return;
+        const wasRunning=card.classList.contains('is-running');
+        if(wasRunning!==s.running){needsFullRender=true;return}
+        const dur=card.querySelector('.meta-dur');
+        if(dur)dur.innerHTML=fmtDuration(s.runtimeSeconds);
+        const kb=card.querySelector('.meta-kb');
+        if(kb)kb.innerHTML=((s.stdoutLength/1024).toFixed(1))+'<span class="dim">KB</span>';
+        const exit=card.querySelector('.meta-exit');
+        if(exit){
+            const exitClass=s.running?'exit-run':(s.exitCode===0?'exit-ok':'exit-err');
+            exit.className='meta-item meta-exit '+exitClass;
+            exit.textContent=s.running?'running':String(s.exitCode);
+        }
+    });
+    if(needsFullRender)renderSessions();
 }
 
 function updateAgentFilter(){
@@ -882,8 +920,9 @@ function getFiltered(){
 function renderSessions(){
     const c=document.getElementById('sessions-container');
     const f=getFiltered();
-    if(!f.length){c.innerHTML='<div class="empty-state"><div class="empty-icon">&#128269;</div><p>No sessions match filters.</p></div>';return}
+    if(!f.length){c.innerHTML='<div class="empty-state"><div class="empty-icon">&#128269;</div><p>No sessions match filters.</p></div>';prevFilteredIds='';return}
     f.sort((a,b)=>{if(a.running!==b.running)return a.running?-1:1;return new Date(b.startedAt)-new Date(a.startedAt)});
+    prevFilteredIds=f.map(s=>s.id).join(',');
     c.innerHTML=f.map(s=>renderCard(s)).join('');
 }
 
@@ -905,7 +944,7 @@ function renderCard(s){
     const cliBadge='cli-'+(cli==='claude'||cli==='codex'?cli:'unknown');
     const exitClass=s.running?'exit-run':(s.exitCode===0?'exit-ok':'exit-err');
     const exitText=s.running?'running':String(s.exitCode);
-    return '<div class="session-card'+(s.running?' is-running':'')+'">'
+    return '<div class="session-card'+(s.running?' is-running':'')+'" data-sid="'+s.id+'">'
         +'<div class="session-header" onclick="toggle(\\''+s.id+'\\')">'
         +'<div class="session-left">'
         +'<span class="session-status '+sc+'"></span>'
@@ -914,9 +953,9 @@ function renderCard(s){
         +'</div>'
         +'<div class="session-right">'
         +'<span class="meta-item">PID '+s.pid+'</span>'
-        +'<span class="meta-item">'+fmtDuration(s.runtimeSeconds)+'</span>'
-        +'<span class="meta-item">'+((s.stdoutLength/1024).toFixed(1))+'<span class="dim">KB</span></span>'
-        +'<span class="meta-item '+exitClass+'">'+exitText+'</span>'
+        +'<span class="meta-item meta-dur">'+fmtDuration(s.runtimeSeconds)+'</span>'
+        +'<span class="meta-item meta-kb">'+((s.stdoutLength/1024).toFixed(1))+'<span class="dim">KB</span></span>'
+        +'<span class="meta-item meta-exit '+exitClass+'">'+exitText+'</span>'
         +(s.running?'<button class="kill-btn" onclick="event.stopPropagation();killSession(\\''+s.id+'\\')">Kill</button>':'')
         +'</div></div>'
         +'<div class="session-body '+(ex?'expanded':'')+'" id="body-'+s.id+'">'
@@ -957,7 +996,9 @@ async function loadRaw(id){
         if(el){
             const text=d.stdout||'(no output)';
             el.dataset.raw=text;
+            const wasAtBottom=el.scrollTop+el.clientHeight>=el.scrollHeight-20;
             el.innerHTML=highlightJson(text);
+            if(wasAtBottom)el.scrollTop=el.scrollHeight;
         }
     }catch(e){const el=document.getElementById('raw-'+id);if(el){el.textContent='Error: '+e.message}}
 }
@@ -976,6 +1017,11 @@ function copyRaw(id,btn){
 async function loadHistory(id){
     const el=document.getElementById('hist-'+id);
     if(!el)return;
+    const sess=allSessions.find(s=>s.id===id);
+    if(sess&&sess.running){
+        el.innerHTML='<span style="font-size:12px;color:#6e7681">Structured history loads when session finishes. See raw output below.</span>';
+        return;
+    }
     el.innerHTML='<span style="font-size:12px;color:#6e7681">Loading history...</span>';
     try{
         const d=await apiFetch('/api/cli/history',{sessionId:id});
@@ -1091,7 +1137,7 @@ const server = http.createServer(async (req, res) => {
 
             console.log(`[${new Date().toISOString()}] Processing: ${url}`, data);
 
-            let result = {};
+            let result = null;
 
             if (url === '/api/file/list') {
                 const targetPath = path.resolve(BASE_DIR, data.path || '.');
