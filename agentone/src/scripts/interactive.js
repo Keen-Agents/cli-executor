@@ -1229,10 +1229,11 @@ class KeenCLI {
     // ── Two-tier prompt: escalate to full orchestrator for pipeline-worthy tasks ──
     const lowerText = text.toLowerCase();
     const pipelineSignals = [
-      'build', 'implement', 'create an app', 'create a feature', 'run the pipeline',
-      'pipeline', 'dual plan', 'use codex', 'use claude and codex', 'spawn',
-      'research', 'multi-agent', 'full pipeline', 'complex profile',
-      'standard profile', 'simple profile'
+      'run the pipeline', 'launch the pipeline', 'full pipeline', 'start pipeline',
+      'pipeline', 'dual plan', 'use claude and codex', 'multi-agent',
+      'complex profile', 'standard profile', 'simple profile',
+      'build an app', 'build a feature', 'build a module', 'build a website',
+      'implement this', 'implement the'
     ];
     const needsFullPrompt = pipelineSignals.some(s => lowerText.includes(s));
 
