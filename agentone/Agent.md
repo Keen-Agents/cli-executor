@@ -4,6 +4,40 @@
 
 **NEVER read `.flow.json` files directly.** These are monolithic files that can be 12,000+ characters on a single line. Instead, always use the **split flow format** which breaks down the same information into small, focused files.
 
+## Before You Start Building
+
+Before writing any code for a new agent, walk through these questions with the user to identify what's needed:
+
+### 1. What does the agent need to do?
+- What is the core task? (e.g., monitor content, process data, answer questions)
+- What inputs does it receive? (user messages, scheduled triggers, webhooks)
+- What outputs should it produce? (summaries, notifications, data transformations)
+
+### 2. What external services or APIs are involved?
+- Which APIs will the agent call? (e.g., YouTube Data API, weather APIs, CRMs)
+- What API keys or credentials are needed?
+- Are there rate limits or quotas to be aware of?
+- Are there free tiers available, or does the user need paid access?
+
+### 3. What data does the user need to provide?
+- Configuration values (e.g., list of channels to monitor, email addresses)
+- Personal criteria or preferences (e.g., "I care about AI news")
+- Authentication tokens for third-party services
+
+### 4. What's the flow architecture?
+- How many nodes and what types? (script nodes for data fetching, agent nodes for LLM processing, condition nodes for branching)
+- Is parallel execution needed?
+- Does it need tools (agent-invoked scripts) or just canvas scripts?
+
+### 5. How will it be triggered?
+- On-demand via chat UI?
+- Scheduled (external cron job hitting the agent endpoint)?
+- Webhook from another service?
+
+**Gather all prerequisites before building.** Missing an API key or access credential mid-build wastes time and creates half-finished flows.
+
+---
+
 ## Project Structure
 
 A Keen flow project has this structure:
@@ -18,10 +52,10 @@ project-name/
 │   │   │   └── node-settings.json   # Settings for non-agent nodes
 │   │   └── {FlowName}.flow.json     # Monolithic file (DO NOT READ)
 │   │
-│   ├── scripts/                     # Scripts folder
-│   │   ├── {flow-script}.js         # Flow scripts (called from flow nodes)
-│   │   └── tools/                   # Tools subfolder
-│   │       └── {tool-name}.js       # Tools (called by agents via SYSTEM CALL)
+│   ├── scripts/                     # Canvas scripts (run by scriptNode_ nodes)
+│   │   ├── {script-name}.js
+│   │   └── tools/                   # Agent-invoked tool scripts (called via SYSTEM CALL)
+│   │       └── {tool-name}.js
 │   │
 │   └── agents/
 │       └── {AgentName}/
@@ -31,7 +65,7 @@ project-name/
 │           └── 02-assistant.md      # Assistant response (optional)
 ├── Agent.md                         # This file
 ├── keen.json                        # Project configuration
-├── keen-tools.json                  # Tool definitions (only for tools/, not flow scripts)
+├── keen-tools.json                  # Tool definitions
 └── package.json
 ```
 
@@ -54,17 +88,17 @@ This is the simplest file. Use it when you need to:
     "zoom": 0.51
   },
   "nodes": {
-    "startNode_default_start": {
-      "x": 600,
-      "y": 2.49
+    "startNode_{id}": {
+      "x": 450,
+      "y": 50
     },
-    "agentNode_default_agent": {
-      "x": 460.53,
-      "y": 209.05
+    "agentNode_broadcaster__receiver_{id}": {
+      "x": 416,
+      "y": 312
     },
-    "endNode_default_end": {
-      "x": 300,
-      "y": 550
+    "endNode_{id}": {
+      "x": 500,
+      "y": 623
     }
   }
 }
@@ -80,35 +114,34 @@ Contains the flow's logical structure: what nodes exist and how they connect.
 ```json
 {
   "$schema": "keen-flow-instructions-v1",
-  "flowId": "Project",
-  "flowLabel": "Start",
+  "flowId": "{FlowName}",
+  "flowLabel": "{FlowName}",
   "nodes": [
     {
-      "id": "startNode_default_start",
+      "id": "startNode_{id}",
       "type": "startNode_",
       "label": "Start"
     },
     {
-      "id": "agentNode_default_agent",
+      "id": "agentNode_broadcaster__receiver_{id}",
       "type": "agentNode_broadcaster__receiver_",
-      "agentRef": "Agent-jokester",
-      "label": "Jokester Agent"
+      "agentRef": "{AgentName}"
     },
     {
-      "id": "endNode_default_end",
+      "id": "endNode_{id}",
       "type": "endNode_"
     }
   ],
   "edges": [
     {
-      "source": "startNode_default_start",
-      "target": "agentNode_default_agent",
+      "source": "startNode_{id}",
+      "target": "agentNode_broadcaster__receiver_{id}",
       "sourceHandle": "NEXT_1",
       "targetHandle": "IN"
     },
     {
-      "source": "agentNode_default_agent",
-      "target": "endNode_default_end",
+      "source": "agentNode_broadcaster__receiver_{id}",
+      "target": "endNode_{id}",
       "sourceHandle": "NEXT_1",
       "targetHandle": "IN"
     }
@@ -116,18 +149,32 @@ Contains the flow's logical structure: what nodes exist and how they connect.
 }
 ```
 
-**Node Types:**
-- `startNode_` - Flow entry point
-- `endNode_` - Flow exit point
-- `agentNode_` - LLM agent (has `agentRef` pointing to agent folder)
-- `agentNode_broadcaster_` - Agent that broadcasts messages
-- `agentNode_receiver_` - Agent that receives messages
-- `agentNode_broadcaster__receiver_` - Agent that does both
-- `scriptNode_` - JavaScript execution (has `settingsRef`)
-- `conditionNode_` - Conditional branching (has `settingsRef`)
-- `runFlowNode_` - Runs another flow (has `settingsRef`)
-- `displayNode_` - Display output (has `settingsRef`)
-- `setDictionaryNode_` - Set dictionary values (has `settingsRef`)
+**Node ID Format:** Each node needs a unique ID. The UI generates opaque IDs like `startNode_T8AMwU...` (containing alphanumeric characters, hyphens, and underscores). Human-readable IDs (e.g., `startNode_my_start`) also work.
+
+**Node Types (13 total, verified on platform):**
+
+| # | Type | Category | Extra Fields | Description |
+|---|------|----------|-------------|-------------|
+| 1 | `startNode_` | Flow control | `label` (required) | Flow entry point. **Must have a `label` field** matching the Admin Panel's "Start Node" value (e.g., `"label": "Start"`). Without this, the engine cannot find the entry point and the flow will fail. |
+| 2 | `endNode_` | Flow control | — | Flow exit point |
+| 3 | `agentNode_broadcaster__receiver_` | Agent | `agentRef` | LLM agent node. **This is the only agent node type that works.** |
+| 4 | `scriptNode_` | Logic | `settingsRef` | JavaScript execution |
+| 5 | `conditionNode_` | Logic | `settingsRef` | Conditional branching (TRUE/FALSE handles) |
+| 6 | `assignmentNode_` | Logic | `settingsRef` | Set dictionary values |
+| 7 | `loopNode_` | Logic | `settingsRef` | Loop/iteration |
+| 8 | `runFlowNode_` | Flow control | `settingsRef` | Runs another flow and returns |
+| 9 | `jumpFlowNode_` | Flow control | `settingsRef` | Jumps to another flow |
+| 10 | `groupNode_` | Visual | — | Visual grouping container for organizing nodes |
+| 11 | `parallelInNode_` | Parallel | `settingsRef` | Parallel execution entry point |
+| 12 | `parallelFlowNode_` | Parallel | `settingsRef` | Parallel flow execution |
+| 13 | `joinNode_` | Parallel | — | Joins parallel execution branches back together |
+
+**Deprecated/removed node types (do NOT use):**
+- `agentNode_` — broken, does not render
+- `agentNode_broadcaster_` — broken, does not render
+- `agentNode_receiver_` — broken, does not render
+- `displayNode_` — removed from platform
+- `setDictionaryNode_` — replaced by `assignmentNode_`
 
 **Edge Handles:**
 - `NEXT_1`, `NEXT_2`, etc. - Output handles
@@ -136,19 +183,21 @@ Contains the flow's logical structure: what nodes exist and how they connect.
 
 ### 3. node-settings.json (For Non-Agent Node Settings)
 
-Contains settings for script nodes, condition nodes, etc.
+Contains settings for nodes that have a `settingsRef` (script, condition, assignment, loop, runFlow, jumpFlow, parallelIn, parallelFlow nodes).
+
+**Note (observed behavior):** When nodes are first dropped from the UI, their entries in node-settings.json may be empty. Settings appear to be populated when the user edits them in the canvas. When creating nodes programmatically, you should add the settings entries yourself.
 
 **Structure:**
 ```json
 {
   "$schema": "keen-node-settings-v1",
   "nodes": {
-    "scriptNode_abc123": {
-      "value": "return context.input.toUpperCase();",
+    "scriptNode_{id}": {
+      "value": "dictionary.result = dictionary.input.toUpperCase();",
       "description": "Converts input to uppercase"
     },
-    "conditionNode_def456": {
-      "value": "context.count > 5",
+    "conditionNode_{id}": {
+      "value": "dictionary.count > 5",
       "description": "Check if count exceeds threshold"
     }
   }
@@ -162,7 +211,7 @@ Located in `src/agents/{AgentName}/`
 **settings.json:**
 ```json
 {
-  "agentName": "Agent-jokester",
+  "agentName": "{AgentName}",
   "llm": {
     "company": "google",
     "model": "gemini-2.5-flash",
@@ -193,7 +242,7 @@ Located in `src/agents/{AgentName}/`
 
 **Example: Move agent node to center**
 ```json
-"agentNode_default_agent": {
+"agentNode_broadcaster__receiver_{id}": {
   "x": 500,
   "y": 300
 }
@@ -235,11 +284,13 @@ Located in `src/agents/{AgentName}/`
 ### Add a New Node
 
 1. Read `src/flows/{FlowName}/instructions.json`
-2. Add node to `nodes` array with unique ID
+2. Add node to `nodes` array with a unique ID (e.g., `{nodeType}_{uniqueSuffix}`)
 3. Add position to `positions.json`
-4. If agent node: create agent folder in `src/agents/`
-5. If settings node: add entry to `node-settings.json`
+4. If agent node (`agentNode_broadcaster__receiver_`): create agent folder in `src/agents/` with `settings.json` and `00-system.md`
+5. If node has `settingsRef`: add entry to `node-settings.json`
 6. Connect with edges
+
+**Note on agent nodes from the UI (observed behavior):** When you drop an agent node from the canvas UI, the platform has been observed to auto-create a generic agent folder (e.g., `src/agents/Agent_agentNod/`) with a default `settings.json` and no prompt files. You should update the `agentRef` and create a proper agent folder with prompts.
 
 ## Why Split Format?
 
@@ -256,8 +307,8 @@ Compare these two approaches for the same flow:
   "$schema": "keen-flow-positions-v1",
   "viewport": { "x": 71.25, "y": 59.38, "zoom": 0.51 },
   "nodes": {
-    "startNode_default_start": { "x": 600, "y": 2.49 },
-    "agentNode_default_agent": { "x": 460.53, "y": 209.05 }
+    "startNode_{id}": { "x": 450, "y": 50 },
+    "agentNode_broadcaster__receiver_{id}": { "x": 416, "y": 312 }
   }
 }
 ```
@@ -267,6 +318,15 @@ Split format is:
 - **Focused** - Each file has one purpose
 - **Readable** - Properly formatted JSON with line breaks
 - **Efficient** - Only read what you need
+
+**Important:** `src/flows/` is the source of truth. The `dist/` directory contains built output (`dist/flows/*.flow.js`) which is generated by the builder. Always edit in `src/flows/`, never in `dist/`.
+
+**You must build and deploy for changes to take effect.** Editing `src/` files alone does not update the running server. Each project has a deploy script in `package.json` that invokes `keen-builder` with a token and space ID. The space and its deploy credentials are configured through the Admin Panel. Running the deploy script will:
+1. Compile split format files into `dist/flows/{FlowName}.flow.js`
+2. Copy scripts to `dist/scripts/`
+3. Upload the project to the configured Keen server space
+
+If a flow file is missing from `dist/flows/` after building, the flow likely has a compilation error (e.g., missing `label` on startNode, invalid node references). Check the builder output for `[ERROR]` messages.
 
 ## Quick Reference
 
@@ -278,118 +338,11 @@ Split format is:
 | Connect nodes | `instructions.json` |
 | Edit agent prompt | `agents/{Name}/*.md` |
 | Change LLM settings | `agents/{Name}/settings.json` |
-| Edit script/condition | `node-settings.json` |
-| Add/edit tool | `keen-tools.json` + `src/scripts/tools/*.js` |
-| Add/edit flow script | `src/scripts/*.js` (NOT in tools folder) |
-
----
-
-## Scripts vs Tools: Critical Distinction
-
-### The Core Principle: Cognitive vs Deterministic Work
-
-**Cognitive Work** = Tasks that require AI reasoning, judgment, or analysis
-→ Use **Agents with Tools**
-
-**Deterministic Work** = Tasks that execute the same way every time, 100% predictable
-→ Use **Flow Scripts**
-
-### Folder Structure
-
-```
-src/scripts/
-├── check-drive-download-files-for-processing.js   ← FLOW SCRIPT
-├── attach-file-id-and-call-agent.js               ← FLOW SCRIPT
-├── unzip-extracted-files.js                       ← FLOW SCRIPT
-│
-└── tools/                                         ← TOOLS FOLDER
-    ├── pdf-extract-multiple.js                    ← TOOL (agent-callable)
-    ├── gdrive-upload-file.js                      ← TOOL (agent-callable)
-    └── ... (all tools here)
-```
-
-### Flow Scripts (`src/scripts/*.js`)
-
-- **Location:** Directly in `src/scripts/` (NOT in tools subfolder)
-- **Called by:** Flow nodes (scriptNode_ type)
-- **NOT registered** in `keen-tools.json`
-- **Purpose:** Orchestration, data transformation, deterministic operations
-
-**Examples:**
-- Download file from GDrive
-- Unzip a file
-- Call another flow
-- Transform data between nodes
-
-**When to use:**
-- The operation is always the same (no AI decision needed)
-- It's a step in a pipeline that always executes
-- It's orchestration logic
-
-### Tools (`src/scripts/tools/*.js`)
-
-- **Location:** In `src/scripts/tools/` subfolder
-- **Called by:** Agents via `<SYSTEM CALL>` blocks
-- **MUST be registered** in `keen-tools.json`
-- **Purpose:** Operations that agents choose to invoke
-
-**Examples:**
-- PDF Extract Multiple Ranges (agent decides page ranges)
-- GDrive Upload File (agent decides what to upload)
-- Read File (agent decides which file to read)
-
-**When to use:**
-- The agent needs to decide IF and HOW to use it
-- Parameters are determined by AI reasoning
-- It's a capability the agent can choose to invoke
-
-### Decision Flowchart
-
-```
-Does this operation require AI judgment?
-    │
-    ├─ YES → Make it a TOOL in src/scripts/tools/
-    │        Register in keen-tools.json
-    │        Agent calls via <SYSTEM CALL>
-    │
-    └─ NO → Make it a FLOW SCRIPT in src/scripts/
-            Called from flow node
-            No registration needed
-```
-
-### Real Example: PDF Processing Workflow
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ FLOW SCRIPTS (Deterministic)              TOOLS (Cognitive)         │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│ 1. check-drive-download-files-for-processing.js                     │
-│    → Always: List folder, download first PDF                        │
-│                                                                      │
-│ 2. attach-file-id-and-call-agent.js                                 │
-│    → Always: Attach file, call PDFExtractor agent                   │
-│                                                                      │
-│         ┌──────────────────────────────────────┐                    │
-│         │ PDFExtractor Agent (Cognitive)        │                    │
-│         │ - Analyzes document structure         │                    │
-│         │ - Decides how to split               │ ←─── Uses TOOL:    │
-│         │ - Determines page ranges              │      "PDF Extract  │
-│         │ - Classifies document types           │       Multiple     │
-│         └──────────────────────────────────────┘       Ranges"      │
-│                                                                      │
-│ 3. unzip-extracted-files.js                                         │
-│    → Always: Unzip the output ZIP file                              │
-│                                                                      │
-│ 4. upload-to-gdrive.js                                              │
-│    → Always: Upload extracted files to GDrive                       │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Key Insight
-
-The **agent does cognitive work** - analyzing the PDF, understanding document boundaries, deciding page ranges. But everything before and after the agent is **deterministic** - downloading, unzipping, uploading. These deterministic steps should be flow scripts, not tools.
+| Edit script/condition/assignment/loop | `node-settings.json` |
+| Edit runFlow/jumpFlow/parallel settings | `node-settings.json` |
+| Add/edit agent tool | `keen-tools.json` + `src/scripts/tools/*.js` |
+| Add/edit canvas script | `node-settings.json` + `src/scripts/*.js` |
+| Register agent for execution | Admin Panel (not keen.json) |
 
 ## File Reading Priority
 
@@ -399,8 +352,9 @@ When investigating a flow:
 2. **If needed**: Read `positions.json` for layout information
 3. **For agent details**: Read `agents/{AgentName}/settings.json` and prompts
 4. **For scripts/conditions**: Read `node-settings.json`
-5. **For tools**: Read `keen-tools.json` and `src/scripts/*.js`
-6. **NEVER**: Read the `.flow.json` file
+5. **For agent tools**: Read `keen-tools.json` and `src/scripts/tools/*.js`
+6. **For canvas scripts**: Read `src/scripts/*.js` (root level)
+7. **NEVER**: Read the `.flow.json` file
 
 ---
 
@@ -427,22 +381,48 @@ const cargo = dictionary.cargo;
 
 | Key | Purpose |
 |-----|---------|
-| `promptMessage.content` | Input payload (JSON-stringified) |
+| `promptMessage` | Engine-managed object containing session credentials, user input, and other context. **See warning below.** |
+| `promptMessage.content` | Input payload (JSON-stringified). This is the field you should read/write for passing data to agent nodes. |
 | `isEmailValid` | Boolean validation flag for condition nodes |
 | `labelName` | Status label (e.g., 'ai_success', 'ai_skip') |
 | `emailContent` | Extracted/processed content |
 | `threadId` | External reference IDs |
 | `response` | Tool script output (returned to agent) |
 
+### CRITICAL: Never overwrite `dictionary.promptMessage`
+
+The `dictionary.promptMessage` object contains engine-managed data including `userSessionCredentials` and other context required for flow execution. **If you replace the entire object, the flow will crash** with an error like:
+
+```
+Cannot destructure property 'userID' of 'userSessionCredentials' as it is undefined.
+```
+
+**WRONG — destroys session context:**
+```javascript
+dictionary.promptMessage = { content: 'my data' };
+```
+
+**CORRECT — only update the content field:**
+```javascript
+if (!dictionary.promptMessage) {
+    dictionary.promptMessage = {};
+}
+dictionary.promptMessage.content = JSON.stringify(myData);
+```
+
+This applies to any engine-managed dictionary key. As a general rule: **update individual properties on existing dictionary objects rather than replacing the entire object.**
+
 ### Script in node-settings.json
+
+The `value` field for a `scriptNode_` is a **filename reference** (relative to `src/scripts/`), not inline code. The engine resolves it to `{SCRIPT_ABS_PATH}/{value}` and executes the file.
 
 ```json
 {
   "$schema": "keen-node-settings-v1",
   "nodes": {
-    "scriptNode_abc123": {
-      "value": "dictionary.result = dictionary.input.toUpperCase(); return dictionary.result;",
-      "description": "Uppercase converter"
+    "scriptNode_{id}": {
+      "value": "fetch-youtube-videos.js",
+      "description": "Fetch latest videos from YouTube channels"
     }
   }
 }
@@ -530,11 +510,31 @@ dictionary.toolResult = data;
 
 ---
 
+# Scripts vs Tools
+
+There are two distinct types of JavaScript files in a Keen project. They live in different locations and serve different purposes:
+
+| | Canvas Scripts | Agent Tools |
+|---|---|---|
+| **Purpose** | Run by `scriptNode_` nodes on the flow canvas | Invoked by agents via `<SYSTEM CALL>` during conversation |
+| **Location** | `src/scripts/` (root level) | `src/scripts/tools/` (subfolder) |
+| **Configured in** | `node-settings.json` (via `settingsRef`) | `keen-tools.json` |
+| **Triggered by** | Flow execution reaching a `scriptNode_` | Agent outputting a `<SYSTEM CALL>` block |
+| **Read params from** | `dictionary.{key}` directly | `dictionary.TOOL_CONTEXT.{key}` |
+| **Write response to** | `dictionary.{key}` directly | `dictionary.response` |
+| **Example** | `src/scripts/debux.js` | `src/scripts/tools/weather-tool.js` |
+
+**Do not mix these up.** Canvas scripts go in `src/scripts/`, tool scripts go in `src/scripts/tools/`.
+
+---
+
 # Tools System (Agent-Invoked Tools)
 
 ## Overview
 
 Tools allow agents to execute JavaScript code during a conversation. The agent outputs a special `<SYSTEM CALL>` block, the engine intercepts it, runs the corresponding script, and returns the result to the agent.
+
+**Tool scripts must be placed in `src/scripts/tools/`**, not in `src/scripts/` directly.
 
 ## Tool Configuration: keen-tools.json
 
@@ -544,14 +544,9 @@ Tools are defined in `keen-tools.json` at the project root.
 ```json
 [
     {
-        "name": "Test Tool",
+        "name": "Weather Tool",
         "type": "script",
-        "entry": "test.js"
-    },
-    {
-        "name": "Calculate",
-        "type": "script",
-        "entry": "calculate.js"
+        "entry": "tools/weather-tool.js"
     }
 ]
 ```
@@ -560,65 +555,76 @@ Tools are defined in `keen-tools.json` at the project root.
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `name` | Tool name (used in SYSTEM CALL) | `"Test Tool"` |
+| `name` | Tool name (used in SYSTEM CALL) | `"Weather Tool"` |
 | `type` | Must be `"script"` for JS tools | `"script"` |
-| `entry` | Script filename in `src/scripts/` | `"test.js"` |
+| `entry` | Path relative to `src/scripts/` | `"tools/weather-tool.js"` |
 
-**IMPORTANT:** Do NOT use `"script"` as the key - use `"entry"` for the filename.
+**IMPORTANT:**
+- Do NOT use `"script"` as the key — use `"entry"` for the filename.
+- The `entry` path is relative to `src/scripts/`, so tools use the `tools/` prefix.
 
 ## Tool Script Files: src/scripts/tools/*.js
 
-Tool scripts must export an async `exec()` function. They are located in the `tools/` subfolder.
+Tool scripts must export an async `exec()` function.
+
+**CRITICAL: In tool scripts, parameters from the agent's `<SYSTEM CALL>` are available at `dictionary.TOOL_CONTEXT`, NOT directly on `dictionary`.** The engine places all parsed SYSTEM CALL parameters into `dictionary.TOOL_CONTEXT` before executing the script.
+
+| What you want | Correct | WRONG |
+|---|---|---|
+| Read a parameter from agent | `dictionary.TOOL_CONTEXT.city` | ~~`dictionary.city`~~ |
+| Write the response back | `dictionary.response` | — |
+
+Note: Writing the response back is still `dictionary.response` (not `dictionary.TOOL_CONTEXT.response`).
 
 **Basic Structure:**
 ```javascript
 export async function exec() {
-    // Read parameters from dictionary
-    const param = dictionary.paramName;
+    // Read parameters from TOOL_CONTEXT (where the engine puts SYSTEM CALL params)
+    const param = dictionary.TOOL_CONTEXT.paramName;
 
     // Do something
     const result = 'Hello!';
 
-    // Write response back to dictionary
+    // Write response back to dictionary (NOT TOOL_CONTEXT)
     dictionary.response = result;
 }
 ```
 
-**Example - Simple Test Tool (test.js):**
+**Example - Weather Tool (tools/weather-tool.js):**
 ```javascript
 export async function exec() {
-    const message = dictionary.message;
+    const city = dictionary.TOOL_CONTEXT.city;
 
-    // Default message if none provided
-    const inputMessage = message || 'No message provided';
-
-    // Return a response confirming the tool was called
-    dictionary.response = 'Test tool executed successfully! Tool calling is working.';
-}
-```
-
-**Example - API Call Tool (calculate.js):**
-```javascript
-export async function exec() {
-    const expression = dictionary.expression;
-
-    if (!expression) {
-        dictionary.response = {
-            error: 'Missing expression parameter'
-        }
+    if (!city) {
+        dictionary.response = 'Error: No city provided.';
         return;
     }
 
-    const response = await fetch('https://api.example.com/calculate', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ expression })
-    });
-    const result = await response.json();
+    const geoRes = await fetch(
+        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en&format=json`
+    );
+    const geoData = await geoRes.json();
 
-    dictionary.response = result;
+    if (!geoData.results || geoData.results.length === 0) {
+        dictionary.response = `Error: Could not find location "${city}".`;
+        return;
+    }
+
+    const { latitude, longitude, name, country } = geoData.results[0];
+
+    const weatherRes = await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&timezone=auto`
+    );
+    const weatherData = await weatherRes.json();
+    const current = weatherData.current;
+
+    dictionary.response = JSON.stringify({
+        location: `${name}, ${country}`,
+        temperature: `${current.temperature_2m}°C`,
+        humidity: `${current.relative_humidity_2m}%`,
+        wind_speed: `${current.wind_speed_10m} km/h`,
+        weather_code: current.weather_code
+    });
 }
 ```
 
@@ -670,21 +676,22 @@ use tool
 1. Agent outputs a `<SYSTEM CALL>` block in its response
 2. Engine parses the block and extracts:
    - `tool` - The tool name (must match `name` in keen-tools.json)
-   - Parameters (e.g., `message`, `expression`)
+   - Parameters (e.g., `city`, `expression`)
 3. Engine looks up the tool in keen-tools.json
-4. Engine loads and executes the script from `src/scripts/{entry}`
-5. Parameters are passed via `dictionary.{paramName}`
-6. Script writes result to `dictionary.response`
-7. Engine returns the response to the agent as a system message
+4. Engine places all parsed parameters into `dictionary.TOOL_CONTEXT`
+5. Engine loads and executes the script from `src/scripts/{entry}`
+6. Script reads parameters from `dictionary.TOOL_CONTEXT.{paramName}`
+7. Script writes result to `dictionary.response`
+8. Engine cleans up `TOOL_CONTEXT` and returns the response to the agent as a system message
 
 ## Adding a New Tool
 
 ### Step 1: Create the Script
 
-Create `src/scripts/my-tool.js`:
+Create `src/scripts/tools/my-tool.js`:
 ```javascript
 export async function exec() {
-    const input = dictionary.input;
+    const input = dictionary.TOOL_CONTEXT.input;
 
     // Your logic here
     const result = `Processed: ${input}`;
@@ -700,7 +707,7 @@ Add to `keen-tools.json`:
 {
     "name": "My Tool",
     "type": "script",
-    "entry": "my-tool.js"
+    "entry": "tools/my-tool.js"
 }
 ```
 
@@ -820,1086 +827,91 @@ All paths should eventually reach `endNode` - no orphaned flows.
 
 ## Flow Architecture Patterns
 
+Note: "agent" below refers to `agentNode_broadcaster__receiver_`, the only working agent node type.
+
 ### Simple Linear Flow
 ```
-startNode → agentNode → endNode
+startNode_ → agentNode_broadcaster__receiver_ → endNode_
 ```
 
 ### Branching Flow
 ```
-startNode → agentNode → conditionNode
-                            ├─ TRUE → processNode → endNode
-                            └─ FALSE → skipNode → endNode
+startNode_ → agentNode_broadcaster__receiver_ → conditionNode_
+                                                    ├─ TRUE → scriptNode_ → endNode_
+                                                    └─ FALSE → endNode_
 ```
 
 ### Orchestrator Pattern
 ```
-startNode → orchestratorScript → endNode
-            (spawns parallel sub-flows)
+startNode_ → scriptNode_ → endNode_
+             (spawns parallel sub-flows)
 ```
 
 ### Multi-Agent Pipeline
 ```
-startNode → Agent1 → script1 → conditionNode
-                                   ├─ TRUE → Agent2 → Agent3 → endNode
-                                   └─ FALSE → endNode
+startNode_ → agent1 → scriptNode_ → conditionNode_
+                                        ├─ TRUE → agent2 → agent3 → endNode_
+                                        └─ FALSE → endNode_
 ```
+*(agent1, agent2, agent3 are all `agentNode_broadcaster__receiver_` nodes with different `agentRef` values)*
 
 ---
 
 ## Additional Resources
 
-- **learning-journal.md** - Detailed exploration notes from complex projects
-- **keen.json** - Project configuration (agents, deployment URL)
+- **keen.json** - Project configuration (server URL, entry/dist paths)
 - **keen-tools.json** - Available tools/KPIs
+- **Admin Panel** - Agent registration and routing (`{keen_server}/org/agent/...`)
 
 ---
 
-## keen.json Configuration (Multi-Agent Format)
+## keen.json Configuration
 
-The `keen.json` file defines project configuration and available agents.
-
-### New Format (Recommended)
+The `keen.json` file defines minimal project configuration. Agent routing is handled via the **Admin Panel**, not in this file.
 
 ```json
 {
-    "project_name": "pdf-agent",
-    "keen_server": "http://localhost:3030",
-    "entry": "src",
-    "dist": "dist",
-    "agents": [
-        {
-            "id": "pdf-attacher",
-            "name": "PDFAttachToSFAgent",
-            "entry_flow": "SFAttacher",
-            "entry_node": "Start"
-        },
-        {
-            "id": "pdf-extractor",
-            "name": "PDFExtractorAgent",
-            "entry_flow": "PDFExtractor",
-            "entry_node": "Start"
-        },
-        {
-            "id": "deal-recognizer",
-            "name": "DealRecognitionAgent",
-            "entry_flow": "DealRecognizer",
-            "entry_node": "Start"
-        }
-    ]
-}
-```
-
-### Agent Configuration Fields
-
-| Field | Description | Example |
-|-------|-------------|---------|
-| `id` | Unique identifier used in Chat UI Controller field | `"pdf-attacher"` |
-| `name` | The actual agent name (matches `agentRef` in flow and folder in `src/agents/`) | `"PDFAttachToSFAgent"` |
-| `entry_flow` | Flow file name (without `.flow.js`) | `"SFAttacher"` |
-| `entry_node` | Start node label within the flow | `"Start"` |
-
-### How It Works
-
-1. **Chat UI** sends the `id` (e.g., `"pdf-attacher"`) as the Controller
-2. **Engine** looks up the agent config by `id`
-3. **Engine** loads `{entry_flow}.flow.js` and starts at the node labeled `{entry_node}`
-4. **Engine** returns the output from agent named `{name}`
-
----
-
-## Chat UI Configuration
-
-When setting up an agent in the Chat UI:
-
-| Field | Value | Description |
-|-------|-------|-------------|
-| **Agent Name** | `PDFAttachToSFAgent` | Display name (can be anything) |
-| **Project** | `pdf-agent` | Must match `project_name` in keen.json |
-| **Controller** | `pdf-attacher` | Must match an `id` from the `agents` array |
-
-### Example Setup
-
-For the PDF Attacher agent:
-- **Project**: `pdf-agent`
-- **Controller**: `pdf-attacher`
-
-For the PDF Extractor agent:
-- **Project**: `pdf-agent`
-- **Controller**: `pdf-extractor`
-
-For the Deal Recognizer agent:
-- **Project**: `pdf-agent`
-- **Controller**: `deal-recognizer`
-
----
-
-## Legacy Format (Deprecated)
-
-The old format is still supported for backwards compatibility but not recommended for new projects:
-
-```json
-{
-    "project_name": "my-project",
-    "agent": "AgentName",
-    "start_agent": "FlowName-StartNodeLabel",
-    "keen_server": "http://localhost:3030",
+    "keen_server": "{keen_server_url}",
     "entry": "src",
     "dist": "dist"
 }
 ```
 
-**Problems with legacy format:**
-- `agent` field name is confusing (it's actually the output agent, not the entry)
-- `start_agent` combines flow name and node label with a hyphen (confusing)
-- Only supports a single agent per project
+| Field | Description |
+|-------|-------------|
+| `keen_server` | URL of the Keen server |
+| `entry` | Source directory (contains agents, flows, scripts) |
+| `dist` | Build output directory |
 
-**Migration:** Replace `agent` and `start_agent` with the `agents` array.
-
----
-
-# File Handling in Cloud Environment
-
-## Shared Volumes (Docker ↔ Host)
-
-The engine runs in Docker with volume mounts that map host paths to container paths.
-
-### Local Development Configuration
-
-**Compose file:** `sandbox-local-development-with-database.yaml`
-
-```yaml
-volumes:
-    - C:\Users\{username}\Documents\KeenAgentsStorage\projects:/app/projects
-    - C:\Users\{username}\Documents\KeenAgentsStorage\uploads:/app/uploads
-    - C:\Users\{username}\Documents\KeenAgentsStorage\logs:/app/logs
-```
-
-### Cloud/Production Configuration
-
-**Compose file:** `prod-cloud-ready-with-chat-ui.yaml`
-
-```yaml
-volumes:
-    - /opt/keen-storage/projects:/app/projects
-    - /opt/keen-storage/uploads:/app/uploads
-    - /opt/keen-storage/logs:/app/logs
-```
-
-### Path Mapping Reference
-
-| Environment | Host Path | Container Path |
-|-------------|-----------|----------------|
-| Local (Windows) | `C:/Users/.../KeenAgentsStorage/uploads` | `/app/uploads` |
-| Cloud (Linux) | `/opt/keen-storage/uploads` | `/app/uploads` |
+**Note (observed behavior):** The `agents` array, `agent`, and `start_agent` fields that previously existed in keen.json do not appear to be used in the current platform build. Agent registration is currently done through the Admin Panel.
 
 ---
 
-## Attaching Files to Agent Messages
+## Agent Registration (Admin Panel)
 
-When calling an agent flow, you can attach files that will be automatically uploaded to Gemini for the agent to read.
+Agents are registered and configured through the Keen Admin Panel at `{keen_server}/org/agent/...`.
 
-### Using filePaths in promptMessage
+### Admin Panel Fields
 
-```javascript
-const promptMessage = {
-    role: 'user',
-    content: 'Process the attached PDF file...',
+| Field | Description | Example |
+|-------|-------------|---------|
+| **Display Name** | Human-friendly name shown in the UI. Must match the agent folder name in `src/agents/` and the `agentRef` in the flow. | `{AgentName}` |
+| **Enabled** | Toggle to turn the agent on/off | On |
+| **Template Markup** | Custom prompt markup (optional) | *(empty)* |
+| **Start Flow** | The flow file to execute when this agent receives a prompt (matches the flow folder name in `src/flows/`) | `{FlowName}` |
+| **Start Node** | The entry node label within the flow | `Start` |
 
-    // Attach files - Gemini will read them automatically
-    filePaths: [
-        { path: '/app/uploads/session123/document.pdf' }
-    ],
+### How It Works (observed behavior)
 
-    userSessionCredentials: {
-        sessionID: `${parentSessionID}_${Date.now()}`,
-        userID: parentUserID,
-    },
-    agentChat: false
-};
+1. Agent is created in the Admin Panel with a **Display Name**, **Start Flow**, and **Start Node**
+2. When a prompt is sent to this agent, the engine loads `{Start Flow}.flow.json` and begins execution at the node labeled `{Start Node}`
+3. The agent name must be consistent across: Admin Panel Display Name, `src/agents/{AgentName}/` folder, and `agentRef` in instructions.json
 
-await flow.run('PDFExtractor-Start', { promptMessage });
-```
+### Example
 
-### Key Points
-
-- Use container paths (e.g., `/app/uploads/...`) in `filePaths`
-- The engine will upload the file to Gemini's File API
-- The agent sees the file content directly - no need for a "Read File" tool
-- Works with PDFs, images, and other supported file types
-
----
-
-## Calling Flows from Scripts
-
-Scripts can spawn sub-flows using `flow.run()`.
-
-### Basic Usage
-
-```javascript
-import flow from 'system/flow';
-
-export async function exec() {
-    // Call another flow with a prompt message
-    const result = await flow.run('agent-id', {
-        promptMessage: {
-            role: 'user',
-            content: 'Your message here',
-            userSessionCredentials: {
-                sessionID: `${dictionary.promptMessage.userSessionCredentials.sessionID}_${Date.now()}`,
-                userID: dictionary.promptMessage.userSessionCredentials.userID,
-            },
-            agentChat: false
-        }
-    });
-
-    dictionary.flowResult = result;
-}
-```
-
-### IMPORTANT: Use Agent ID, Not Flow Path
-
-**`flow.run()` must use the agent `id` from `keen.json`, NOT the flow path format.**
-
-### IMPORTANT: flow.run() Returns Dictionary Directly
-
-**`flow.run()` returns the dictionary object directly, NOT wrapped in `{dictionary: ...}`.**
-
-```javascript
-const result = await flow.run('single-file-pipeline', { promptMessage });
-
-// CORRECT - access properties directly on result
-const pipelineResult = result?.pipelineResult;  // ✅
-
-// WRONG - there is no .dictionary wrapper
-const pipelineResult = result?.dictionary?.pipelineResult;  // ❌ undefined!
-```
-
-The `result` object IS the dictionary. Any values set via `dictionary.someKey = value` in the sub-flow are available as `result.someKey` in the parent.
-
-### IMPORTANT: Script-Only Flows Must Set Output Key
-
-For flows that have **no agent (LLM) node** - only script nodes - you must manually set the output using the exact `name` from `keen.json`:
-
-```javascript
-// keen.json has: { "id": "batch-orchestrator", "name": "BatchOrchestratorProcessor", ... }
-
-// In your script, set output using the EXACT name:
-dictionary["BatchOrchestratorProcessor"] = yourOutputData;
-```
-
-**Why?** The engine looks for output at `dictionary[name]` where `name` is from keen.json. Agent nodes populate this automatically, but script nodes don't. Without this, you get: `"error": "No output from agent: YourAgentName"`
-
-### IMPORTANT: writeOut() vs writeThinking() for UI Output
-
-Scripts have two functions for outputting text, and they display differently in the Chat UI:
-
-| Function | Where it appears | Use for |
-|----------|------------------|---------|
-| `writeOut(message)` | **Chat area** (main conversation) | Final reports, user-facing messages |
-| `writeThinking(message)` | **Thinking box** (collapsible) | Progress logs, debug info, step details |
-
-```javascript
-// Goes to main chat area - user sees this directly
-writeOut("## Final Report\n\nProcessed 5 files successfully.");
-
-// Goes to collapsible thinking box - user can expand to see details
-writeThinking("Downloading file 1 of 5...");
-writeThinking("File downloaded: 1.2MB");
-```
-
-**Best practice:** Use `writeThinking()` for all progress/debug messages. Only use `writeOut()` for the final result or critical errors the user must see. This keeps the chat area clean.
-
-From `keen.json`:
-```json
-{
-    "id": "pdf-extractor",        // <-- USE THIS in flow.run()
-    "name": "PDFExtractorAgent",
-    "entry_flow": "PDFExtractor",
-    "entry_node": "Start"
-}
-```
-
-```javascript
-// CORRECT - Use the agent ID
-await flow.run('pdf-extractor', { promptMessage });
-
-// WRONG - Do NOT use FlowName-EntryNode format
-await flow.run('PDFExtractor-Start', { promptMessage });  // This will fail silently!
-```
-
-### Parallel Flow Execution
-
-```javascript
-const items = dictionary.itemsToProcess;
-
-const flowPromises = items.map(item =>
-    flow.run('process-item', {  // Use agent ID from keen.json
-        promptMessage: {
-            role: 'user',
-            content: JSON.stringify(item),
-            userSessionCredentials: {
-                sessionID: `${parentSessionID}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                userID: parentUserID,
-            },
-            agentChat: false
-        }
-    })
-);
-
-await Promise.all(flowPromises);
-```
-
----
-
-## Proxy Services for External APIs
-
-### Why Proxies Are Needed
-
-The VM sandbox where tools run has restricted access:
-- ✅ `fetch()` - HTTP requests allowed
-- ✅ `dictionary` - Data passing
-- ❌ `fs` - No filesystem access
-- ❌ `child_process` - No process spawning
-
-When an external API needs actual file bytes (not just a path), a proxy service bridges the gap.
-
-### Proxy Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ Docker Container (VM Sandbox)                                       │
-│                                                                     │
-│ Tool: my-tool.js                                                    │
-│ - Has file path: /app/uploads/file.pdf                              │
-│ - Cannot read file (no fs access)                                   │
-│ - Calls proxy via fetch()                                           │
-└─────────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ Host Machine (Proxy Service)                                        │
-│                                                                     │
-│ - Receives path from tool                                           │
-│ - Translates path: /app/uploads → C:/Users/.../uploads              │
-│ - Reads actual file bytes                                           │
-│ - Forwards to external API as multipart/form-data                   │
-│ - Saves response to output path                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Path Translation in Proxy
-
-When the proxy runs on a different machine than Docker, paths need translation:
-
-```javascript
-const PATH_MAPPINGS = {
-    '/app/uploads': 'C:/Users/username/Documents/KeenAgentsStorage/uploads',
-    '/app/projects': 'C:/Users/username/Documents/KeenAgentsStorage/projects',
-};
-
-function translatePath(containerPath) {
-    for (const [dockerPath, hostPath] of Object.entries(PATH_MAPPINGS)) {
-        if (containerPath.startsWith(dockerPath)) {
-            return containerPath.replace(dockerPath, hostPath);
-        }
-    }
-    return containerPath;
-}
-```
-
----
-
-## Google Drive Integration
-
-### Available GDrive Tools
-
-| Tool | Purpose |
-|------|---------|
-| `GDrive List Folder` | List contents of a folder |
-| `GDrive Download File` | Download file to local storage |
-| `GDrive Upload File` | Upload file from local storage |
-| `GDrive Create Folder` | Create a new folder |
-| `GDrive Move Item` | Move file/folder |
-| `GDrive Rename Item` | Rename file/folder |
-
-### Download from GDrive to Shared Volume
-
-```javascript
-// In a flow script (not a tool)
-const GDRIVE_API_URL = 'http://host.docker.internal:3110';
-
-// Download file from GDrive
-const response = await fetch(`${GDRIVE_API_URL}/files/${fileId}/download`, {
-    method: 'POST',
-    headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': 'your-api-key'
-    },
-    body: JSON.stringify({
-        // Use HOST path (where GDrive API writes)
-        destinationPath: 'C:/Users/.../KeenAgentsStorage/uploads/session/file.pdf'
-    })
-});
-
-// Store CONTAINER path (where engine reads)
-dictionary.downloadedFilePath = '/app/uploads/session/file.pdf';
-```
-
-### Autonomous Processing Pattern (FullAutonomy)
-
-A flow that processes files from a GDrive folder without user interaction:
-
-```
-Start
-  ↓
-[Script: List GDrive "For Processing" folder]
-  ↓
-[Script: Download first file to shared volume]
-  ↓
-[Script: Call PDFExtractor agent with file attached]
-  ↓
-[Agent: Analyzes PDF, calls extraction tool]
-  ↓
-[Tool: Splits PDF, saves ZIP to shared volume]
-  ↓
-End
-```
-
----
-
-## Sandbox Built-in Functions
-
-Scripts running in the VM sandbox have access to these functions:
-
-| Function | Purpose |
-|----------|---------|
-| `writeOut(message)` | Send output to user |
-| `writeThinking(message)` | Send thinking/progress update |
-| `writeError(message)` | Send error message |
-| `dictionary` | Shared data object between nodes |
-| `fetch(url, options)` | Make HTTP requests |
-
-### Available Node.js Modules (Limited)
-
-```javascript
-// Allowed imports
-import { createHash } from 'node:crypto';
-import { TextEncoder, URL } from 'node:util';
-import { Buffer } from 'node:buffer';
-import { join, basename } from 'node:path';
-
-// Special import for calling other flows
-import flow from 'system/flow';
-```
-
----
-
-# Sub-Agent Orchestration (Advanced)
-
-This section covers how to spawn multiple agents in parallel, track their progress, aggregate results, and handle errors. This is the key pattern for batch processing workflows.
-
-## Sub-Agent Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ Parent Flow (Orchestrator)                                               │
-│                                                                          │
-│ orchestrator.js                                                          │
-│ ├── Lists items to process                                               │
-│ ├── Spawns N sub-agents in parallel (Promise.all)                        │
-│ ├── Each sub-agent has unique sessionId                                  │
-│ ├── Collects results as they complete                                    │
-│ └── Generates final report                                               │
-│                                                                          │
-│      ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                │
-│      │ Sub-Agent 1 │   │ Sub-Agent 2 │   │ Sub-Agent 3 │   ...          │
-│      │ sessionId_1 │   │ sessionId_2 │   │ sessionId_3 │                │
-│      └─────────────┘   └─────────────┘   └─────────────┘                │
-│              │                 │                 │                       │
-│              └────────────────┬┴─────────────────┘                       │
-│                               ▼                                          │
-│                    Results Aggregation                                   │
-│                               ▼                                          │
-│                      Final Report                                        │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-## Session ID Management
-
-Each sub-agent needs a unique session ID for:
-- Progress tracking in the UI
-- Distinguishing parallel executions
-- Linking parent ↔ child relationships
-
-### Session ID Pattern
-
-```javascript
-// Parent session comes from the original request
-const parentSessionId = dictionary.promptMessage.userSessionCredentials.sessionID;
-const parentUserId = dictionary.promptMessage.userSessionCredentials.userID;
-
-// Generate unique child session ID
-function generateSubAgentSessionId(parentSessionId) {
-    const timestamp = Date.now();
-    const random = Math.random().toString(36).substr(2, 9);
-    return `${parentSessionId}_${timestamp}_${random}`;
-}
-
-// Example: "main123_1706789012345_x7k9m2abc"
-```
-
-## Progress Reporting to UI
-
-The three core functions for real-time UI updates:
-
-### writeAgentStart(mainSessionId, subSessionId, agentName, description)
-
-Signals that a sub-agent has started. This creates a new agent entry in the UI.
-
-```javascript
-const subSessionId = generateSubAgentSessionId(parentSessionId);
-
-writeAgentStart(
-    parentSessionId,           // Main session (links to parent)
-    subSessionId,              // This sub-agent's unique ID
-    'PDFProcessor',            // Agent name (displayed in UI)
-    'Processing invoice.pdf'   // Description (what it's doing)
-);
-```
-
-### writeAgentStream(sessionId, message)
-
-Sends progress updates that appear in the UI in real-time.
-
-```javascript
-writeAgentStream(subSessionId, 'Downloading file from GDrive...');
-writeAgentStream(subSessionId, 'File downloaded successfully');
-writeAgentStream(subSessionId, 'Analyzing PDF structure...');
-writeAgentStream(subSessionId, 'Found 5 documents to split');
-writeAgentStream(subSessionId, 'Extracting pages 1-10...');
-```
-
-### writeAgentEnd(sessionId, status)
-
-Signals that the sub-agent has completed. Status can be:
-- `'completed'` - Success
-- `'error'` - Failed
-- `'warning'` - Completed with issues
-
-```javascript
-// Success
-writeAgentEnd(subSessionId, 'completed');
-
-// Error
-writeAgentEnd(subSessionId, 'error');
-
-// Completed with warnings
-writeAgentEnd(subSessionId, 'warning');
-```
-
-## Complete Orchestrator Pattern
-
-Here's a full example of an orchestrator script that processes multiple items in parallel:
-
-```javascript
-import flow from 'system/flow';
-
-export async function exec() {
-    const items = dictionary.itemsToProcess;  // Array of items
-    const parentSessionId = dictionary.promptMessage.userSessionCredentials.sessionID;
-    const parentUserId = dictionary.promptMessage.userSessionCredentials.userID;
-
-    writeOut(`Starting batch processing of ${items.length} items...`);
-
-    // Track results
-    const results = {
-        successful: [],
-        failed: [],
-        total: items.length
-    };
-
-    // Create promises for parallel execution
-    const processingPromises = items.map(async (item, index) => {
-        // Generate unique session ID for this sub-agent
-        const subSessionId = `${parentSessionId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-        // Signal start to UI
-        writeAgentStart(
-            parentSessionId,
-            subSessionId,
-            'ItemProcessor',
-            `Processing item ${index + 1}: ${item.name}`
-        );
-
-        try {
-            // Progress update
-            writeAgentStream(subSessionId, `Starting processing...`);
-
-            // Call the sub-flow
-            const result = await flow.run('ProcessItem-Start', {
-                promptMessage: {
-                    role: 'user',
-                    content: JSON.stringify(item),
-                    userSessionCredentials: {
-                        sessionID: subSessionId,
-                        userID: parentUserId,
-                    },
-                    agentChat: false
-                }
-            });
-
-            // Success
-            writeAgentStream(subSessionId, `Completed successfully`);
-            writeAgentEnd(subSessionId, 'completed');
-
-            results.successful.push({
-                item: item.name,
-                result: result
-            });
-
-        } catch (error) {
-            // Error - but don't throw, collect the failure
-            writeAgentStream(subSessionId, `Error: ${error.message}`);
-            writeAgentEnd(subSessionId, 'error');
-
-            results.failed.push({
-                item: item.name,
-                error: error.message,
-                step: 'processing'  // Track which step failed
-            });
-        }
-    });
-
-    // Wait for ALL to complete (success or failure)
-    await Promise.all(processingPromises);
-
-    // Store results for report generation
-    dictionary.batchResults = results;
-
-    // Generate summary
-    writeOut(`\n=== Batch Processing Complete ===`);
-    writeOut(`Total: ${results.total}`);
-    writeOut(`Successful: ${results.successful.length}`);
-    writeOut(`Failed: ${results.failed.length}`);
-}
-```
-
-## Error Handling: Continue on Failure
-
-Critical principle: **One failure should not stop the entire batch.**
-
-### Wrap Each Sub-Agent in Try-Catch
-
-```javascript
-const promises = items.map(async (item) => {
-    try {
-        // Process item
-        return { success: true, item, result };
-    } catch (error) {
-        // Don't rethrow - collect the error
-        return { success: false, item, error: error.message };
-    }
-});
-
-const results = await Promise.all(promises);
-
-// Separate successes and failures
-const successes = results.filter(r => r.success);
-const failures = results.filter(r => !r.success);
-```
-
-### Track Which Step Failed
-
-For multi-step pipelines, track where the failure occurred:
-
-```javascript
-try {
-    writeAgentStream(sessionId, 'Step 1: Downloading...');
-    const file = await downloadFile(item);
-
-    writeAgentStream(sessionId, 'Step 2: Extracting...');
-    const extracted = await extractPdf(file);
-
-    writeAgentStream(sessionId, 'Step 3: Uploading...');
-    const uploaded = await uploadFiles(extracted);
-
-    return { success: true, ...uploaded };
-
-} catch (error) {
-    return {
-        success: false,
-        failedStep: currentStep,  // Which step failed
-        error: error.message
-    };
-}
-```
-
-## Result Aggregation
-
-### Simple Aggregation
-
-```javascript
-const allResults = await Promise.all(promises);
-
-dictionary.report = {
-    timestamp: new Date().toISOString(),
-    total: allResults.length,
-    successful: allResults.filter(r => r.success).length,
-    failed: allResults.filter(r => !r.success).length,
-    details: allResults
-};
-```
-
-### Structured Aggregation by Step
-
-For pipelines with multiple steps:
-
-```javascript
-const report = {
-    overview: {
-        total: items.length,
-        fullySuccessful: 0,
-        partiallySuccessful: 0,
-        failed: 0
-    },
-    byStep: {
-        download: { success: 0, failed: 0 },
-        extract: { success: 0, failed: 0 },
-        upload: { success: 0, failed: 0 }
-    },
-    items: []
-};
-
-// Populate from results
-results.forEach(r => {
-    if (r.success) {
-        report.overview.fullySuccessful++;
-        report.byStep.download.success++;
-        report.byStep.extract.success++;
-        report.byStep.upload.success++;
-    } else {
-        // Track which step failed
-        const failedStep = r.failedStep;
-        // Steps before failure succeeded
-        // Steps at and after failure... mark accordingly
-    }
-    report.items.push(r);
-});
-```
-
-## Generating Markdown Reports
-
-Output a clean report at the end:
-
-```javascript
-function generateMarkdownReport(results) {
-    let md = `# Batch Processing Report\n\n`;
-    md += `**Date:** ${new Date().toISOString()}\n\n`;
-    md += `## Summary\n\n`;
-    md += `- **Total items:** ${results.total}\n`;
-    md += `- **Successful:** ${results.successful.length}\n`;
-    md += `- **Failed:** ${results.failed.length}\n\n`;
-
-    if (results.successful.length > 0) {
-        md += `## Successful Items\n\n`;
-        results.successful.forEach(item => {
-            md += `- **${item.name}**\n`;
-            md += `  - Output folder: ${item.outputFolderUrl}\n`;
-            md += `  - Files created: ${item.filesCreated}\n`;
-        });
-    }
-
-    if (results.failed.length > 0) {
-        md += `## Failed Items\n\n`;
-        results.failed.forEach(item => {
-            md += `- **${item.name}**\n`;
-            md += `  - Failed at: ${item.failedStep}\n`;
-            md += `  - Error: ${item.error}\n`;
-        });
-    }
-
-    return md;
-}
-
-// Output to user
-writeOut(generateMarkdownReport(dictionary.batchResults));
-```
-
-## Best Practices Summary
-
-| Practice | Description |
-|----------|-------------|
-| Unique Session IDs | Always generate unique IDs: `${parent}_${timestamp}_${random}` |
-| Progress Updates | Use writeAgentStream for real-time feedback |
-| Error Isolation | Wrap each sub-agent in try-catch, don't let one failure crash all |
-| Result Collection | Always collect both successes and failures |
-| Step Tracking | Track which step failed for better debugging |
-| Final Report | Generate a clean summary at the end |
-
----
-
-# Critical Lessons Learned
-
-This section documents critical technical discoveries that caused significant debugging time. Read this carefully to avoid the same pitfalls.
-
-## 1. LLM Response Format from flow.run()
-
-**Problem:** When calling `flow.run()` to invoke an agent, the result structure is NOT what you might expect.
-
-**WRONG - Returns undefined:**
-```javascript
-const result = await flow.run('deal-recognizer', { promptMessage });
-const agentOutput = result?.DealRecognitionAgent;  // ❌ UNDEFINED!
-```
-
-**CORRECT - The output is nested:**
-```javascript
-const result = await flow.run('deal-recognizer', { promptMessage });
-const agentOutput = result?.llmResponse_DealRecognitionAgent?.output || '';  // ✅
-```
-
-**Full result structure:**
-```javascript
-{
-  promptMessage: {...},
-  __agentToolLoops: {...},
-  llmResponse_DealRecognitionAgent: {   // Note: llmResponse_ prefix!
-    output: "The actual text response from the agent",  // The string you want
-    error: null,
-    name: "DealRecognitionAgent"
-  }
-}
-```
-
-**Key insight:** The agent name is prefixed with `llmResponse_` and the actual text is in the `.output` property.
-
----
-
-## 2. VM Sandbox - No Filesystem Access
-
-**Critical Understanding:** Flow scripts and tools run inside a sandboxed VM (Virtual Machine) that does **NOT** have direct access to the host filesystem.
-
-**What this means:**
-- ❌ `fs.readFileSync()` - Does NOT work
-- ❌ `fs.writeFileSync()` - Does NOT work
-- ❌ `fs.existsSync()` - Does NOT work
-- ❌ Any `fs` module operations - Do NOT work
-
-**What DOES work in the sandbox:**
-- ✅ `fetch()` - HTTP requests
-- ✅ `dictionary` - Data passing between nodes
-- ✅ `writeThinking()`, `writeOut()`, `writeError()` - UI output
-- ✅ Limited Node modules: `crypto`, `Buffer`, `path` (for string operations only)
-
-**Solution:** Use a proxy service running on the host to handle all filesystem operations.
-
-```javascript
-// WRONG - Direct filesystem access
-const content = fs.readFileSync('/app/uploads/file.pdf');  // ❌ FAILS
-
-// CORRECT - Call proxy service via HTTP
-const response = await fetch('http://host.docker.internal:3111/api/pdf/read', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filePath: '/app/uploads/file.pdf' })
-});
-const data = await response.json();  // ✅ Proxy reads file and returns content
-```
-
----
-
-## 3. External APIs Cannot Access Local File Paths
-
-**Problem:** When calling external APIs (outside your infrastructure), you CANNOT send a file path and expect the API to read it.
-
-**Why this fails:**
-```javascript
-// Your local path
-const filePath = 'C:/Users/vicit/Documents/file.pdf';
-
-// Sending to remote API
-await fetch('https://external-api.com/upload', {
-    body: JSON.stringify({ filePath: filePath })  // ❌ FAILS
-});
-// The remote server doesn't have access to your C: drive!
-```
-
-**Solution:** Send the file CONTENT (as base64), not the file PATH:
-
-```javascript
-// Proxy reads file and converts to base64
-const proxyResponse = await fetch('http://host.docker.internal:3111/api/file/base64', {
-    method: 'POST',
-    body: JSON.stringify({ filePath: '/app/uploads/file.pdf' })
-});
-const { base64, fileName, fileType } = await proxyResponse.json();
-
-// Send base64 content to external API
-await fetch('https://external-api.com/upload', {
-    body: JSON.stringify({
-        file_data: base64,      // Base64 encoded content
-        file_name: fileName,
-        file_type: fileType
-    })
-});
-```
-
-**Architecture pattern for external API calls:**
-
-```
-Script (VM)
-    ↓ HTTP (send file path)
-PDF Proxy (Host - has filesystem access)
-    ↓ Reads file, converts to base64
-    ↓ Calls external API with base64 payload
-External API
-    ↓
-Returns result to Proxy
-    ↓
-Proxy returns result to Script
-```
-
----
-
-## 4. Debug Logging - writeThinking() Not console.log()
-
-**Problem:** `console.log()` output is NOT visible when running in the VM sandbox.
-
-```javascript
-// WRONG - Output goes nowhere
-console.log('Debug info');  // ❌ You will never see this
-
-// CORRECT - Shows in Chat UI thinking panel
-writeThinking('Debug info');  // ✅ Visible in UI
-```
-
-**Available output functions:**
-
-| Function | Where it appears | Use for |
-|----------|------------------|---------|
-| `writeThinking(msg)` | Thinking panel (collapsible) | Debug logs, progress |
-| `writeOut(msg)` | Main chat area | Final results, reports |
-| `writeError(msg)` | Error display | Critical errors |
-| `writeAgentStream(sessionId, msg)` | Sub-agent panel | Real-time progress |
-
----
-
-## 5. Agent File Attachment - filePaths in promptMessage
-
-**Problem:** How do you make an agent "see" a PDF file?
-
-**Solution:** Use `filePaths` in the promptMessage. Gemini (multimodal) will see the file content directly.
-
-```javascript
-const promptMessage = {
-    role: 'user',
-    content: 'Analyze this document and find the reference numbers.',
-    filePaths: [{ path: '/app/uploads/document.pdf' }],  // ← File attachment
-    userSessionCredentials: {
-        sessionID: subSessionId,
-        userID: userId
-    },
-    agentChat: false
-};
-
-await flow.run('deal-recognizer', { promptMessage });
-```
-
-**Critical:** When using `filePaths`, the agent's system prompt should NOT include a "Read File" tool. The file is already visible to the agent - adding a Read File tool just confuses it and wastes time.
-
-**WRONG system prompt:**
-```markdown
-1. Use the Read File tool to read the PDF  ← WRONG! File is already attached
-2. Analyze the content
-```
-
-**CORRECT system prompt:**
-```markdown
-The PDF file is already attached - you can see its contents directly.
-1. Analyze the document to find reference numbers
-2. Use the lookup tool to search for deals
-```
-
----
-
-## 6. Agent Output Format for Parsing
-
-**Problem:** When a downstream script needs to parse agent output, the agent must output in a predictable format.
-
-**Bad - Conversational output (hard to parse):**
-```
-I found the deal! The reference is SBGSI25037859 and it's a pratka type order.
-```
-
-**Good - Structured output (easy to parse):**
-```
-DEAL_FOUND
-item: pratka
-itemId: 1966193
-item_uml_ref: SBGSI25037859
-```
-
-**In the agent's system prompt, be explicit:**
-```markdown
-## Output Format
-
-**If deal found**, output EXACTLY this format:
-
-```
-DEAL_FOUND
-item: pratka
-itemId: 1234567
-item_uml_ref: SBGSI25037859
-```
-
-**If no deal found**:
-
-```
-NO_DEAL_FOUND
-Tried references: REF1, REF2, REF3
-```
-
-Do not add extra commentary - just the structured output.
-```
-
----
-
-## 7. API Field Name Casing Matters
-
-**Problem:** API field names are case-sensitive. `itemId` ≠ `itemID`.
-
-**Real example that caused failures:**
-```javascript
-// WRONG - lowercase 'd'
-body: JSON.stringify({
-    item: item,
-    itemId: itemId,  // ❌ API expects itemID
-    docType: docType
-})
-
-// CORRECT - capital 'D'
-body: JSON.stringify({
-    item: item,
-    itemID: itemId,  // ✅ Matches API expectation
-    docType: docType
-})
-```
-
-**Lesson:** Always check the exact field names expected by the API. When you get validation errors like `"itemID should not be empty"`, check the casing.
-
----
-
-## Summary Table
-
-| Issue | Wrong Approach | Correct Approach |
-|-------|----------------|------------------|
-| Getting agent output | `result?.AgentName` | `result?.llmResponse_AgentName?.output` |
-| Reading files in script | `fs.readFileSync()` | Call proxy via `fetch()` |
-| Sending files to external API | Send file path | Send base64 content via proxy |
-| Debug logging | `console.log()` | `writeThinking()` |
-| Agent seeing files | Read File tool | `filePaths` in promptMessage |
-| Agent output format | Conversational text | Structured format for parsing |
-| API field names | Guess the casing | Check exact API specification |
-
----
+For an agent named `{AgentName}` using the `{FlowName}` flow:
+- **Admin Panel Display Name**: `{AgentName}`
+- **Start Flow**: `{FlowName}`
+- **Start Node**: `Start`
+- **Agent folder**: `src/agents/{AgentName}/`
+- **Flow `agentRef`**: `"agentRef": "{AgentName}"` in `src/flows/{FlowName}/instructions.json`
