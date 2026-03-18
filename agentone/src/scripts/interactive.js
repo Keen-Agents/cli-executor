@@ -32,11 +32,31 @@ const MAX_SESSIONS = 50;
 const MAX_HISTORY = 500;
 const IS_WINDOWS = process.platform === 'win32';
 
+// ── Model registry ──────────────────────────────────────────────────────────
+const MODELS = {
+  // Claude models (--model flag)
+  opus:    { provider: 'claude', label: 'Claude Opus 4.6',   flag: 'opus',   speed: 'slow',   desc: 'Most capable, best for complex tasks' },
+  sonnet:  { provider: 'claude', label: 'Claude Sonnet 4.6', flag: 'sonnet', speed: 'fast',   desc: 'Fast and capable, great balance' },
+  haiku:   { provider: 'claude', label: 'Claude Haiku 4.5',  flag: 'haiku',  speed: 'fastest',desc: 'Fastest Claude, good for simple tasks' },
+  // Codex models (-c model_reasoning_effort flag)
+  'codex-xhigh': { provider: 'codex', label: 'Codex GPT-5.4 (xhigh)', effort: 'xhigh', speed: 'slow',    desc: 'Maximum reasoning, slow' },
+  'codex-high':  { provider: 'codex', label: 'Codex GPT-5.4 (high)',   effort: 'high',  speed: 'medium',  desc: 'Strong reasoning' },
+  'codex-med':   { provider: 'codex', label: 'Codex GPT-5.4 (medium)', effort: 'medium',speed: 'fast',    desc: 'Balanced speed/quality' },
+  'codex-low':   { provider: 'codex', label: 'Codex GPT-5.4 (low)',    effort: 'low',   speed: 'fastest', desc: 'Fastest Codex, good for chat' },
+};
+// Aliases for convenience
+const MODEL_ALIASES = {
+  claude: 'sonnet', codex: 'codex-low',
+  'claude-opus': 'opus', 'claude-sonnet': 'sonnet', 'claude-haiku': 'haiku',
+  'gpt-5.4': 'codex-xhigh', fast: 'haiku',
+};
+
 // ── Slash command registry ───────────────────────────────────────────────────
 const SLASH_COMMANDS = [
-  { cmd: '/model',    args: '[claude|codex]', desc: 'Switch or toggle primary model' },
-  { cmd: '/claude',   args: '',               desc: 'Switch to Claude' },
-  { cmd: '/codex',    args: '',               desc: 'Switch to Codex' },
+  { cmd: '/model',    args: '[name]',          desc: 'Switch model (opus/sonnet/haiku/codex-low/codex-high...)' },
+  { cmd: '/models',   args: '',                desc: 'List all available models' },
+  { cmd: '/claude',   args: '',                desc: 'Switch to Claude (Sonnet)' },
+  { cmd: '/codex',    args: '',                desc: 'Switch to Codex (low reasoning)' },
   { cmd: '/sessions', args: '',               desc: 'List saved sessions' },
   { cmd: '/resume',   args: '[id]',            desc: 'Resume a saved session (interactive picker if no id)' },
   { cmd: '/new',      args: '',               desc: 'Start a fresh session' },
@@ -150,13 +170,13 @@ function runTurn(stdinContent, opts) {
   return runClaudeTurn(stdinContent, opts);
 }
 
-function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, procRef, liteModel }) {
+function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, procRef, modelDef }) {
   return new Promise((res, rej) => {
     const args = ['-p'];
     if (!isFirst) args.push('--continue');
     args.push('--dangerously-skip-permissions');
-    // Lite mode uses Sonnet for fast responses (~2s vs ~8s Opus)
-    if (liteModel) args.push('--model', 'sonnet');
+    // Use the specific Claude model selected by the user
+    if (modelDef?.flag) args.push('--model', modelDef.flag);
 
     // Pass system prompt via temp file to avoid Windows cmd.exe ~8KB argument limit.
     // --append-system-prompt-file preserves Claude's built-in prompt (including MCP tools)
@@ -198,7 +218,7 @@ const CODEX_IDENTITY = `You are **Codex** (OpenAI, GPT-5.4), part of the **Keen 
 Your partner is **Claude** (Anthropic) — the user switches between you with /model.
 You both share the same conversation history. Be concise and direct.`;
 
-function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData, procRef, liteModel }) {
+function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData, procRef, modelDef }) {
   return new Promise((res, rej) => {
     // Prepend Codex identity to the system prompt so it knows who it is
     const codexPrompt = CODEX_IDENTITY + '\n\n' + systemPrompt;
@@ -216,8 +236,8 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
     }
 
     const args = ['exec'];
-    // Lite mode: use low reasoning effort for fast responses (~2s vs ~13s)
-    if (liteModel) args.push('-c', 'model_reasoning_effort="low"');
+    // Use the specific Codex reasoning effort selected by the user
+    if (modelDef?.effort) args.push('-c', `model_reasoning_effort="${modelDef.effort}"`);
     args.push('-');
     const proc = spawn('codex', args, {
       cwd: workdir,
@@ -305,10 +325,11 @@ class KeenCLI {
     this._cleaned = false;
 
     // ── Model state ──────────────────────────────────────────────
-    this.primaryModel = 'claude';
+    this.primaryModel = 'claude';       // 'claude' or 'codex' (provider)
+    this.activeModelKey = 'sonnet';     // key into MODELS registry
     this.isFirstClaude = true;
     this.isFirstCodex = true;
-    this.conversationHistory = [];   // shared across both models
+    this.conversationHistory = [];      // shared across both models
 
     // ── Session persistence ──────────────────────────────────────
     this.sessionId = `keen-${Date.now()}`;
@@ -363,7 +384,7 @@ class KeenCLI {
     }
     // Text info to the right of the logo — single line, vertically centered
     this.w(a.moveTo(3, infoCol) +
-      a.bold('Keen') + a.dim('  \u00b7  ') + mc(this.primaryModel) +
+      a.bold('Keen') + a.dim('  \u00b7  ') + mc(MODELS[this.activeModelKey]?.label || this.primaryModel) +
       a.dim('  \u00b7  ') + a.gray(this.workdir));
 
     // Separator
@@ -446,7 +467,7 @@ class KeenCLI {
     // Row r: hints line
     this.w(a.moveTo(r, 1) + a.clearLine);
     if (this.busy) {
-      this.w(a.dim(`  ^C to interrupt \u00b7 `) + mc(this.primaryModel));
+      this.w(a.dim(`  ^C to interrupt \u00b7 `) + mc(MODELS[this.activeModelKey]?.label || this.primaryModel));
     } else {
       const suggestions = this.slashSuggestions();
       if (suggestions) {
@@ -554,13 +575,32 @@ class KeenCLI {
 
     if (cmd === '/model') {
       const arg = (parts[1] || '').toLowerCase();
-      if (arg === 'claude' || arg === 'codex') {
-        this.setPrimaryModel(arg);
-      } else if (!arg) {
+      if (!arg) {
+        // Toggle provider
         this.setPrimaryModel(this.primaryModel === 'claude' ? 'codex' : 'claude');
       } else {
-        this.scrollWrite(a.yellow(`Unknown model: ${arg}. Use /model claude or /model codex\n`));
+        this.setPrimaryModel(arg);
       }
+      return;
+    }
+
+    if (cmd === '/models') {
+      this.scrollWrite('\n' + a.magenta(a.bold('Available Models')) + '\n\n');
+      const current = this.activeModelKey;
+      // Claude models
+      this.scrollWrite(a.cyan(a.bold('  Claude (Anthropic)')) + '\n');
+      for (const [key, m] of Object.entries(MODELS)) {
+        if (m.provider !== 'claude') continue;
+        const sel = key === current ? a.green(' *') : '';
+        this.scrollWrite(`    ${a.cyan(key.padEnd(14))}${sel}  ${a.dim(m.speed.padEnd(8))}  ${m.desc}\n`);
+      }
+      this.scrollWrite('\n' + a.yellow(a.bold('  Codex (OpenAI)')) + '\n');
+      for (const [key, m] of Object.entries(MODELS)) {
+        if (m.provider !== 'codex') continue;
+        const sel = key === current ? a.green(' *') : '';
+        this.scrollWrite(`    ${a.yellow(key.padEnd(14))}${sel}  ${a.dim(m.speed.padEnd(8))}  ${m.desc}\n`);
+      }
+      this.scrollWrite('\n' + a.dim('  /model <name> to switch  (e.g. /model opus, /model codex-high)') + '\n\n');
       return;
     }
 
@@ -617,7 +657,7 @@ class KeenCLI {
       this.scrollWrite(`\n${a.magenta(a.bold('Status'))}\n`);
       const shortId = this.sessionId.replace('keen-', '').slice(-8);
       this.scrollWrite(`  ${a.cyan('Session:'.padEnd(14))} ${shortId}\n`);
-      this.scrollWrite(`  ${a.cyan('Model:'.padEnd(14))} ${mc(this.primaryModel)}\n`);
+      this.scrollWrite(`  ${a.cyan('Model:'.padEnd(14))} ${mc(MODELS[this.activeModelKey]?.label || this.primaryModel)}\n`);
       this.scrollWrite(`  ${a.cyan('Spinner:'.padEnd(14))} ${activeSpinnerName} ${SPINNER.join(' ')}\n`);
       this.scrollWrite(`  ${a.cyan('Turns:'.padEnd(14))} ${turns}\n`);
       this.scrollWrite(`  ${a.cyan('History:'.padEnd(14))} ${this.history.length} entries\n`);
@@ -746,15 +786,31 @@ class KeenCLI {
     }).join('  ');
   }
 
-  setPrimaryModel(model) {
-    this.primaryModel = model;
-    // History is shared — don't wipe it. Both models see the full conversation.
-    // Reset isFirst so the new model gets the system prompt + history context.
-    if (model === 'claude') this.isFirstClaude = true;
+  /**
+   * Switch to a model by key (e.g. 'opus', 'sonnet', 'codex-low') or provider ('claude', 'codex').
+   */
+  setPrimaryModel(nameOrKey) {
+    // Resolve aliases
+    let key = MODEL_ALIASES[nameOrKey] || nameOrKey;
+    // Legacy: bare 'claude' / 'codex' without specific model
+    if (nameOrKey === 'claude' && !MODELS[nameOrKey]) key = 'sonnet';
+    if (nameOrKey === 'codex' && !MODELS[nameOrKey]) key = 'codex-low';
+
+    const modelDef = MODELS[key];
+    if (!modelDef) {
+      this.scrollWrite(a.red(`Unknown model: ${nameOrKey}`) + a.dim(' — type /models to see available\n'));
+      return;
+    }
+
+    this.activeModelKey = key;
+    this.primaryModel = modelDef.provider;
+
+    // History is shared — don't wipe it.
+    if (modelDef.provider === 'claude') this.isFirstClaude = true;
     else this.isFirstCodex = true;
 
-    const mc = model === 'claude' ? a.cyan : a.yellow;
-    this.scrollWrite(mc(`\u2731 Switched to ${model}\n`));
+    const mc = modelDef.provider === 'claude' ? a.cyan : a.yellow;
+    this.scrollWrite(mc(`\u2731 ${modelDef.label}`) + a.dim(` (${modelDef.desc})\n`));
     this.drawHeader();
     this.drawBottom();
   }
@@ -1281,8 +1337,8 @@ class KeenCLI {
       };
 
       // Lite mode + Claude uses Sonnet for fast responses (~2s vs ~8s Opus)
-      // Lite mode: Claude uses Sonnet (~2s), Codex uses low reasoning (~2s)
-      const liteModel = !this._isEscalated ? 'lite' : null;
+      // Pass active model config to the turn runner
+      const modelDef = MODELS[this.activeModelKey];
 
       const result = await runTurn(modelInput, {
         workdir: this.workdir,
@@ -1292,7 +1348,7 @@ class KeenCLI {
         conversationHistory: this.conversationHistory,
         procRef: this._primaryProcRef,
         onData: onDataBuffer,
-        liteModel
+        modelDef
       });
 
       // Update isFirst for the primary model
