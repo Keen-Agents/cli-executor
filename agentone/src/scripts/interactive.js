@@ -35,7 +35,7 @@ const SLASH_COMMANDS = [
   { cmd: '/claude',   args: '',               desc: 'Switch to Claude' },
   { cmd: '/codex',    args: '',               desc: 'Switch to Codex' },
   { cmd: '/sessions', args: '',               desc: 'List saved sessions' },
-  { cmd: '/resume',   args: '<id>',           desc: 'Resume a saved session' },
+  { cmd: '/resume',   args: '[id]',            desc: 'Resume a saved session (interactive picker if no id)' },
   { cmd: '/new',      args: '',               desc: 'Start a fresh session' },
   { cmd: '/spinner',  args: '[name]',         desc: 'Change spinner style' },
   { cmd: '/clear',    args: '',               desc: 'Clear screen (Ctrl+L)' },
@@ -127,9 +127,13 @@ function parseArgs(argv) {
     if (argv[i] === '--workdir' && argv[i + 1]) {
       workdir = resolve(argv[i + 1]);
       i++;
-    } else if (argv[i] === '--resume' && argv[i + 1]) {
-      resumeId = argv[i + 1];
-      i++;
+    } else if (argv[i] === '--resume') {
+      if (argv[i + 1] && !argv[i + 1].startsWith('--')) {
+        resumeId = argv[i + 1];
+        i++;
+      } else {
+        resumeId = '__picker__';  // signal to open interactive picker
+      }
     }
   }
   return { workdir, resumeId };
@@ -290,6 +294,12 @@ class KeenCLI {
     this.sessionId = `keen-${Date.now()}`;
     this._sessionCreated = new Date().toISOString();
     this._ensureSessionsDir();
+
+    // ── Session picker (interactive /resume) ────────────────────
+    this._pickerActive = false;
+    this._pickerItems = [];     // session objects
+    this._pickerIdx = 0;        // highlighted index
+    this._pickerScroll = 0;     // scroll offset for long lists
 
     // Per-turn output buffer
     this.primaryOutput = '';
@@ -629,14 +639,15 @@ class KeenCLI {
         this.scrollWrite(`  ${a.cyan(shortId)}${isCurrent}  ${a.dim(date + ' ' + time)}  ${a.dim(turns + 't')}  ${preview}\n`);
       }
       if (sessions.length > 20) this.scrollWrite(a.dim(`  ... and ${sessions.length - 20} more\n`));
-      this.scrollWrite('\n' + a.dim('  /resume <id> to continue a session') + '\n\n');
+      this.scrollWrite('\n' + a.dim('  /resume to pick interactively, or /resume <id>') + '\n\n');
       return;
     }
 
     if (cmd === '/resume') {
       const partialId = parts[1];
       if (!partialId) {
-        this.scrollWrite(a.yellow('Usage: /resume <id>  (use /sessions to list)\n'));
+        // No args — open interactive session picker
+        this._enterPicker();
         return;
       }
       const session = this.resumeSession(partialId);
@@ -695,6 +706,169 @@ class KeenCLI {
     this.scrollWrite(mc(`\u2731 Switched to ${model}\n`));
     this.drawHeader();
     this.drawBottom();
+  }
+
+  // ── Interactive session picker (/resume) ─────────────────────────────────
+  _enterPicker() {
+    const sessions = this._listSessions().filter(s => s.id !== this.sessionId);
+    if (sessions.length === 0) {
+      this.scrollWrite(a.dim('  No other sessions to resume.\n'));
+      return;
+    }
+    this._pickerActive = true;
+    this._pickerItems = sessions;
+    this._pickerIdx = 0;
+    this._pickerScroll = 0;
+    this._drawPicker();
+  }
+
+  _exitPicker(cancelled) {
+    this._pickerActive = false;
+    // Redraw to clear picker UI
+    this._redrawScrollView();
+    this.drawBottom();
+    if (cancelled) {
+      this.scrollWrite(a.dim('  Cancelled.\n'));
+    }
+  }
+
+  _pickerSelect() {
+    const session = this._pickerItems[this._pickerIdx];
+    this._pickerActive = false;
+    this._redrawScrollView();
+    // Actually resume
+    const resumed = this.resumeSession(session.id.replace('keen-', '').slice(-8));
+    if (!resumed) {
+      this.scrollWrite(a.red(`Failed to resume session.\n`));
+      this.drawBottom();
+      return;
+    }
+    const turns = Math.floor(resumed.history.length / 2);
+    this.scrollWrite(a.green(`\nResumed session (${turns} turns)\n\n`));
+    const recent = resumed.history.slice(-6);
+    for (const turn of recent) {
+      const prefix = turn.role === 'user' ? a.green('\u203A') : a.cyan('\u25C7');
+      const text = turn.content.slice(0, 120) + (turn.content.length > 120 ? '...' : '');
+      this.scrollWrite(`  ${prefix} ${a.dim(text)}\n`);
+    }
+    this.scrollWrite('\n');
+    this.drawHeader();
+    this.drawBottom();
+  }
+
+  _drawPicker() {
+    const viewHeight = this.scrollEnd - this.scrollStart;
+    const maxVisible = Math.max(viewHeight - 4, 3); // leave room for header/footer
+    const items = this._pickerItems;
+
+    // Adjust scroll so selected item is visible
+    if (this._pickerIdx < this._pickerScroll) {
+      this._pickerScroll = this._pickerIdx;
+    } else if (this._pickerIdx >= this._pickerScroll + maxVisible) {
+      this._pickerScroll = this._pickerIdx - maxVisible + 1;
+    }
+
+    this.w(a.hide);
+    // Clear scroll region
+    for (let i = this.scrollStart; i <= this.scrollEnd; i++) {
+      this.w(a.moveTo(i, 1) + a.clearLine);
+    }
+
+    let row = this.scrollStart;
+
+    // Title
+    this.w(a.moveTo(row, 1) + '  ' + a.magenta(a.bold('Resume a session')) + a.dim(`  (${items.length} saved)`));
+    row += 2;
+
+    // Session list
+    const end = Math.min(this._pickerScroll + maxVisible, items.length);
+    for (let i = this._pickerScroll; i < end; i++) {
+      if (row > this.scrollEnd - 2) break;
+      const s = items[i];
+      const d = new Date(s.updated);
+      const date = d.toLocaleDateString();
+      const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const turns = Math.floor((s.history?.length || 0) / 2);
+      const shortId = s.id.replace('keen-', '').slice(-8);
+      const preview = (s.preview || '(empty)').slice(0, Math.max(this.cols - 40, 20));
+
+      const selected = i === this._pickerIdx;
+      const pointer = selected ? a.cyan('\u203A ') : '  ';
+      const idStr = selected ? a.cyan(a.bold(shortId)) : a.dim(shortId);
+      const meta = a.dim(`${date} ${time}  ${turns}t`);
+      const prevStr = selected ? preview : a.dim(preview);
+
+      this.w(a.moveTo(row, 1) + `  ${pointer}${idStr}  ${meta}  ${prevStr}`);
+      row++;
+    }
+
+    // Scroll indicators
+    if (this._pickerScroll > 0) {
+      this.w(a.moveTo(this.scrollStart + 2, this.cols - 3) + a.dim('\u2191'));
+    }
+    if (end < items.length) {
+      this.w(a.moveTo(row, this.cols - 3) + a.dim('\u2193'));
+    }
+
+    // Footer hints
+    const footerRow = Math.min(row + 1, this.scrollEnd);
+    this.w(a.moveTo(footerRow, 1) + '  ' + a.dim('\u2191\u2193 navigate \u00b7 Enter select \u00b7 Esc cancel'));
+
+    this.w(a.show);
+    // Hide main input prompt — park cursor off the input area
+    this.w(a.moveTo(this.rows - 2, 1) + a.clearLine + a.dim('  selecting session...'));
+    this.w(a.moveTo(this.rows, 1) + a.clearLine + a.dim('  \u2191\u2193 navigate \u00b7 Enter select \u00b7 Esc cancel'));
+  }
+
+  _onPickerKey(data) {
+    const key = data.toString();
+    const hex = data.toString('hex');
+
+    // Escape
+    if (key === '\x1b' && hex === '1b') {
+      this._exitPicker(true);
+      return true;
+    }
+    // Ctrl+C
+    if (key === '\x03') {
+      this._exitPicker(true);
+      return true;
+    }
+    // Enter
+    if (key === '\r' || key === '\n') {
+      this._pickerSelect();
+      return true;
+    }
+    // Up arrow
+    if (hex === '1b5b41') {
+      if (this._pickerIdx > 0) {
+        this._pickerIdx--;
+        this._drawPicker();
+      }
+      return true;
+    }
+    // Down arrow
+    if (hex === '1b5b42') {
+      if (this._pickerIdx < this._pickerItems.length - 1) {
+        this._pickerIdx++;
+        this._drawPicker();
+      }
+      return true;
+    }
+    // Page Up (jump 5)
+    if (hex === '1b5b357e') {
+      this._pickerIdx = Math.max(0, this._pickerIdx - 5);
+      this._drawPicker();
+      return true;
+    }
+    // Page Down (jump 5)
+    if (hex === '1b5b367e') {
+      this._pickerIdx = Math.min(this._pickerItems.length - 1, this._pickerIdx + 5);
+      this._drawPicker();
+      return true;
+    }
+    // Consume all other keys (don't leak to main handler)
+    return true;
   }
 
   // Write text into the scroll region (auto-saves cursor position)
@@ -1160,6 +1334,12 @@ class KeenCLI {
 
   // ── Keyboard ───────────────────────────────────────────────────────────
   onKey(data) {
+    // Session picker intercepts all keys when active
+    if (this._pickerActive) {
+      this._onPickerKey(data);
+      return;
+    }
+
     const key = data.toString();
 
     // Ctrl+C: cancel turn if busy, exit if idle
@@ -1375,7 +1555,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const cli = new KeenCLI({ workdir: args.workdir, systemPrompt });
 
   // Resume a previous session if --resume was passed
-  if (args.resumeId) {
+  if (args.resumeId && args.resumeId !== '__picker__') {
     const session = cli.resumeSession(args.resumeId);
     if (session) {
       const turns = Math.floor(session.history.length / 2);
@@ -1385,6 +1565,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       process.exit(1);
     }
   }
+  // --resume with no id: open interactive picker after TUI is set up
+  const _openPickerOnStart = args.resumeId === '__picker__';
 
   const shutdown = () => { cli.cleanup(); process.exit(0); };
   process.on('exit', () => cli.cleanup());
@@ -1400,4 +1582,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   });
 
   cli.setup();
+
+  // Open picker immediately if --resume was passed with no id
+  if (_openPickerOnStart) {
+    cli._enterPicker();
+  }
 }
