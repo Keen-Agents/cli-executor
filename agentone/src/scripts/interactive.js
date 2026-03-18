@@ -189,12 +189,15 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, p
       args.push('--append-system-prompt-file', promptFile);
     }
 
-    const proc = spawn('claude', args, {
-      cwd: workdir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: IS_WINDOWS,  // Windows needs shell to find claude in PATH; Linux doesn't
-      env: { ...process.env }
-    });
+    // On Windows, spawn via shell to find claude in PATH. Use single command string
+    // to avoid Node v22+ DEP0190 deprecation warning about unescaped args with shell.
+    const proc = IS_WINDOWS
+      ? spawn((['claude', ...args].map(a => a.includes(' ') ? `"${a}"` : a)).join(' '), {
+          cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], shell: true, env: { ...process.env }
+        })
+      : spawn('claude', args, {
+          cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env }
+        });
 
     if (procRef) procRef.proc = proc;
 
@@ -239,12 +242,13 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
     // Use the specific Codex reasoning effort selected by the user
     if (modelDef?.effort) args.push('-c', `model_reasoning_effort="${modelDef.effort}"`);
     args.push('-');
-    const proc = spawn('codex', args, {
-      cwd: workdir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: IS_WINDOWS,
-      env: { ...process.env }
-    });
+    const proc = IS_WINDOWS
+      ? spawn((['codex', ...args].map(a => a.includes(' ') ? `"${a}"` : a)).join(' '), {
+          cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], shell: true, env: { ...process.env }
+        })
+      : spawn('codex', args, {
+          cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env }
+        });
 
     if (procRef) procRef.proc = proc;
 
@@ -1296,8 +1300,39 @@ class KeenCLI {
     // User prompt echo
     this.scrollWrite(`\n${a.green(a.bold('\u203A'))} ${a.bold(text)}\n\n`);
 
-    // ── Two-tier prompt: escalate to full orchestrator for pipeline-worthy tasks ──
+    // ── Direct spawn detection: "ask codex to X", "make claude do X", etc. ──
     const lowerText = text.toLowerCase();
+    const spawnPatterns = [
+      { rx: /(?:ask|tell|make|have|call|use)\s+codex\s+(?:to\s+)?(.+)/i, cli: 'codex' },
+      { rx: /(?:ask|tell|make|have|call|use)\s+claude\s+(?:to\s+)?(.+)/i, cli: 'claude' },
+      { rx: /codex[,:]\s*(.+)/i, cli: 'codex' },
+      { rx: /claude[,:]\s*(.+)/i, cli: 'claude' },
+    ];
+    for (const { rx, cli } of spawnPatterns) {
+      const m = text.match(rx);
+      if (m && m[1]) {
+        const prompt = m[1].trim();
+        // Don't spawn yourself — only spawn the OTHER model
+        if (cli === this.primaryModel) break;
+        this.conversationHistory.push({ role: 'user', content: text });
+        const spawnResult = await this.runSpawnFromTag(cli, prompt);
+        const modelName = cli === 'claude' ? 'Claude' : 'Codex';
+        this.conversationHistory.push({
+          role: 'assistant',
+          content: `[${modelName} said: ${(spawnResult || '(no output)').slice(0, 500)}]`
+        });
+        if (this.conversationHistory.length > 20) {
+          this.conversationHistory = this.conversationHistory.slice(-20);
+        }
+        this._stopSpinner();
+        this._saveSession();
+        this.busy = false;
+        this.drawBottom();
+        return;
+      }
+    }
+
+    // ── Two-tier prompt: escalate to full orchestrator for pipeline-worthy tasks ──
     const pipelineSignals = [
       'run the pipeline', 'launch the pipeline', 'full pipeline', 'start pipeline',
       'pipeline', 'dual plan', 'use claude and codex', 'multi-agent',
