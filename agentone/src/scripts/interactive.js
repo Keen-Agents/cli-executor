@@ -19,7 +19,8 @@ import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, r
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
-import { PersistentClaude } from './lib/persistent-claude.js';
+// PersistentClaude not used — stream-json input broken on Windows.
+// Speed comes from using Sonnet model in lite mode (~2s vs ~8s Opus).
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -149,11 +150,13 @@ function runTurn(stdinContent, opts) {
   return runClaudeTurn(stdinContent, opts);
 }
 
-function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, procRef }) {
+function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, procRef, liteModel }) {
   return new Promise((res, rej) => {
     const args = ['-p'];
     if (!isFirst) args.push('--continue');
     args.push('--dangerously-skip-permissions');
+    // Lite mode uses Sonnet for fast responses (~2s vs ~8s Opus)
+    if (liteModel) args.push('--model', liteModel);
 
     // Pass system prompt via temp file to avoid Windows cmd.exe ~8KB argument limit.
     // --append-system-prompt-file preserves Claude's built-in prompt (including MCP tools)
@@ -302,9 +305,6 @@ class KeenCLI {
     this._sessionCreated = new Date().toISOString();
     this._ensureSessionsDir();
 
-    // ── Persistent Claude process (fast lite mode) ─────────────
-    this._persistentClaude = null;
-
     // ── Session picker (interactive /resume) ────────────────────
     this._pickerActive = false;
     this._pickerItems = [];     // session objects
@@ -391,7 +391,6 @@ class KeenCLI {
     if (this._cleaned) return;
     this._cleaned = true;
 
-    this._destroyPersistentClaude();
     killProc(this._primaryProcRef.proc);
 
     if (this._spinnerInterval) clearInterval(this._spinnerInterval);
@@ -683,7 +682,6 @@ class KeenCLI {
 
     if (cmd === '/new') {
       this._saveSession();
-      this._destroyPersistentClaude();  // fresh session = fresh process
       this.sessionId = `keen-${Date.now()}`;
       this._sessionCreated = new Date().toISOString();
       this.conversationHistory = [];
@@ -701,7 +699,6 @@ class KeenCLI {
       }
       this._isEscalated = true;
       this.systemPrompt = this.systemPromptFull;
-      this._destroyPersistentClaude();
       this.isFirstClaude = true;
       this.isFirstCodex = true;
       this.scrollWrite(a.magenta('\u2731 Escalated to full orchestrator mode\n'));
@@ -750,52 +747,6 @@ class KeenCLI {
     this.scrollWrite(mc(`\u2731 Switched to ${model}\n`));
     this.drawHeader();
     this.drawBottom();
-  }
-
-  // ── Persistent Claude (fast lite mode) ─────────────────────────────────
-  async _ensurePersistentClaude() {
-    if (this._persistentClaude?.isAlive()) return this._persistentClaude;
-    // Destroy stale instance
-    if (this._persistentClaude) this._persistentClaude.destroy();
-    this._persistentClaude = new PersistentClaude({
-      workdir: this.workdir,
-      systemPrompt: this.systemPromptLite,
-      model: 'claude-sonnet-4-5-20250514'
-    });
-    await this._persistentClaude.start();
-    return this._persistentClaude;
-  }
-
-  _destroyPersistentClaude() {
-    if (this._persistentClaude) {
-      this._persistentClaude.destroy();
-      this._persistentClaude = null;
-    }
-  }
-
-  /**
-   * Run a turn via the persistent Claude process (no cold start).
-   * Falls back to CLI spawn on error.
-   */
-  async runLiteTurn(text, { onData, procRef } = {}) {
-    try {
-      const pc = await this._ensurePersistentClaude();
-      const result = await pc.sendMessage(text, { onData, timeout: 120_000 });
-      return result;
-    } catch (err) {
-      // Persistent process failed — fall back to CLI spawn
-      this.scrollWrite(a.dim(`  [persistent process error: ${err.message}, falling back to CLI]\n`));
-      this._destroyPersistentClaude();
-      return runTurn(text, {
-        workdir: this.workdir,
-        isFirst: this.isFirstClaude,
-        systemPrompt: this.systemPrompt,
-        model: 'claude',
-        conversationHistory: this.conversationHistory,
-        procRef: procRef || {},
-        onData
-      });
-    }
   }
 
   // ── Interactive session picker (/resume) ─────────────────────────────────
@@ -1293,8 +1244,6 @@ class KeenCLI {
     if (needsFullPrompt && !this._isEscalated) {
       this._isEscalated = true;
       this.systemPrompt = this.systemPromptFull;
-      // Kill persistent process — escalated mode needs CLI with tool access
-      this._destroyPersistentClaude();
       this.isFirstClaude = true;
       this.isFirstCodex = true;
       this.scrollWrite(a.dim('  [escalated to full orchestrator]\n'));
@@ -1315,26 +1264,25 @@ class KeenCLI {
     }
 
     try {
-      // Lite mode + Claude = persistent process (fast, ~1s)
-      // Escalated/pipeline mode or Codex = CLI spawn (has tool access)
-      const usePersistent = !this._isEscalated && this.primaryModel === 'claude';
       const onDataBuffer = (chunk) => {
         this.primaryOutput += chunk;
         // Buffer everything — display decision happens after model finishes.
         // Spinner keeps running to show activity.
       };
 
-      const result = usePersistent
-        ? await this.runLiteTurn(modelInput, { onData: onDataBuffer, procRef: this._primaryProcRef })
-        : await runTurn(modelInput, {
-            workdir: this.workdir,
-            isFirst,
-            systemPrompt: this.systemPrompt,
-            model: this.primaryModel,
-            conversationHistory: this.conversationHistory,
-            procRef: this._primaryProcRef,
-            onData: onDataBuffer
-          });
+      // Lite mode + Claude uses Sonnet for fast responses (~2s vs ~8s Opus)
+      const liteModel = (!this._isEscalated && this.primaryModel === 'claude') ? 'sonnet' : null;
+
+      const result = await runTurn(modelInput, {
+        workdir: this.workdir,
+        isFirst,
+        systemPrompt: this.systemPrompt,
+        model: this.primaryModel,
+        conversationHistory: this.conversationHistory,
+        procRef: this._primaryProcRef,
+        onData: onDataBuffer,
+        liteModel
+      });
 
       // Update isFirst for the primary model
       if (this.primaryModel === 'claude') this.isFirstClaude = false;
