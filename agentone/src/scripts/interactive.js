@@ -238,7 +238,7 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
       fullPrompt += '\nContinue the conversation. Respond to the latest user message.';
     }
 
-    const args = ['exec'];
+    const args = ['exec', '--full-auto'];
     // Use the specific Codex reasoning effort selected by the user
     if (modelDef?.effort) args.push('-c', `model_reasoning_effort="${modelDef.effort}"`);
     args.push('-');
@@ -1115,14 +1115,20 @@ class KeenCLI {
     const procRef = {};
     this._primaryProcRef = procRef;
 
+    // Use fast model for spawns: Sonnet for Claude, low reasoning for Codex
+    const spawnModelDef = cli === 'claude'
+      ? MODELS['sonnet']
+      : MODELS['codex-low'];
+
     try {
       const result = await runTurn(prompt, {
         workdir: this.workdir,
         isFirst: true,
-        systemPrompt: `You are ${cli}. Answer the following request directly and concisely.`,
+        systemPrompt: `You are ${cli}. Answer the following request directly and concisely. You have full access to the filesystem and can create, edit, and delete files.`,
         model: cli,
         conversationHistory: [],
         procRef,
+        modelDef: spawnModelDef,
         onData: (chunk) => {
           this._clearSpinnerLine();
           spawnOutput += chunk;
