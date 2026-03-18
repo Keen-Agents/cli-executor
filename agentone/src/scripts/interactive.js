@@ -23,6 +23,7 @@ import { homedir, tmpdir } from 'node:os';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SYSTEM_PROMPT_PATH = resolve(__dirname, 'prompts/orchestrator.md');
+const SYSTEM_PROMPT_LITE_PATH = resolve(__dirname, 'prompts/orchestrator-lite.md');
 const HISTORY_FILE = resolve(homedir(), '.keen_history');
 const SESSIONS_DIR = resolve(homedir(), '.keen', 'sessions');
 const MAX_SESSIONS = 50;
@@ -42,6 +43,8 @@ const SLASH_COMMANDS = [
   { cmd: '/help',     args: '',               desc: 'Show available commands' },
   { cmd: '/status',   args: '',               desc: 'Show session status' },
   { cmd: '/save',     args: '[path]',         desc: 'Save conversation to file' },
+  { cmd: '/pipeline', args: '',               desc: 'Escalate to full orchestrator mode' },
+  { cmd: '/lite',     args: '',               desc: 'Switch back to fast/lite mode' },
 ];
 
 // ── Keen logo (ANSI block art — light-blue folder with two white "eyes") ─────
@@ -273,9 +276,12 @@ function extractCodexResponse(stdout) {
 
 // ── TUI ──────────────────────────────────────────────────────────────────────
 class KeenCLI {
-  constructor({ workdir, systemPrompt }) {
+  constructor({ workdir, systemPrompt, systemPromptLite }) {
     this.workdir = workdir;
-    this.systemPrompt = systemPrompt;
+    this.systemPromptFull = systemPrompt;       // full orchestrator (pipeline dispatch)
+    this.systemPromptLite = systemPromptLite || systemPrompt;  // lightweight (normal chat)
+    this.systemPrompt = this.systemPromptLite;  // active prompt — start lite
+    this._isEscalated = false;                  // true when using full orchestrator
     this.busy = false;
     this.input = '';
     this.cursor = 0;
@@ -288,7 +294,7 @@ class KeenCLI {
     this.primaryModel = 'claude';
     this.isFirstClaude = true;
     this.isFirstCodex = true;
-    this.conversationHistory = [];   // used for Codex context (Claude uses --continue)
+    this.conversationHistory = [];   // shared across both models
 
     // ── Session persistence ──────────────────────────────────────
     this.sessionId = `keen-${Date.now()}`;
@@ -682,6 +688,34 @@ class KeenCLI {
       return;
     }
 
+    if (cmd === '/pipeline') {
+      if (this._isEscalated) {
+        this.scrollWrite(a.dim('Already in full orchestrator mode.\n'));
+        return;
+      }
+      this._isEscalated = true;
+      this.systemPrompt = this.systemPromptFull;
+      this.isFirstClaude = true;
+      this.isFirstCodex = true;
+      this.scrollWrite(a.magenta('\u2731 Escalated to full orchestrator mode\n'));
+      this.drawBottom();
+      return;
+    }
+
+    if (cmd === '/lite') {
+      if (!this._isEscalated) {
+        this.scrollWrite(a.dim('Already in lite mode.\n'));
+        return;
+      }
+      this._isEscalated = false;
+      this.systemPrompt = this.systemPromptLite;
+      this.isFirstClaude = true;
+      this.isFirstCodex = true;
+      this.scrollWrite(a.cyan('\u2731 Switched to lite mode (faster responses)\n'));
+      this.drawBottom();
+      return;
+    }
+
     // Unknown slash command
     this.scrollWrite(a.red(`Unknown command: ${cmd}`) + a.dim(' — type /help for available commands\n'));
   }
@@ -700,7 +734,10 @@ class KeenCLI {
 
   setPrimaryModel(model) {
     this.primaryModel = model;
-    this.conversationHistory = [];  // fresh start on model switch
+    // History is shared — don't wipe it. Both models see the full conversation.
+    // Reset isFirst so the new model gets the system prompt + history context.
+    if (model === 'claude') this.isFirstClaude = true;
+    else this.isFirstCodex = true;
 
     const mc = model === 'claude' ? a.cyan : a.yellow;
     this.scrollWrite(mc(`\u2731 Switched to ${model}\n`));
@@ -1189,16 +1226,37 @@ class KeenCLI {
     // User prompt echo
     this.scrollWrite(`\n${a.green(a.bold('\u203A'))} ${a.bold(text)}\n\n`);
 
+    // ── Two-tier prompt: escalate to full orchestrator for pipeline-worthy tasks ──
+    const lowerText = text.toLowerCase();
+    const pipelineSignals = [
+      'build', 'implement', 'create an app', 'create a feature', 'run the pipeline',
+      'pipeline', 'dual plan', 'use codex', 'use claude and codex', 'spawn',
+      'research', 'multi-agent', 'full pipeline', 'complex profile',
+      'standard profile', 'simple profile'
+    ];
+    const needsFullPrompt = pipelineSignals.some(s => lowerText.includes(s));
+
+    if (needsFullPrompt && !this._isEscalated) {
+      this._isEscalated = true;
+      this.systemPrompt = this.systemPromptFull;
+      // Force fresh Claude session so it picks up the full prompt
+      this.isFirstClaude = true;
+      this.isFirstCodex = true;
+      this.scrollWrite(a.dim('  [escalated to full orchestrator]\n'));
+    }
+
     // Run primary model — buffer output, display only if no dispatch tags
     const isFirst = this.primaryModel === 'claude' ? this.isFirstClaude : this.isFirstCodex;
 
     // When resuming a session, give Claude context of the previous conversation
     let modelInput = text;
-    if (isFirst && this.conversationHistory.length > 0 && this.primaryModel === 'claude') {
-      const ctx = this.conversationHistory.slice(-10).map(t =>
+    if (isFirst && this.conversationHistory.length > 0) {
+      // Inject conversation history so the model has full context
+      // (happens on first turn, after model switch, or session resume)
+      const ctx = this.conversationHistory.slice(-14).map(t =>
         `[${t.role}]: ${t.content.slice(0, 500)}`
       ).join('\n\n');
-      modelInput = `[Resumed session — previous conversation for context]\n${ctx}\n\n[Current message]\n${text}`;
+      modelInput = `[Conversation history for context]\n${ctx}\n\n[Current message]\n${text}`;
     }
 
     try {
@@ -1544,15 +1602,20 @@ export async function exec(dictionary) {
 // ── Direct invocation ────────────────────────────────────────────────────────
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const args = parseArgs(process.argv.slice(2));
-  let systemPrompt;
+  let systemPrompt, systemPromptLite;
   try {
     systemPrompt = readFileSync(SYSTEM_PROMPT_PATH, 'utf8');
   } catch (err) {
     console.error(`[keen] Cannot read orchestrator prompt: ${err.message}`);
     process.exit(1);
   }
+  try {
+    systemPromptLite = readFileSync(SYSTEM_PROMPT_LITE_PATH, 'utf8');
+  } catch {
+    systemPromptLite = systemPrompt; // fallback to full if lite doesn't exist
+  }
 
-  const cli = new KeenCLI({ workdir: args.workdir, systemPrompt });
+  const cli = new KeenCLI({ workdir: args.workdir, systemPrompt, systemPromptLite });
 
   // Resume a previous session if --resume was passed
   if (args.resumeId && args.resumeId !== '__picker__') {
