@@ -65,6 +65,7 @@ const SLASH_COMMANDS = [
   { cmd: '/help',     args: '',               desc: 'Show available commands' },
   { cmd: '/status',   args: '',               desc: 'Show session status' },
   { cmd: '/save',     args: '[path]',         desc: 'Save conversation to file' },
+  { cmd: '/verbose',  args: '',               desc: 'Toggle tool use + thinking visibility (Ctrl+T)' },
   { cmd: '/pipeline', args: '',               desc: 'Escalate to full orchestrator mode' },
   { cmd: '/lite',     args: '',               desc: 'Switch back to fast/lite mode' },
 ];
@@ -170,17 +171,15 @@ function runTurn(stdinContent, opts) {
   return runClaudeTurn(stdinContent, opts);
 }
 
-function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, procRef, modelDef }) {
+function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, onVerbose, procRef, modelDef }) {
   return new Promise((res, rej) => {
-    const args = ['-p'];
+    const args = ['-p', '--output-format', 'stream-json', '--verbose'];
     if (!isFirst) args.push('--continue');
     args.push('--dangerously-skip-permissions');
     // Use the specific Claude model selected by the user
     if (modelDef?.flag) args.push('--model', modelDef.flag);
 
     // Pass system prompt via temp file to avoid Windows cmd.exe ~8KB argument limit.
-    // --append-system-prompt-file preserves Claude's built-in prompt (including MCP tools)
-    // while adding our orchestrator instructions on top.
     let promptFile = null;
     if (isFirst && systemPrompt) {
       const tmpDir = mkdtempSync(join(tmpdir(), 'keen-'));
@@ -189,8 +188,7 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, p
       args.push('--append-system-prompt-file', promptFile);
     }
 
-    // On Windows, spawn via shell to find claude in PATH. Use single command string
-    // to avoid Node v22+ DEP0190 deprecation warning about unescaped args with shell.
+    // On Windows, spawn via shell to find claude in PATH.
     const proc = IS_WINDOWS
       ? spawn((['claude', ...args].map(a => a.includes(' ') ? `"${a}"` : a)).join(' '), {
           cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], shell: true, env: { ...process.env }
@@ -205,15 +203,62 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, p
     proc.stdin.end();
     proc.stdin.on('error', () => {});
 
-    let fullOutput = '';
+    let fullText = '';  // just the text content (for history/tags)
+    let ndjsonBuf = '';
+
     proc.stdout.on('data', (chunk) => {
-      const text = chunk.toString();
-      fullOutput += text;
-      if (onData) onData(text);
+      ndjsonBuf += chunk.toString();
+      let nlIdx;
+      while ((nlIdx = ndjsonBuf.indexOf('\n')) !== -1) {
+        const line = ndjsonBuf.slice(0, nlIdx).trim();
+        ndjsonBuf = ndjsonBuf.slice(nlIdx + 1);
+        if (!line) continue;
+        try {
+          const evt = JSON.parse(line);
+          // Assistant text
+          if (evt.type === 'assistant' && evt.message?.content) {
+            for (const block of evt.message.content) {
+              if (block.type === 'text' && block.text) {
+                fullText += block.text;
+                if (onData) onData(block.text);
+              }
+              // Tool use — show what tool and preview of input
+              if (block.type === 'tool_use' && onVerbose) {
+                const name = block.name || 'unknown';
+                const input = block.input || {};
+                let preview = '';
+                if (input.command) preview = input.command;
+                else if (input.file_path) preview = input.file_path;
+                else if (input.pattern) preview = input.pattern;
+                else if (input.prompt) preview = input.prompt.slice(0, 80);
+                else preview = JSON.stringify(input).slice(0, 80);
+                onVerbose('tool_use', name, preview);
+              }
+            }
+          }
+          // Tool result
+          if (evt.type === 'tool_result' && onVerbose) {
+            const out = (evt.content || '').toString().slice(0, 120);
+            onVerbose('tool_result', '', out);
+          }
+          // Result — turn complete
+          if (evt.type === 'result') {
+            // result.result contains the final text if we missed streaming
+            if (!fullText && evt.result) {
+              fullText = evt.result;
+              if (onData) onData(evt.result);
+            }
+          }
+        } catch {
+          // Not valid JSON — might be raw text in some edge case
+          if (line && onData) { fullText += line; onData(line); }
+        }
+      }
     });
+
     proc.stderr.on('data', () => {});
     proc.on('error', rej);
-    proc.on('exit', (code) => res({ code: code ?? 0, output: fullOutput }));
+    proc.on('exit', (code) => res({ code: code ?? 0, output: fullText }));
   });
 }
 
@@ -331,6 +376,7 @@ class KeenCLI {
     // ── Model state ──────────────────────────────────────────────
     this.primaryModel = 'claude';       // 'claude' or 'codex' (provider)
     this.activeModelKey = 'sonnet';     // key into MODELS registry
+    this._verbose = false;              // show tool use + thinking (Ctrl+T toggle)
     this.isFirstClaude = true;
     this.isFirstCodex = true;
     this.conversationHistory = [];      // shared across both models
@@ -478,8 +524,8 @@ class KeenCLI {
         this.w(`  ${suggestions}  ${a.dim('Tab')}`);
       } else {
         this.w(
-          a.dim('  \u21B5 send \u00b7 ^C cancel \u00b7 ') +
-          mc(`/model ${this.primaryModel}`) +
+          a.dim('  \u21B5 send \u00b7 ^C cancel \u00b7 ^T verbose') +
+          (this._verbose ? a.magenta(' on') : '') +
           a.dim(' \u00b7 /help')
         );
       }
@@ -646,6 +692,7 @@ class KeenCLI {
       this.scrollWrite('\n' + a.magenta(a.bold('Keyboard')) + '\n');
       this.scrollWrite(`  ${a.cyan('Ctrl+L'.padEnd(24))} ${a.dim('Clear screen')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+C'.padEnd(24))} ${a.dim('Cancel turn / Exit')}\n`);
+      this.scrollWrite(`  ${a.cyan('Ctrl+T'.padEnd(24))} ${a.dim('Toggle verbose (show tool use + thinking)')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+U'.padEnd(24))} ${a.dim('Clear input line')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+W'.padEnd(24))} ${a.dim('Delete word backward')}\n`);
       this.scrollWrite(`  ${a.cyan('\u2191\u2193 arrows'.padEnd(24))} ${a.dim('History navigation')}\n`);
@@ -742,6 +789,15 @@ class KeenCLI {
       this.isFirstClaude = true;
       this.isFirstCodex = true;
       this.scrollWrite(a.green('New session started.\n'));
+      this.drawBottom();
+      return;
+    }
+
+    if (cmd === '/verbose') {
+      this._verbose = !this._verbose;
+      this.scrollWrite(this._verbose
+        ? a.magenta('\u2731 Verbose ON — showing tool use + thinking (Ctrl+T to toggle)\n')
+        : a.dim('\u2731 Verbose OFF\n'));
       this.drawBottom();
       return;
     }
@@ -1309,10 +1365,17 @@ class KeenCLI {
     // ── Direct spawn detection: "ask codex to X", "make claude do X", etc. ──
     const lowerText = text.toLowerCase();
     const spawnPatterns = [
+      // "ask codex to say hi", "make codex say hi"
       { rx: /(?:ask|tell|make|have|call|use)\s+codex\s+(?:to\s+)?(.+)/i, cli: 'codex' },
       { rx: /(?:ask|tell|make|have|call|use)\s+claude\s+(?:to\s+)?(.+)/i, cli: 'claude' },
+      // "codex, say hi" / "codex: say hi"
       { rx: /codex[,:]\s*(.+)/i, cli: 'codex' },
       { rx: /claude[,:]\s*(.+)/i, cli: 'claude' },
+      // "make say hi codex" / "say hi with codex" (codex/claude at end)
+      { rx: /(.+?)\s+(?:with|using|via|in|on)\s+codex\s*$/i, cli: 'codex' },
+      { rx: /(.+?)\s+(?:with|using|via|in|on)\s+claude\s*$/i, cli: 'claude' },
+      { rx: /(?:make|let)\s+(.+?)\s+codex\s*$/i, cli: 'codex' },
+      { rx: /(?:make|let)\s+(.+?)\s+claude\s*$/i, cli: 'claude' },
     ];
     for (const { rx, cli } of spawnPatterns) {
       const m = text.match(rx);
@@ -1389,7 +1452,17 @@ class KeenCLI {
         conversationHistory: this.conversationHistory,
         procRef: this._primaryProcRef,
         onData: onDataBuffer,
-        modelDef
+        modelDef,
+        onVerbose: this._verbose ? (type, name, preview) => {
+          this._clearSpinnerLine();
+          if (type === 'tool_use') {
+            this.scrollWrite(a.dim(`  \u25B6 ${a.magenta(name)} `) + a.dim(preview) + '\n');
+          } else if (type === 'tool_result') {
+            const short = preview.split('\n')[0].slice(0, 100);
+            this.scrollWrite(a.dim(`    \u2514 ${short}`) + '\n');
+          }
+          this.drawBottom();
+        } : null
       });
 
       // Update isFirst for the primary model
@@ -1530,8 +1603,13 @@ class KeenCLI {
       process.exit(0);
     }
 
-    // Ctrl+T — reserved for future use
-    if (key === '\x14') return;
+    // Ctrl+T — toggle verbose mode (show tool use + thinking)
+    if (key === '\x14') {
+      this._verbose = !this._verbose;
+      this.scrollWrite(a.dim(`  [verbose: ${this._verbose ? 'on' : 'off'}]\n`));
+      this.drawBottom();
+      return;
+    }
 
     // Mouse wheel scroll (SGR mode) — works even while model is generating
     const sgrMouseMatch = key.match(/\x1b\[<(\d+);\d+;\d+[Mm]/);
