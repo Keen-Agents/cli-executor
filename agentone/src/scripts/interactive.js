@@ -156,7 +156,7 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, p
     if (!isFirst) args.push('--continue');
     args.push('--dangerously-skip-permissions');
     // Lite mode uses Sonnet for fast responses (~2s vs ~8s Opus)
-    if (liteModel) args.push('--model', liteModel);
+    if (liteModel) args.push('--model', 'sonnet');
 
     // Pass system prompt via temp file to avoid Windows cmd.exe ~8KB argument limit.
     // --append-system-prompt-file preserves Claude's built-in prompt (including MCP tools)
@@ -194,13 +194,20 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, p
   });
 }
 
-function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData, procRef }) {
+const CODEX_IDENTITY = `You are **Codex** (OpenAI, GPT-5.4), part of the **Keen Agents** dual-model REPL.
+Your partner is **Claude** (Anthropic) — the user switches between you with /model.
+You both share the same conversation history. Be concise and direct.`;
+
+function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData, procRef, liteModel }) {
   return new Promise((res, rej) => {
+    // Prepend Codex identity to the system prompt so it knows who it is
+    const codexPrompt = CODEX_IDENTITY + '\n\n' + systemPrompt;
+
     let fullPrompt;
     if (!conversationHistory || conversationHistory.length === 0) {
-      fullPrompt = systemPrompt + '\n\n---\n\nUser message: ' + stdinContent;
+      fullPrompt = codexPrompt + '\n\n---\n\nUser message: ' + stdinContent;
     } else {
-      fullPrompt = systemPrompt + '\n\n---\n\nConversation so far:\n';
+      fullPrompt = codexPrompt + '\n\n---\n\nConversation so far:\n';
       for (const turn of conversationHistory) {
         fullPrompt += `\n[${turn.role}]: ${turn.content}\n`;
       }
@@ -208,7 +215,10 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
       fullPrompt += '\nContinue the conversation. Respond to the latest user message.';
     }
 
-    const args = ['exec', '-'];
+    const args = ['exec'];
+    // Lite mode: use low reasoning effort for fast responses (~2s vs ~13s)
+    if (liteModel) args.push('-c', 'model_reasoning_effort="low"');
+    args.push('-');
     const proc = spawn('codex', args, {
       cwd: workdir,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -1271,7 +1281,8 @@ class KeenCLI {
       };
 
       // Lite mode + Claude uses Sonnet for fast responses (~2s vs ~8s Opus)
-      const liteModel = (!this._isEscalated && this.primaryModel === 'claude') ? 'sonnet' : null;
+      // Lite mode: Claude uses Sonnet (~2s), Codex uses low reasoning (~2s)
+      const liteModel = !this._isEscalated ? 'lite' : null;
 
       const result = await runTurn(modelInput, {
         workdir: this.workdir,
