@@ -172,7 +172,7 @@ function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, p
     const proc = spawn('claude', args, {
       cwd: workdir,
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: true,
+      shell: IS_WINDOWS,  // Windows needs shell to find claude in PATH; Linux doesn't
       env: { ...process.env }
     });
 
@@ -212,7 +212,7 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
     const proc = spawn('codex', args, {
       cwd: workdir,
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: true,
+      shell: IS_WINDOWS,
       env: { ...process.env }
     });
 
