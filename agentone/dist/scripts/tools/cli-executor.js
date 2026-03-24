@@ -2,13 +2,17 @@
 // Allows agents to spawn and interact with CLI tools (claude, codex, etc.)
 // on the local PC via the bridge wrapper's session-based API.
 
-const BRIDGE_URL = 'https://pc.tail7c837c.ts.net';
-const API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
+function resolveBridge(ctx) {
+    return {
+        url: ctx.bridgeUrl || 'http://localhost:3222',
+        token: ctx.apiToken || ''
+    };
+}
 
-async function bridgeCall(endpoint, body) {
-    const response = await fetch(`${BRIDGE_URL}${endpoint}?token=${API_TOKEN}`, {
+async function bridgeCall(endpoint, body, config) {
+    const response = await fetch(`${config.url}${endpoint}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-token': API_TOKEN, 'Authorization': `Bearer ${API_TOKEN}` },
+        headers: { 'Content-Type': 'application/json', 'x-api-token': config.token, 'Authorization': `Bearer ${config.token}` },
         body: JSON.stringify(body)
     });
     if (!response.ok) {
@@ -20,6 +24,7 @@ async function bridgeCall(endpoint, body) {
 
 export async function exec() {
     const ctx = dictionary.TOOL_CONTEXT || dictionary;
+    const bridge = resolveBridge(ctx);
     const mode = ctx.mode || 'execute';
     const cli = ctx.cli;
     const prompt = ctx.prompt;
@@ -39,7 +44,43 @@ export async function exec() {
     };
 
     try {
-        if (mode === 'execute') {
+        if (mode === 'health-check') {
+            try {
+                const response = await fetch(`${bridge.url}/api/health`, {
+                    method: 'GET',
+                    headers: { 'x-api-token': bridge.token, 'Authorization': `Bearer ${bridge.token}` }
+                });
+                if (response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    dictionary.response = JSON.stringify({
+                        status: 'connected',
+                        bridge: bridge.url,
+                        hostname: data.hostname || null,
+                        platform: data.platform || null,
+                        message: 'Bridge is reachable. Full pipeline available.'
+                    });
+                } else {
+                    dictionary.response = JSON.stringify({
+                        status: 'error',
+                        bridge: bridge.url,
+                        httpStatus: response.status,
+                        message: `Bridge returned HTTP ${response.status}. Check token or restart bridge.`
+                    });
+                }
+            } catch (err) {
+                const msg = err.message || '';
+                const isTimeout = err.name === 'AbortError';
+                dictionary.response = JSON.stringify({
+                    status: 'disconnected',
+                    bridge: bridge.url,
+                    reason: isTimeout ? 'timeout' : 'connection_refused',
+                    message: 'Bridge is not reachable. Entering cloud-only mode.'
+                });
+            }
+            return;
+        }
+
+        else if (mode === 'execute') {
             if (!cli) throw new Error("Missing 'cli' parameter (e.g. 'claude')");
 
             let cliArgs = [];
@@ -63,7 +104,7 @@ export async function exec() {
 
             const spawnResult = await bridgeCall('/api/cli/spawn', {
                 cli, args: cliArgs, cwd, closeStdin: true, metadata
-            });
+            }, bridge);
 
             const POLL_INTERVAL = 3000;
             const startTime = Date.now();
@@ -73,7 +114,7 @@ export async function exec() {
                 pollResult = await bridgeCall('/api/cli/poll', {
                     sessionId: spawnResult.sessionId,
                     interval: POLL_INTERVAL
-                });
+                }, bridge);
 
                 if (!pollResult.running) break;
 
@@ -82,19 +123,19 @@ export async function exec() {
                 if (partialOut.includes('[human-gate] Pipeline paused')) {
                     const runIdMatch = partialOut.match(/Starting run (run-[^\s]+)/);
                     const runId = runIdMatch ? runIdMatch[1] : 'unknown';
-                    dictionary.response = `PIPELINE_PAUSED_FOR_REVIEW\n\nThe pipeline is paused at the human-gate stage waiting for your approval.\nRun ID: ${runId}\nSession ID: ${spawnResult.sessionId}\n\nPlease ask the user to approve, revise, or reject.\nTo approve, call CLI Executor with:\n  mode: execute\n  cli: node\n  args: ["-e", "fetch('http://localhost:3222/api/pipeline/decide',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'${runId}',decision:'approve',comments:''})}).then(r=>r.json()).then(j=>console.log(JSON.stringify(j))).catch(e=>console.error(e))"]\n\nAfter approving, resume the pipeline by calling CLI Executor with:\n  mode: wait\n  sessionId: ${spawnResult.sessionId}\n  timeout: 900000`;
+                    dictionary.response = `PIPELINE_PAUSED_FOR_REVIEW\n\nThe pipeline is paused at the human-gate stage waiting for your approval.\nRun ID: ${runId}\nSession ID: ${spawnResult.sessionId}\n\nPlease ask the user to approve, revise, or reject.\nTo approve, call CLI Executor with:\n  mode: execute\n  cli: node\n  args: ["-e", "fetch('${bridge.url}/api/pipeline/decide',{method:'POST',headers:{'Content-Type':'application/json','x-api-token':'${bridge.token}'},body:JSON.stringify({runId:'${runId}',decision:'approve',comments:''})}).then(r=>r.json()).then(j=>console.log(JSON.stringify(j))).catch(e=>console.error(e))"]\n\nAfter approving, resume the pipeline by calling CLI Executor with:\n  mode: wait\n  sessionId: ${spawnResult.sessionId}\n  timeout: 900000`;
                     return;
                 }
 
                 const elapsed = Date.now() - startTime;
                 if (elapsed > timeout) {
-                    await bridgeCall('/api/cli/kill', { sessionId: spawnResult.sessionId }).catch(() => {});
+                    await bridgeCall('/api/cli/kill', { sessionId: spawnResult.sessionId }, bridge).catch(() => {});
                     dictionary.response = `CLI timed out after ${Math.round(timeout / 1000)}s.\n\nPartial output:\n${pollResult.stdout || '(no output)'}`;
                     return;
                 }
             }
 
-            await bridgeCall('/api/cli/cleanup', {}).catch(() => {});
+            await bridgeCall('/api/cli/cleanup', {}, bridge).catch(() => {});
 
             let output = pollResult.stdout || '';
 
@@ -126,7 +167,7 @@ export async function exec() {
                 }
             }
 
-            const result = await bridgeCall('/api/cli/spawn', { cli, args: cliArgs, cwd, metadata });
+            const result = await bridgeCall('/api/cli/spawn', { cli, args: cliArgs, cwd, metadata }, bridge);
 
             dictionary.response = JSON.stringify({
                 sessionId: result.sessionId,
@@ -140,14 +181,14 @@ export async function exec() {
             if (!sessionId) throw new Error("Missing 'sessionId' for send mode");
             if (!input) throw new Error("Missing 'input' for send mode");
 
-            await bridgeCall('/api/cli/send', { sessionId, input });
+            await bridgeCall('/api/cli/send', { sessionId, input }, bridge);
             dictionary.response = `Input sent to session ${sessionId}`;
         }
 
         else if (mode === 'read') {
             if (!sessionId) throw new Error("Missing 'sessionId' for read mode");
 
-            const result = await bridgeCall('/api/cli/output', { sessionId, full: ctx.full || false });
+            const result = await bridgeCall('/api/cli/output', { sessionId, full: ctx.full || false }, bridge);
 
             let output = result.stdout || '';
             if (result.stderr) output += `\n[STDERR]\n${result.stderr}`;
@@ -164,7 +205,7 @@ export async function exec() {
             let pollResult;
 
             while (true) {
-                pollResult = await bridgeCall('/api/cli/poll', { sessionId, interval: POLL_INTERVAL });
+                pollResult = await bridgeCall('/api/cli/poll', { sessionId, interval: POLL_INTERVAL }, bridge);
                 if (!pollResult.running) break;
 
                 const elapsed = Date.now() - startTime;
@@ -185,7 +226,7 @@ export async function exec() {
 
         else if (mode === 'kill') {
             if (!sessionId) throw new Error("Missing 'sessionId' for kill mode");
-            await bridgeCall('/api/cli/kill', { sessionId });
+            await bridgeCall('/api/cli/kill', { sessionId }, bridge);
             dictionary.response = `Session ${sessionId} killed`;
         }
 
@@ -194,6 +235,17 @@ export async function exec() {
         }
 
     } catch (error) {
-        dictionary.response = `CLI Executor Error: ${error.message}`;
+        const msg = error.message || '';
+        const isConnectionError = msg.includes('ECONNREFUSED') || msg.includes('fetch failed')
+            || msg.includes('ETIMEDOUT') || msg.includes('ENOTFOUND') || msg.includes('AbortError');
+        if (isConnectionError) {
+            dictionary.response = JSON.stringify({
+                error: 'BRIDGE_DISCONNECTED',
+                message: `Bridge connection lost: ${msg}`,
+                suggestion: 'The bridge is not reachable. Switch to cloud-only mode or help the user reconnect.'
+            });
+        } else {
+            dictionary.response = `CLI Executor Error: ${msg}`;
+        }
     }
 }

@@ -9,7 +9,15 @@ import { chromium } from 'playwright';
 
 const DEFAULT_PORT = 3222;
 let PORT = parseInt(process.argv[2] || process.env.BRIDGE_PORT) || DEFAULT_PORT;
-const API_TOKEN = 'b3d6d5c1a50155e207c503102f7bc610';
+const API_TOKEN = (() => {
+    if (process.env.AGENTONE_API_TOKEN) return process.env.AGENTONE_API_TOKEN;
+    if (process.env.BRIDGE_API_TOKEN) return process.env.BRIDGE_API_TOKEN;
+    try {
+        const configPath = path.join(os.homedir(), '.agentone', 'config.json');
+        return JSON.parse(fsSync.readFileSync(configPath, 'utf8')).token;
+    } catch {}
+    return 'b3d6d5c1a50155e207c503102f7bc610'; // legacy fallback
+})();
 let BASE_DIR = process.cwd();
 const IS_WINDOWS = process.platform === 'win32';
 
@@ -1065,7 +1073,7 @@ refreshData();
 const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, x-api-token, Authorization',
     'Content-Type': 'application/json'
 };
 
@@ -1097,11 +1105,14 @@ const server = http.createServer(async (req, res) => {
     const urlParams = new URL(req.url + (req.url.includes('?') ? '' : '?'), `http://${req.headers.host}`).searchParams;
     const authToken = authHeader || urlParams.get('token');
     if (authToken !== API_TOKEN) {
-        console.log(`[${new Date().toISOString()}] AUTH-SKIP: ${method} ${normalizedUrl} | headers: ${JSON.stringify(req.headers).substring(0, 200)}`);
-        // Allow request anyway — Funnel URL is protection enough
+        console.log(`[${new Date().toISOString()}] AUTH-REJECT: ${method} ${normalizedUrl} from ${clientIp}`);
+        return done(401, { error: 'Unauthorized — invalid or missing API token' });
     }
 
     if (method === 'GET') {
+        if (normalizedUrl === '/api/health') {
+            return done(200, { ok: true, hostname: os.hostname(), platform: process.platform, uptime: process.uptime() });
+        }
         if (normalizedUrl === '/api/config') {
             return done(200, { baseDir: BASE_DIR });
         }

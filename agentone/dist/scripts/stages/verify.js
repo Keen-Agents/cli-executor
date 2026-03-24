@@ -278,7 +278,8 @@ export async function run(context) {
             cwd,
             timeout: TIMEOUTS.verify,
             label: `verify-ai-review-${intake.key || context.ticketKey || 'unknown'}`,
-            metadata: { stage: STAGE_NAME, mode: 'ai-review', runId: context.state.runId }
+            metadata: { stage: STAGE_NAME, mode: 'ai-review', runId: context.state.runId },
+            signal: context.signal
           });
 
           if (context.costTracker) {

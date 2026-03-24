@@ -4,10 +4,12 @@ import { fileURLToPath } from 'url';
 import { runAgent } from '../lib/agent-runner.js';
 import { CostTracker } from '../lib/cost-tracker.js';
 import { assembleContext } from '../lib/context-assembler.js';
-import { TIMEOUTS } from '../pipeline-config.js';
+import { TIMEOUTS, DEFAULTS } from '../pipeline-config.js';
 
 const STAGE_NAME = 'cross-critique';
 const COMPLETED_REGEX = /<COMPLETED>([\s\S]*?)<\/COMPLETED>/;
+const CONVERGED_SIGNAL = '<CONVERGED>';
+const DEBATE_SAFETY_CAP = DEFAULTS.debateSafetyCap ?? 10;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -27,8 +29,8 @@ const CHANGE_RATIO_THRESHOLD = 0.10;
 const MAX_PLAN_CHARS = 12000;
 const MAX_CONTEXT_CHARS = 4000;
 const MAX_CRITIQUE_CHARS = 6000;
-const MAX_PRIOR_CRITIQUES = 2;
-const MAX_PRIOR_BLOCK_CHARS = 5000;
+const MAX_PRIOR_CRITIQUES = 50;
+const MAX_PRIOR_BLOCK_CHARS = 30000;
 
 function asText(value) {
   if (typeof value === 'string') {
@@ -92,13 +94,58 @@ function detectCritiqueConvergence(critiqueText) {
   return false;
 }
 
-function buildRevisionPrompt({ ticket, currentPlan, critique, round, maxRounds, priorCritiques }) {
+function buildSynthesisPrompt({ ticket, rounds, initialPlan }) {
+  const parts = [
+    'You are a senior architect producing the FINAL implementation plan.',
+    'A debate between a planner and a critic ran for multiple rounds. Each round the planner revised the plan and the critic found new issues.',
+    'The debate did NOT converge — the revisions kept oscillating, fixing some issues while re-introducing others.',
+    '',
+    'Your job: read ALL revisions and ALL critiques, then produce ONE definitive plan that:',
+    '1. Takes the BEST resolution for each critique point across ALL rounds',
+    '2. Does NOT regress on any issue that was properly solved in ANY round',
+    '3. Does NOT include speculative fixes that no critique actually asked for',
+    '4. Resolves contradictions between rounds by picking the technically stronger answer',
+    '',
+    `Ticket: ${asText(ticket?.key)}`,
+    `Summary: ${asText(ticket?.summary)}`,
+    '',
+    '=== INITIAL PLAN (before debate) ===',
+    initialPlan,
+    '',
+  ];
+
+  for (const r of rounds) {
+    parts.push(`=== ROUND ${r.round} CRITIQUE (${r.critiqueIssueCount || '?'} issues, changeRatio: ${r.changeRatio || '?'}) ===`);
+    parts.push(r.critique);
+    parts.push('');
+    if (r.revisedPlan) {
+      parts.push(`=== ROUND ${r.round} REVISION ===`);
+      parts.push(r.revisedPlan);
+      parts.push('');
+    }
+  }
+
+  parts.push(
+    '',
+    'Now produce the final consolidated plan. Take the best from every round. Do not leave any properly-solved critique unaddressed.',
+    '',
+    'Return the final plan wrapped in tags:',
+    '<COMPLETED>',
+    '[Final consolidated plan]',
+    '</COMPLETED>'
+  );
+
+  return parts.join('\n');
+}
+
+function buildRevisionPrompt({ ticket, currentPlan, critique, round, maxRounds, isAutoMode, priorCritiques }) {
+  const roundLabel = isAutoMode ? `${round} (auto mode — no fixed limit)` : `${round} of ${maxRounds}`;
   const parts = [
     'You are the original planner revising an implementation plan based on critique.',
     '',
     `Ticket: ${asText(ticket?.key)}`,
     `Summary: ${asText(ticket?.summary)}`,
-    `Revision Round: ${round} of ${maxRounds}`,
+    `Revision Round: ${roundLabel}`,
     '',
     'Current Plan:',
     currentPlan,
@@ -119,8 +166,10 @@ function buildRevisionPrompt({ ticket, currentPlan, critique, round, maxRounds, 
     critique,
     '',
     'Revise the plan to address the latest critique while keeping it practical and complete.',
-    'Do not re-introduce issues that prior rounds already resolved.',
-    'If the critique is already addressed, keep the plan unchanged and state that briefly inside the plan.',
+    'CRITICAL: You have the FULL critique history above. Do NOT re-introduce issues that prior rounds already solved.',
+    'Before changing any section, check if a prior critique raised and resolved the same point — keep the existing fix.',
+    'If the latest critique contradicts a prior resolution, pick the technically stronger answer and explain why.',
+    'If the critique is already addressed in the current plan, keep the plan unchanged and state that briefly.',
     '',
     'Return only the revised plan wrapped in tags:',
     '<COMPLETED>',
@@ -168,7 +217,9 @@ export async function run(context) {
     }
 
     const adversarial = Boolean(context?.config?.adversarialCritique);
-    const baseMaxRounds = Number(context?.config?.maxConvergenceRounds ?? 0);
+    const rawRounds = context?.config?.maxConvergenceRounds ?? DEFAULTS.maxConvergenceRounds ?? 'auto';
+    const isAutoMode = rawRounds === 'auto' || rawRounds === -1;
+    const baseMaxRounds = isAutoMode ? DEBATE_SAFETY_CAP : Number(rawRounds);
     const maxRounds = adversarial ? Math.max(baseMaxRounds, 4) : baseMaxRounds;
     const changeRatioThreshold = adversarial ? 0.05 : CHANGE_RATIO_THRESHOLD;
     const initialPlan = asText(planOutput.plan).trim();
@@ -191,16 +242,54 @@ export async function run(context) {
 
     const templatePath = adversarial ? ADVERSARIAL_PROMPT_TEMPLATE_PATH : CRITIQUE_PROMPT_TEMPLATE_PATH;
     const critiqueTemplate = readFileSync(templatePath, 'utf8');
-    if (adversarial) {
-      context.logger?.log({ type: 'GATE_CHECK', stage: STAGE_NAME, gate: 'adversarial_mode', maxRounds, changeRatioThreshold });
-    }
+
+    context.logger?.log({
+      type: 'GATE_CHECK',
+      stage: STAGE_NAME,
+      gate: 'critique_start',
+      mode: isAutoMode ? 'auto' : 'fixed',
+      adversarial,
+      maxRounds,
+      safetyCap: isAutoMode ? DEBATE_SAFETY_CAP : undefined,
+      changeRatioThreshold
+    });
+
+    // ── Resume support: check for completed round checkpoints ──
     const rounds = [];
     const priorCritiques = [];
     let currentPlan = initialPlan;
     let converged = false;
     let convergenceReason = null;
 
-    for (let round = 1; round <= maxRounds; round += 1) {
+    for (let r = 1; r <= maxRounds; r++) {
+      const roundCheckpoint = context.state.getStageOutput(`cross-critique-round-${r}`);
+      if (roundCheckpoint) {
+        rounds.push(roundCheckpoint);
+        priorCritiques.push({ round: r, text: roundCheckpoint.critique });
+        if (roundCheckpoint.revisedPlan) {
+          currentPlan = roundCheckpoint.revisedPlan;
+        }
+        if (roundCheckpoint.converged) {
+          converged = true;
+          convergenceReason = roundCheckpoint.convergenceReason || 'resumed';
+        }
+      } else {
+        break;
+      }
+    }
+
+    if (rounds.length > 0 && !converged) {
+      context.logger?.log({
+        type: 'GATE_CHECK',
+        stage: STAGE_NAME,
+        gate: 'partial_resume',
+        completedRounds: rounds.length
+      });
+    }
+
+    for (let round = rounds.length + 1; round <= maxRounds && !converged; round += 1) {
+      if (context.signal?.aborted) break;
+
       const recentPriorCritiques = priorCritiques
         .slice(-MAX_PRIOR_CRITIQUES)
         .map(p => ({ ...p, text: trimToChars(p.text, MAX_CRITIQUE_CHARS) }));
@@ -217,9 +306,23 @@ export async function run(context) {
         '{{TICKET_SUMMARY}}': asText(intakeOutput.summary),
         '{{PLAN}}': trimToChars(currentPlan, MAX_PLAN_CHARS),
         '{{ROUND}}': String(round),
-        '{{MAX_ROUNDS}}': String(maxRounds),
+        '{{MAX_ROUNDS}}': isAutoMode ? 'unlimited (auto)' : String(maxRounds),
         '{{PRIOR_CRITIQUE}}': priorCritiqueBlock
       });
+
+      // In auto mode, append convergence instructions to the prompt
+      if (isAutoMode) {
+        critiquePrompt += `\n\n## Convergence Rule (AUTO MODE)\n\n` +
+          `This critique loop has NO fixed number of rounds. You keep critiquing until the plan is genuinely solid.\n` +
+          `There is no pressure to converge early — take as many rounds as needed.\n\n` +
+          `When you are GENUINELY satisfied that the plan has no remaining substantive issues, include ${CONVERGED_SIGNAL} ` +
+          `at the start of your response followed by a brief explanation of why convergence is appropriate.\n\n` +
+          `Do NOT converge just because several rounds have passed. Only converge when:\n` +
+          `- All prior critique points have been adequately addressed\n` +
+          `- No new substantive issues remain\n` +
+          `- The plan is implementable as-is\n\n` +
+          `If ANY real issues remain, keep critiquing. Do NOT agree politely.`;
+      }
 
       const contextBlock = assembleContext(context.state, 'cross-critique', MAX_CONTEXT_CHARS, { otherPlan: currentPlan, priorCritique: priorCritiqueBlock });
       if (contextBlock) {
@@ -232,7 +335,7 @@ export async function run(context) {
       }
 
       const critiqueResult = await runAgent({
-        cli: 'claude',
+        cli: 'codex',
         prompt: critiquePrompt,
         cwd: context.workDir || undefined,
         timeout: TIMEOUTS['cross-critique'],
@@ -246,7 +349,8 @@ export async function run(context) {
           profile: classifyOutput.profile,
           runId: context.state.runId
         },
-        extractRegex: COMPLETED_REGEX
+        extractRegex: COMPLETED_REGEX,
+        signal: context.signal
       });
 
       if (context.costTracker) {
@@ -263,8 +367,9 @@ export async function run(context) {
 
       const critiqueText = critiqueResult.content.trim();
 
-      // Check critique-side convergence: critic says plan is solid
-      const critiqueSignalsConverged = detectCritiqueConvergence(critiqueText);
+      // Check convergence: explicit <CONVERGED> signal OR phrase detection
+      const hasConvergedSignal = critiqueText.includes(CONVERGED_SIGNAL);
+      const critiqueSignalsConverged = hasConvergedSignal || detectCritiqueConvergence(critiqueText);
 
       let revisedPlan = '';
       let revisionSessionId = null;
@@ -274,14 +379,16 @@ export async function run(context) {
       if (critiqueSignalsConverged) {
         // Critic says no significant issues — skip revision, converge
         converged = true;
-        convergenceReason = 'critique_approved';
+        convergenceReason = hasConvergedSignal ? 'converged_signal' : 'critique_approved';
         context.logger?.log({
           type: 'GATE_CHECK',
           stage: STAGE_NAME,
           gate: 'convergence',
           round,
-          method: 'critique_approved',
-          message: 'Critic indicated plan is solid; skipping revision.'
+          method: convergenceReason,
+          message: hasConvergedSignal
+            ? 'Critic declared <CONVERGED>; plan accepted.'
+            : 'Critic indicated plan is solid; skipping revision.'
         });
       } else {
         // Critic has issues — run revision
@@ -291,6 +398,7 @@ export async function run(context) {
           critique: trimToChars(critiqueText, MAX_CRITIQUE_CHARS),
           round,
           maxRounds,
+          isAutoMode,
           priorCritiques: recentPriorCritiques
         });
 
@@ -309,7 +417,9 @@ export async function run(context) {
             profile: classifyOutput.profile,
             runId: context.state.runId
           },
-          extractRegex: COMPLETED_REGEX
+          extraArgs: ['--allowedTools', 'WebSearch,WebFetch,Task'],
+          extractRegex: COMPLETED_REGEX,
+          signal: context.signal
         });
 
         if (context.costTracker) {
@@ -350,7 +460,10 @@ export async function run(context) {
 
       priorCritiques.push({ round, text: critiqueText });
 
-      rounds.push({
+      // Count numbered issues in critique (e.g. "1.", "2.", etc.)
+      const critiqueIssueCount = (critiqueText.match(/^\s*\d+\.\s/gm) || []).length;
+
+      const roundData = {
         round,
         critique: critiqueText,
         revisedPlan,
@@ -359,10 +472,24 @@ export async function run(context) {
         critiqueDurationMs: critiqueResult.durationMs,
         revisionDurationMs,
         critiqueSignalsConverged,
-        changeRatio
-      });
+        critiqueIssueCount,
+        changeRatio,
+        converged,
+        convergenceReason: converged ? convergenceReason : null
+      };
+      rounds.push(roundData);
+
+      // Checkpoint each round for resume support
+      context.state.checkpoint(`cross-critique-round-${round}`, roundData);
 
       if (converged) {
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: isAutoMode ? 'auto_converged' : 'converged',
+          round,
+          method: convergenceReason
+        });
         break;
       }
 
@@ -381,9 +508,90 @@ export async function run(context) {
       }
     }
 
+    if (!converged && rounds.length >= maxRounds) {
+      context.logger?.log({
+        type: 'GATE_CHECK',
+        stage: STAGE_NAME,
+        gate: isAutoMode ? 'safety_cap_reached' : 'max_rounds_reached',
+        totalRounds: rounds.length,
+        safetyCap: isAutoMode ? DEBATE_SAFETY_CAP : undefined
+      });
+    }
+
+    // ── Synthesis step: consolidate best of all rounds into final plan ──
+    let synthesizedPlan = null;
+    if (rounds.length >= 2 && !context.signal?.aborted) {
+      context.logger?.log({
+        type: 'GATE_CHECK',
+        stage: STAGE_NAME,
+        gate: 'synthesis_start',
+        totalRounds: rounds.length,
+        converged,
+        message: converged
+          ? 'Running synthesis to consolidate converged debate.'
+          : 'Debate did not converge — synthesizing best of all rounds.'
+      });
+
+      const synthesisPrompt = buildSynthesisPrompt({
+        ticket: intakeOutput,
+        rounds,
+        initialPlan
+      });
+
+      const synthesisResult = await runAgent({
+        cli: 'claude',
+        prompt: synthesisPrompt,
+        cwd: context.workDir || undefined,
+        timeout: TIMEOUTS['cross-critique'],
+        label: `cross-critique-synthesis-${asText(intakeOutput.key) || 'unknown'}`,
+        metadata: {
+          stage: STAGE_NAME,
+          mode: 'synthesis',
+          totalRounds: rounds.length,
+          converged,
+          ticketKey: intakeOutput.key,
+          runId: context.state.runId
+        },
+        extraArgs: ['--allowedTools', 'WebSearch,WebFetch,Task'],
+        extractRegex: COMPLETED_REGEX,
+        signal: context.signal
+      });
+
+      if (context.costTracker) {
+        context.costTracker.recordCall(STAGE_NAME, CostTracker.fromAgentResult(synthesisResult));
+      }
+
+      if (synthesisResult.content) {
+        synthesizedPlan = synthesisResult.content.trim();
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'synthesis_complete',
+          synthesizedPlanLength: synthesizedPlan.length,
+          message: 'Synthesis agent produced consolidated plan.'
+        });
+        context.state.checkpoint('cross-critique-synthesis', {
+          synthesizedPlan,
+          sessionId: synthesisResult.sessionId || null,
+          durationMs: synthesisResult.durationMs
+        });
+      } else {
+        context.logger?.log({
+          type: 'GATE_CHECK',
+          stage: STAGE_NAME,
+          gate: 'synthesis_failed',
+          message: 'Synthesis agent did not produce output; falling back to last revision.'
+        });
+      }
+    }
+
+    const finalPlan = synthesizedPlan || currentPlan;
+
     const output = {
       rounds,
-      finalPlan: currentPlan,
+      finalPlan,
+      synthesizedPlan: synthesizedPlan || null,
+      hasSynthesis: !!synthesizedPlan,
       totalRounds: rounds.length,
       converged,
       convergenceReason

@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { PipelineState } from './lib/state-manager.js';
 import { CostTracker } from './lib/cost-tracker.js';
 import { createLogger } from './lib/logger.js';
-import { PROFILES, TIMEOUTS, budgetThresholds, AUTO_UPGRADE } from './pipeline-config.js';
+import { PROFILES, TIMEOUTS, budgetThresholds, AUTO_UPGRADE, RESEARCH_MODES } from './pipeline-config.js';
 
 import { run as intake } from './stages/intake.js';
 import { run as classify } from './stages/classify.js';
@@ -107,7 +107,10 @@ function parseArgs(argv) {
     resume: false,
     workingDirectory: '',
     prompt: '',
-    promptFile: ''
+    promptFile: '',
+    angles: null,
+    subtasks: null,
+    researchMode: ''
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -159,6 +162,32 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--angles') {
+      try {
+        args.angles = JSON.parse(argv[i + 1] || '[]');
+      } catch {
+        throw new Error('--angles must be valid JSON: [{"label":"...", "focus":"..."}]');
+      }
+      i += 1;
+      continue;
+    }
+
+    if (arg === '--research-mode') {
+      args.researchMode = argv[i + 1] || '';
+      i += 1;
+      continue;
+    }
+
+    if (arg === '--subtasks') {
+      try {
+        args.subtasks = JSON.parse(argv[i + 1] || '[]');
+      } catch {
+        throw new Error('--subtasks must be valid JSON: [{"label":"...", "files":[], "instructions":"..."}]');
+      }
+      i += 1;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -202,9 +231,13 @@ async function runWithTimeout(stageName, timeoutMs, stageFn, context) {
     return stageFn(context);
   }
 
+  const ac = new AbortController();
+  context.signal = ac.signal;
+
   let timeoutHandle;
   const timeoutPromise = new Promise((_, reject) => {
     timeoutHandle = setTimeout(() => {
+      ac.abort();
       reject(new Error(`Stage ${stageName} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
   });
@@ -341,6 +374,14 @@ async function runPipeline(input) {
   let profileConfig = initialPlan.profileConfig;
   let stageList = initialPlan.stageList;
 
+  // Merge research mode into profile config
+  if (input.researchMode) {
+    if (!RESEARCH_MODES[input.researchMode]) {
+      throw new Error(`Invalid --research-mode: ${input.researchMode}. Valid: ${Object.keys(RESEARCH_MODES).join(', ')}`);
+    }
+    profileConfig = { ...profileConfig, researchMode: input.researchMode };
+  }
+
   if (profileName) {
     state.setProfile(profileName);
   }
@@ -362,7 +403,14 @@ async function runPipeline(input) {
     ? CostTracker.load(runDir, { soft: thresholds.warning, hard: thresholds.hard })
     : new CostTracker(runDir, { soft: thresholds.warning, hard: thresholds.hard });
 
-  console.log(`[pipeline] Starting run ${runId}`);
+  // On resume, reset pipeline status from 'failed' back to 'running'
+  if (shouldResume && (state.state.status === 'failed' || state.state.status?.startsWith('PAUSED_'))) {
+    state.state.status = 'running';
+    state.state.updatedAt = new Date().toISOString();
+    console.log(`[pipeline] Resuming run ${runId} (was: ${state.state.status})`);
+  } else {
+    console.log(`[pipeline] Starting run ${runId}`);
+  }
 
   const stageInstances = resolveStageInstances(stageList);
   let stageIndex = 0;
@@ -410,7 +458,9 @@ async function runPipeline(input) {
       stageName: instanceName,
       workDir: resolveWorkingDirectory(inputWorkingDirectory, state),
       workingDirectory: resolveWorkingDirectory(inputWorkingDirectory, state),
-      noWorktree: input.noWorktree || false
+      noWorktree: input.noWorktree || false,
+      angles: input.angles || null,
+      subtasks: input.subtasks || null
     };
 
     try {
@@ -504,6 +554,7 @@ async function runPipeline(input) {
       logger.log({ type: 'STAGE_FAILED', stage: instanceName, error: message });
       state.fail(instanceName, err);
       console.error(`[pipeline] Stage ${instanceName} failed: ${message}`);
+      console.error(`[pipeline] To resume after fixing: --resume --run-id ${runId}`);
       break;
     }
   }
@@ -554,7 +605,10 @@ export async function exec(dictionary) {
   const resume = Boolean(dictionary?.resume);
   const workingDirectory = dictionary?.workingDirectory || dictionary?.workDir || '';
 
-  const result = await runPipeline({ ticketKey: effectiveKey, profile, runId, resume, workingDirectory, prompt, promptFile });
+  const angles = dictionary?.angles || null;
+  const subtasks = dictionary?.subtasks || null;
+
+  const result = await runPipeline({ ticketKey: effectiveKey, profile, runId, resume, workingDirectory, prompt, promptFile, angles, subtasks });
 
   if (dictionary && typeof dictionary === 'object') {
     dictionary.response = result;

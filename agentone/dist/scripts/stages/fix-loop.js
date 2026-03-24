@@ -40,7 +40,14 @@ export async function run(context) {
       throw new Error('Fix-loop stage requires verify output from stage "verify".');
     }
 
-    if (verify.passed === true) {
+    // Check if the AI review found critical or moderate issues even when
+    // automated tests passed (e.g. Flutter project where npm test is N/A).
+    const aiReview = toText(verify?.aiReview?.content);
+    const hasCriticalIssues = aiReview && /##\s*Critical Issues/i.test(aiReview);
+    const hasModerateIssues = aiReview && /##\s*Moderate Issues/i.test(aiReview);
+    const aiFoundProblems = hasCriticalIssues || hasModerateIssues;
+
+    if (verify.passed === true && !aiFoundProblems) {
       const skipped = {
         fixed: false,
         attempts: [],
@@ -48,7 +55,7 @@ export async function run(context) {
         finalVerifyPassed: true,
         effectiveVerify: verify,
         skipped: true,
-        reason: 'Verify already passed; fix-loop skipped.'
+        reason: 'Verify passed and AI review found no critical/moderate issues.'
       };
       context.state.checkpoint(STAGE_NAME, skipped);
       return skipped;
@@ -67,9 +74,45 @@ export async function run(context) {
     let finalVerifyPassed = false;
     let effectiveVerify = verify;
     let currentTestOutput = toText(verify?.tests?.output);
+
+    // When automated tests passed but AI review found problems, the test output
+    // is useless (e.g. "No package.json found"). Seed with AI review instead.
+    if (aiFoundProblems && verify.passed === true) {
+      currentTestOutput = `AI Code Review Findings (automated tests passed but review found issues):\n\n${aiReview}`;
+    }
+
+    // When AGENTONE_SKIP_REVIEW=1, skip Claude fix attempts — return failure details for dispatcher to fix manually
+    if (process.env.AGENTONE_SKIP_REVIEW === '1') {
+      context.logger?.log({
+        type: 'STAGE_INFO',
+        stage: STAGE_NAME,
+        message: 'Fix-loop skipped (AGENTONE_SKIP_REVIEW=1) — dispatcher will fix failures manually.'
+      });
+      const output = {
+        fixed: false,
+        attempts: [],
+        totalAttempts: 0,
+        finalVerifyPassed: false,
+        effectiveVerify: verify,
+        skipped: true,
+        reason: 'AGENTONE_SKIP_REVIEW=1 — dispatcher will review and fix.',
+        failureDetails: {
+          testOutput: currentTestOutput,
+          summary: toText(verify?.summary),
+          lintOutput: toText(verify?.lint?.output || ''),
+          auditOutput: toText(verify?.audit?.output || ''),
+          aiReview: aiReview || ''
+        }
+      };
+      context.state.checkpoint(STAGE_NAME, output);
+      return output;
+    }
+
     const promptTemplate = readFileSync(FIX_PROMPT_TEMPLATE_PATH, 'utf8');
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (context.signal?.aborted) break;
+
       const startedAt = Date.now();
 
       const priorFixes = attempts.length > 0
@@ -78,14 +121,16 @@ export async function run(context) {
 
       // Use effectiveVerify (latest state) not the initial verify output
       const verifySource = effectiveVerify || verify;
+      const currentAiReview = toText(verifySource?.aiReview?.content || aiReview);
       const verifyNotes = [
         `Verify summary: ${toText(verifySource.summary)}`,
         `Lint passed: ${Boolean(verifySource?.lint?.passed)}`,
         `Lint output: ${toText(verifySource?.lint?.output || '').trim()}`,
         `Audit vulnerabilities: ${JSON.stringify(verifySource?.audit?.vulnerabilities || {})}`,
         `Audit output: ${toText(verifySource?.audit?.output || '').trim()}`,
-        `Implement summary: ${toText(implement?.summary || '').trim()}`
-      ].join('\n');
+        `Implement summary: ${toText(implement?.summary || '').trim()}`,
+        currentAiReview ? `AI review findings:\n${currentAiReview}` : ''
+      ].filter(Boolean).join('\n');
 
       const testFailures = `${currentTestOutput}\n\nVerify notes:\n${verifyNotes}`;
 
@@ -116,7 +161,8 @@ export async function run(context) {
         cwd,
         timeout: TIMEOUTS['fix-loop'],
         label: `fix-${ticketKey}-attempt-${attempt}`,
-        metadata: { stage: STAGE_NAME, ticketKey, attempt, runId: context.state.runId }
+        metadata: { stage: STAGE_NAME, ticketKey, attempt, runId: context.state.runId },
+        signal: context.signal
       });
 
       if (context.costTracker) {

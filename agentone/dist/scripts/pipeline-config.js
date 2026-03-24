@@ -4,7 +4,8 @@ export const API_TOKEN = process.env.AGENTONE_API_TOKEN || process.env.BRIDGE_AP
 export const DEFAULTS = {
   pollInterval: 3_000,
   stepTimeout: 300_000,
-  maxConvergenceRounds: 2,
+  maxConvergenceRounds: 'auto',
+  debateSafetyCap: 9,
   maxFixAttempts: 2,
   completedRegex: /<COMPLETED>([\s\S]*?)<\/COMPLETED>/
 };
@@ -22,7 +23,7 @@ export const PROFILES = {
   simple: {
     stages: ['intake', 'classify', 'plan', 'implement', 'verify', 'pr-create', 'jira-close'],
     budget: 15,
-    maxConvergenceRounds: 0,
+    maxConvergenceRounds: 0,  // no debate for simple profile
     maxFixAttempts: 1
   },
   standard: {
@@ -42,7 +43,7 @@ export const PROFILES = {
       'jira-close'
     ],
     budget: 60,
-    maxConvergenceRounds: 1,
+    maxConvergenceRounds: 'auto',
     maxFixAttempts: 2
   },
   complex: {
@@ -64,7 +65,29 @@ export const PROFILES = {
       'jira-close'
     ],
     budget: 150,
-    maxConvergenceRounds: 2,
+    maxConvergenceRounds: 'auto',
+    maxFixAttempts: 3,
+    adversarialCritique: true
+  },
+  'complex-no-research': {
+    stages: [
+      'intake',
+      'classify',
+      'dual-plan',
+      'cross-critique',
+      'human-gate',
+      'implement',
+      'verify',
+      'fix-loop',
+      'test-suite',
+      'browser-test',
+      'security-audit',
+      'human-gate',
+      'pr-create',
+      'jira-close'
+    ],
+    budget: 150,
+    maxConvergenceRounds: 'auto',
     maxFixAttempts: 3,
     adversarialCritique: true
   },
@@ -74,9 +97,40 @@ export const PROFILES = {
       'classify',
       'research'
     ],
-    budget: 30,
-    maxConvergenceRounds: 0,
+    budget: 50,
+    maxConvergenceRounds: 'auto',
     maxFixAttempts: 0
+  }
+};
+
+/**
+ * Research cost modes — controls which CLI does the heavy token work.
+ *
+ *   normal   — current behavior: Claude+Codex alternating (most expensive, highest quality)
+ *   cheap    — Sonnet for research/re-research, Claude Opus for debate/validation only
+ *   cheapest — Codex for all research/re-research, Claude Opus for debate/validation only
+ */
+export const RESEARCH_MODES = {
+  normal: {
+    researchCli: null,          // null = use alternating bull/bear logic (current behavior)
+    reResearchCli: 'claude',    // current behavior
+    debateCli: null,            // null = alternating claude/codex
+    validationCli: 'claude',
+    claudeModel: null,          // null = default (Opus)
+  },
+  cheap: {
+    researchCli: 'claude',      // all research via Claude Sonnet
+    reResearchCli: 'claude',
+    debateCli: null,            // alternating
+    validationCli: 'claude',
+    claudeModel: 'claude-sonnet-4-6',
+  },
+  cheapest: {
+    researchCli: 'codex',       // all research via Codex
+    reResearchCli: 'codex',
+    debateCli: null,            // alternating
+    validationCli: 'claude',
+    claudeModel: null,          // debate/validation still uses Opus
   }
 };
 
@@ -92,32 +146,32 @@ export const AUTO_UPGRADE = {
 
 export const AGENT_DEFAULTS = {
   claude: {
-    timeout: 300_000,
+    timeout: 1_800_000,
     extraArgs: ['--output-format', 'json', '--dangerously-skip-permissions']
   },
   codex: {
-    timeout: 300_000,
+    timeout: 1_800_000,
     model: 'gpt-5.4',
-    extraArgs: []
+    extraArgs: ['--skip-git-repo-check']
   }
 };
 
 export const TIMEOUTS = {
-  intake: 120_000,
-  classify: 30_000,
-  plan: 300_000,
-  'dual-plan': 420_000,
-  'cross-critique': 420_000,
+  intake: 300_000,
+  classify: 120_000,
+  plan: 3_600_000,
+  'dual-plan': 3_600_000,
+  'cross-critique': 10_800_000,
   'human-gate': 86_400_000,
-  implement: 900_000,
-  verify: 600_000,
-  'fix-loop': 420_000,
-  research: 600_000,
-  'test-suite': 600_000,
-  'browser-test': 600_000,
-  'security-audit': 300_000,
-  'pr-create': 180_000,
-  'jira-close': 120_000
+  implement: 14_400_000,
+  verify: 3_600_000,
+  'fix-loop': 3_600_000,
+  research: 3_600_000,
+  'test-suite': 3_600_000,
+  'browser-test': 3_600_000,
+  'security-audit': 1_800_000,
+  'pr-create': 600_000,
+  'jira-close': 300_000
 };
 
 /**

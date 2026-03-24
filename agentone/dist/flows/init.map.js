@@ -14,6 +14,11 @@ export default {
       "name": "Browser Automation",
       "type": "script",
       "entry": "tools/browser-automation.js"
+    },
+    {
+      "name": "Net Test",
+      "type": "script",
+      "entry": "tools/net-test.js"
     }
   ]
 };

@@ -90,7 +90,8 @@ export async function run(context) {
         stage: 'plan',
         ticketKey: ticket?.key,
         runId: context.state.runId
-      }
+      },
+      signal: context.signal
     });
 
     if (context.costTracker) {

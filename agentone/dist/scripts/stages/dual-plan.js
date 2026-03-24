@@ -130,7 +130,8 @@ export async function run(context) {
           agent: 'claude',
           ticketKey,
           runId: context.state.runId
-        }
+        },
+        signal: context.signal
       }),
       runAgent({
         cli: 'codex',
@@ -143,7 +144,8 @@ export async function run(context) {
           agent: 'codex',
           ticketKey,
           runId: context.state.runId
-        }
+        },
+        signal: context.signal
       })
     ]);
 

@@ -15,28 +15,59 @@
  */
 
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, readdirSync, mkdirSync, unlinkSync } from 'node:fs';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+// PersistentClaude not used — stream-json input broken on Windows.
+// Speed comes from using Sonnet model in lite mode (~2s vs ~8s Opus).
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SYSTEM_PROMPT_PATH = resolve(__dirname, 'prompts/orchestrator.md');
+const SYSTEM_PROMPT_LITE_PATH = resolve(__dirname, 'prompts/orchestrator-lite.md');
 const HISTORY_FILE = resolve(homedir(), '.keen_history');
+const SESSIONS_DIR = resolve(homedir(), '.keen', 'sessions');
+const MAX_SESSIONS = 50;
 const MAX_HISTORY = 500;
 const IS_WINDOWS = process.platform === 'win32';
 
+// ── Model registry ──────────────────────────────────────────────────────────
+const MODELS = {
+  // Claude models (--model flag)
+  opus:    { provider: 'claude', label: 'Claude Opus 4.6',   flag: 'opus',   speed: 'slow',   desc: 'Most capable, best for complex tasks' },
+  sonnet:  { provider: 'claude', label: 'Claude Sonnet 4.6', flag: 'sonnet', speed: 'fast',   desc: 'Fast and capable, great balance' },
+  haiku:   { provider: 'claude', label: 'Claude Haiku 4.5',  flag: 'haiku',  speed: 'fastest',desc: 'Fastest Claude, good for simple tasks' },
+  // Codex models (-c model_reasoning_effort flag)
+  'codex-xhigh': { provider: 'codex', label: 'Codex GPT-5.4 (xhigh)', effort: 'xhigh', speed: 'slow',    desc: 'Maximum reasoning, slow' },
+  'codex-high':  { provider: 'codex', label: 'Codex GPT-5.4 (high)',   effort: 'high',  speed: 'medium',  desc: 'Strong reasoning' },
+  'codex-med':   { provider: 'codex', label: 'Codex GPT-5.4 (medium)', effort: 'medium',speed: 'fast',    desc: 'Balanced speed/quality' },
+  'codex-low':   { provider: 'codex', label: 'Codex GPT-5.4 (low)',    effort: 'low',   speed: 'fastest', desc: 'Fastest Codex, good for chat' },
+};
+// Aliases for convenience
+const MODEL_ALIASES = {
+  claude: 'sonnet', codex: 'codex-low',
+  'claude-opus': 'opus', 'claude-sonnet': 'sonnet', 'claude-haiku': 'haiku',
+  'gpt-5.4': 'codex-xhigh', fast: 'haiku',
+};
+
 // ── Slash command registry ───────────────────────────────────────────────────
 const SLASH_COMMANDS = [
-  { cmd: '/model',    args: '[claude|codex]', desc: 'Switch or toggle primary model' },
-  { cmd: '/claude',   args: '',               desc: 'Switch to Claude' },
-  { cmd: '/codex',    args: '',               desc: 'Switch to Codex' },
+  { cmd: '/model',    args: '[name]',          desc: 'Switch model (opus/sonnet/haiku/codex-low/codex-high...)' },
+  { cmd: '/models',   args: '',                desc: 'List all available models' },
+  { cmd: '/claude',   args: '',                desc: 'Switch to Claude (Sonnet)' },
+  { cmd: '/codex',    args: '',                desc: 'Switch to Codex (low reasoning)' },
+  { cmd: '/sessions', args: '',               desc: 'List saved sessions' },
+  { cmd: '/resume',   args: '[id]',            desc: 'Resume a saved session (interactive picker if no id)' },
+  { cmd: '/new',      args: '',               desc: 'Start a fresh session' },
   { cmd: '/spinner',  args: '[name]',         desc: 'Change spinner style' },
   { cmd: '/clear',    args: '',               desc: 'Clear screen (Ctrl+L)' },
   { cmd: '/help',     args: '',               desc: 'Show available commands' },
   { cmd: '/status',   args: '',               desc: 'Show session status' },
   { cmd: '/save',     args: '[path]',         desc: 'Save conversation to file' },
+  { cmd: '/verbose',  args: '',               desc: 'Toggle tool use + thinking visibility (Ctrl+T)' },
+  { cmd: '/pipeline', args: '',               desc: 'Escalate to full orchestrator mode' },
+  { cmd: '/lite',     args: '',               desc: 'Switch back to fast/lite mode' },
 ];
 
 // ── Keen logo (ANSI block art — light-blue folder with two white "eyes") ─────
@@ -117,13 +148,21 @@ function killProc(proc) {
 // ── CLI arg parsing ──────────────────────────────────────────────────────────
 function parseArgs(argv) {
   let workdir = process.cwd();
+  let resumeId = null;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--workdir' && argv[i + 1]) {
       workdir = resolve(argv[i + 1]);
       i++;
+    } else if (argv[i] === '--resume') {
+      if (argv[i + 1] && !argv[i + 1].startsWith('--')) {
+        resumeId = argv[i + 1];
+        i++;
+      } else {
+        resumeId = '__picker__';  // signal to open interactive picker
+      }
     }
   }
-  return { workdir };
+  return { workdir, resumeId };
 }
 
 // ── Run a single orchestrator turn ──────────────────────────────────────────
@@ -132,48 +171,111 @@ function runTurn(stdinContent, opts) {
   return runClaudeTurn(stdinContent, opts);
 }
 
-function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, procRef }) {
+function runClaudeTurn(stdinContent, { workdir, isFirst, systemPrompt, onData, onVerbose, procRef, modelDef }) {
   return new Promise((res, rej) => {
-    const args = ['-p'];
+    const args = ['-p', '--output-format', 'stream-json', '--verbose'];
     if (!isFirst) args.push('--continue');
     args.push('--dangerously-skip-permissions');
+    // Use the specific Claude model selected by the user
+    if (modelDef?.flag) args.push('--model', modelDef.flag);
 
-    const proc = spawn('claude', args, {
-      cwd: workdir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: true,
-      env: { ...process.env }
-    });
+    // Pass system prompt via temp file to avoid Windows cmd.exe ~8KB argument limit.
+    let promptFile = null;
+    if (isFirst && systemPrompt) {
+      const tmpDir = mkdtempSync(join(tmpdir(), 'keen-'));
+      promptFile = join(tmpDir, 'system-prompt.txt');
+      writeFileSync(promptFile, systemPrompt, 'utf8');
+      args.push('--append-system-prompt-file', promptFile);
+    }
+
+    // On Windows, spawn via shell to find claude in PATH.
+    const proc = IS_WINDOWS
+      ? spawn((['claude', ...args].map(a => a.includes(' ') ? `"${a}"` : a)).join(' '), {
+          cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], shell: true, env: { ...process.env }
+        })
+      : spawn('claude', args, {
+          cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env }
+        });
 
     if (procRef) procRef.proc = proc;
 
-    if (isFirst) {
-      proc.stdin.write(systemPrompt + '\n\n---\n\nUser message: ' + stdinContent);
-    } else {
-      proc.stdin.write(stdinContent);
-    }
+    proc.stdin.write(stdinContent);
     proc.stdin.end();
     proc.stdin.on('error', () => {});
 
-    let fullOutput = '';
+    let fullText = '';  // just the text content (for history/tags)
+    let ndjsonBuf = '';
+
     proc.stdout.on('data', (chunk) => {
-      const text = chunk.toString();
-      fullOutput += text;
-      if (onData) onData(text);
+      ndjsonBuf += chunk.toString();
+      let nlIdx;
+      while ((nlIdx = ndjsonBuf.indexOf('\n')) !== -1) {
+        const line = ndjsonBuf.slice(0, nlIdx).trim();
+        ndjsonBuf = ndjsonBuf.slice(nlIdx + 1);
+        if (!line) continue;
+        try {
+          const evt = JSON.parse(line);
+          // Assistant text
+          if (evt.type === 'assistant' && evt.message?.content) {
+            for (const block of evt.message.content) {
+              if (block.type === 'text' && block.text) {
+                fullText += block.text;
+                if (onData) onData(block.text);
+              }
+              // Tool use — show what tool and preview of input
+              if (block.type === 'tool_use' && onVerbose) {
+                const name = block.name || 'unknown';
+                const input = block.input || {};
+                let preview = '';
+                if (input.command) preview = input.command;
+                else if (input.file_path) preview = input.file_path;
+                else if (input.pattern) preview = input.pattern;
+                else if (input.prompt) preview = input.prompt.slice(0, 80);
+                else preview = JSON.stringify(input).slice(0, 80);
+                onVerbose('tool_use', name, preview);
+              }
+            }
+          }
+          // Tool result
+          if (evt.type === 'tool_result' && onVerbose) {
+            const out = (evt.content || '').toString().slice(0, 120);
+            onVerbose('tool_result', '', out);
+          }
+          // Result — turn complete
+          if (evt.type === 'result') {
+            // result.result contains the final text if we missed streaming
+            if (!fullText && evt.result) {
+              fullText = evt.result;
+              if (onData) onData(evt.result);
+            }
+          }
+        } catch {
+          // Not valid JSON — might be raw text in some edge case
+          if (line && onData) { fullText += line; onData(line); }
+        }
+      }
     });
+
     proc.stderr.on('data', () => {});
     proc.on('error', rej);
-    proc.on('exit', (code) => res({ code: code ?? 0, output: fullOutput }));
+    proc.on('exit', (code) => res({ code: code ?? 0, output: fullText }));
   });
 }
 
-function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData, procRef }) {
+const CODEX_IDENTITY = `You are **Codex** (OpenAI, GPT-5.4), part of the **Keen Agents** dual-model REPL.
+Your partner is **Claude** (Anthropic) — the user switches between you with /model.
+You both share the same conversation history. Be concise and direct.`;
+
+function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory, onData, procRef, modelDef }) {
   return new Promise((res, rej) => {
+    // Prepend Codex identity to the system prompt so it knows who it is
+    const codexPrompt = CODEX_IDENTITY + '\n\n' + systemPrompt;
+
     let fullPrompt;
     if (!conversationHistory || conversationHistory.length === 0) {
-      fullPrompt = systemPrompt + '\n\n---\n\nUser message: ' + stdinContent;
+      fullPrompt = codexPrompt + '\n\n---\n\nUser message: ' + stdinContent;
     } else {
-      fullPrompt = systemPrompt + '\n\n---\n\nConversation so far:\n';
+      fullPrompt = codexPrompt + '\n\n---\n\nConversation so far:\n';
       for (const turn of conversationHistory) {
         fullPrompt += `\n[${turn.role}]: ${turn.content}\n`;
       }
@@ -181,13 +283,17 @@ function runCodexTurn(stdinContent, { workdir, systemPrompt, conversationHistory
       fullPrompt += '\nContinue the conversation. Respond to the latest user message.';
     }
 
-    const args = ['exec', '-'];
-    const proc = spawn('codex', args, {
-      cwd: workdir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: true,
-      env: { ...process.env }
-    });
+    const args = ['exec', '--full-auto'];
+    // Use the specific Codex reasoning effort selected by the user
+    if (modelDef?.effort) args.push('-c', `model_reasoning_effort="${modelDef.effort}"`);
+    args.push('-');
+    const proc = IS_WINDOWS
+      ? spawn((['codex', ...args].map(a => a.includes(' ') ? `"${a}"` : a)).join(' '), {
+          cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], shell: true, env: { ...process.env }
+        })
+      : spawn('codex', args, {
+          cwd: workdir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env }
+        });
 
     if (procRef) procRef.proc = proc;
 
@@ -253,9 +359,12 @@ function extractCodexResponse(stdout) {
 
 // ── TUI ──────────────────────────────────────────────────────────────────────
 class KeenCLI {
-  constructor({ workdir, systemPrompt }) {
+  constructor({ workdir, systemPrompt, systemPromptLite }) {
     this.workdir = workdir;
-    this.systemPrompt = systemPrompt;
+    this.systemPromptFull = systemPrompt;       // full orchestrator (pipeline dispatch)
+    this.systemPromptLite = systemPromptLite || systemPrompt;  // lightweight (normal chat)
+    this.systemPrompt = this.systemPromptLite;  // active prompt — start lite
+    this._isEscalated = false;                  // true when using full orchestrator
     this.busy = false;
     this.input = '';
     this.cursor = 0;
@@ -265,10 +374,23 @@ class KeenCLI {
     this._cleaned = false;
 
     // ── Model state ──────────────────────────────────────────────
-    this.primaryModel = 'claude';
+    this.primaryModel = 'claude';       // 'claude' or 'codex' (provider)
+    this.activeModelKey = 'sonnet';     // key into MODELS registry
+    this._verbose = false;              // show tool use + thinking (Ctrl+T toggle)
     this.isFirstClaude = true;
     this.isFirstCodex = true;
-    this.conversationHistory = [];   // used for Codex context (Claude uses --continue)
+    this.conversationHistory = [];      // shared across both models
+
+    // ── Session persistence ──────────────────────────────────────
+    this.sessionId = `keen-${Date.now()}`;
+    this._sessionCreated = new Date().toISOString();
+    this._ensureSessionsDir();
+
+    // ── Session picker (interactive /resume) ────────────────────
+    this._pickerActive = false;
+    this._pickerItems = [];     // session objects
+    this._pickerIdx = 0;        // highlighted index
+    this._pickerScroll = 0;     // scroll offset for long lists
 
     // Per-turn output buffer
     this.primaryOutput = '';
@@ -278,8 +400,9 @@ class KeenCLI {
     // Process reference (for kill on Ctrl+C)
     this._primaryProcRef = {};
 
-    // Scroll buffer (for resize replay)
+    // Scroll buffer (for resize replay + scrollback)
     this._scrollBuffer = [];
+    this._scrollOffset = 0;   // 0 = at bottom, >0 = lines scrolled up
 
     // Spinner + elapsed time
     this._spinnerFrame = 0;
@@ -311,7 +434,7 @@ class KeenCLI {
     }
     // Text info to the right of the logo — single line, vertically centered
     this.w(a.moveTo(3, infoCol) +
-      a.bold('Keen') + a.dim('  \u00b7  ') + mc(this.primaryModel) +
+      a.bold('Keen') + a.dim('  \u00b7  ') + mc(MODELS[this.activeModelKey]?.label || this.primaryModel) +
       a.dim('  \u00b7  ') + a.gray(this.workdir));
 
     // Separator
@@ -320,6 +443,7 @@ class KeenCLI {
 
   setup() {
     this.w(a.altOn);
+    this.w('\x1b[?1000h\x1b[?1006h');  // enable mouse tracking (SGR mode) for wheel scroll
     this.w(a.clear);
     this._prevRows = this.rows;
     this.drawHeader();
@@ -355,6 +479,7 @@ class KeenCLI {
     if (this._onResize) process.stdout.removeListener('resize', this._onResize);
     if (this._onStdinData) process.stdin.removeListener('data', this._onStdinData);
 
+    this.w('\x1b[?1000l\x1b[?1006l');  // disable mouse tracking
     this.w(a.resetScroll);
     this.w(a.show);
     this.w(a.altOff);
@@ -392,15 +517,15 @@ class KeenCLI {
     // Row r: hints line
     this.w(a.moveTo(r, 1) + a.clearLine);
     if (this.busy) {
-      this.w(a.dim(`  ^C to interrupt \u00b7 `) + mc(this.primaryModel));
+      this.w(a.dim(`  ^C to interrupt \u00b7 `) + mc(MODELS[this.activeModelKey]?.label || this.primaryModel));
     } else {
       const suggestions = this.slashSuggestions();
       if (suggestions) {
         this.w(`  ${suggestions}  ${a.dim('Tab')}`);
       } else {
         this.w(
-          a.dim('  \u21B5 send \u00b7 ^C cancel \u00b7 ') +
-          mc(`/model ${this.primaryModel}`) +
+          a.dim('  \u21B5 send \u00b7 ^C cancel \u00b7 ^T verbose') +
+          (this._verbose ? a.magenta(' on') : '') +
           a.dim(' \u00b7 /help')
         );
       }
@@ -421,21 +546,72 @@ class KeenCLI {
     this.drawHeader();
     this.w(a.scrollRgn(this.scrollStart, this.scrollEnd));
 
-    // Replay scroll buffer (content is preserved, artifacts are gone)
-    this.w(a.moveTo(this.scrollStart, 1));
-    for (const text of this._scrollBuffer) {
-      this.w(text);
-    }
-    this.w(a.save);
-
-    // Redraw bottom bar
-    this.drawBottom();
+    // Redraw from buffer (respects scroll offset, shows correct viewport)
+    this._redrawScrollView();
 
     // Re-enable spinner if we're in the middle of a turn
     if (this.busy) {
       this._spinnerActive = true;
     }
-    this.w(a.show);
+  }
+
+  // ── Session persistence ──────────────────────────────────────────────
+  _ensureSessionsDir() {
+    try { if (!existsSync(SESSIONS_DIR)) mkdirSync(SESSIONS_DIR, { recursive: true }); } catch {}
+  }
+
+  _saveSession() {
+    if (this.conversationHistory.length === 0) return;
+    const data = {
+      id: this.sessionId,
+      created: this._sessionCreated,
+      updated: new Date().toISOString(),
+      preview: this.conversationHistory[0]?.content?.slice(0, 80) || '',
+      model: this.primaryModel,
+      history: this.conversationHistory
+    };
+    try {
+      writeFileSync(resolve(SESSIONS_DIR, `${this.sessionId}.json`), JSON.stringify(data), 'utf8');
+      this._pruneOldSessions();
+    } catch {}
+  }
+
+  _listSessions() {
+    try {
+      return readdirSync(SESSIONS_DIR)
+        .filter(f => f.endsWith('.json'))
+        .sort().reverse()
+        .map(f => { try { return JSON.parse(readFileSync(resolve(SESSIONS_DIR, f), 'utf8')); } catch { return null; } })
+        .filter(Boolean);
+    } catch { return []; }
+  }
+
+  _loadSession(partialId) {
+    const sessions = this._listSessions();
+    return sessions.find(s => s.id.includes(partialId)) || null;
+  }
+
+  _pruneOldSessions() {
+    try {
+      const files = readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json')).sort();
+      while (files.length > MAX_SESSIONS) {
+        const old = files.shift();
+        try { unlinkSync(resolve(SESSIONS_DIR, old)); } catch {}
+      }
+    } catch {}
+  }
+
+  resumeSession(partialId) {
+    const session = this._loadSession(partialId);
+    if (!session) return false;
+    this._saveSession(); // save current session first
+    this.sessionId = session.id;
+    this._sessionCreated = session.created;
+    this.conversationHistory = session.history || [];
+    this.primaryModel = session.model || 'claude';
+    this.isFirstClaude = true;
+    this.isFirstCodex = true;
+    return session;
   }
 
   // ── Slash commands ─────────────────────────────────────────────────────
@@ -449,13 +625,32 @@ class KeenCLI {
 
     if (cmd === '/model') {
       const arg = (parts[1] || '').toLowerCase();
-      if (arg === 'claude' || arg === 'codex') {
-        this.setPrimaryModel(arg);
-      } else if (!arg) {
+      if (!arg) {
+        // Toggle provider
         this.setPrimaryModel(this.primaryModel === 'claude' ? 'codex' : 'claude');
       } else {
-        this.scrollWrite(a.yellow(`Unknown model: ${arg}. Use /model claude or /model codex\n`));
+        this.setPrimaryModel(arg);
       }
+      return;
+    }
+
+    if (cmd === '/models') {
+      this.scrollWrite('\n' + a.magenta(a.bold('Available Models')) + '\n\n');
+      const current = this.activeModelKey;
+      // Claude models
+      this.scrollWrite(a.cyan(a.bold('  Claude (Anthropic)')) + '\n');
+      for (const [key, m] of Object.entries(MODELS)) {
+        if (m.provider !== 'claude') continue;
+        const sel = key === current ? a.green(' *') : '';
+        this.scrollWrite(`    ${a.cyan(key.padEnd(14))}${sel}  ${a.dim(m.speed.padEnd(8))}  ${m.desc}\n`);
+      }
+      this.scrollWrite('\n' + a.yellow(a.bold('  Codex (OpenAI)')) + '\n');
+      for (const [key, m] of Object.entries(MODELS)) {
+        if (m.provider !== 'codex') continue;
+        const sel = key === current ? a.green(' *') : '';
+        this.scrollWrite(`    ${a.yellow(key.padEnd(14))}${sel}  ${a.dim(m.speed.padEnd(8))}  ${m.desc}\n`);
+      }
+      this.scrollWrite('\n' + a.dim('  /model <name> to switch  (e.g. /model opus, /model codex-high)') + '\n\n');
       return;
     }
 
@@ -497,9 +692,12 @@ class KeenCLI {
       this.scrollWrite('\n' + a.magenta(a.bold('Keyboard')) + '\n');
       this.scrollWrite(`  ${a.cyan('Ctrl+L'.padEnd(24))} ${a.dim('Clear screen')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+C'.padEnd(24))} ${a.dim('Cancel turn / Exit')}\n`);
+      this.scrollWrite(`  ${a.cyan('Ctrl+T'.padEnd(24))} ${a.dim('Toggle verbose (show tool use + thinking)')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+U'.padEnd(24))} ${a.dim('Clear input line')}\n`);
       this.scrollWrite(`  ${a.cyan('Ctrl+W'.padEnd(24))} ${a.dim('Delete word backward')}\n`);
       this.scrollWrite(`  ${a.cyan('\u2191\u2193 arrows'.padEnd(24))} ${a.dim('History navigation')}\n`);
+      this.scrollWrite(`  ${a.cyan('PgUp / PgDn'.padEnd(24))} ${a.dim('Scroll conversation')}\n`);
+      this.scrollWrite(`  ${a.cyan('Shift+\u2191 / Shift+\u2193'.padEnd(24))} ${a.dim('Scroll 3 lines')}\n`);
       this.scrollWrite('\n');
       return;
     }
@@ -508,7 +706,9 @@ class KeenCLI {
       const turns = Math.floor(this.conversationHistory.length / 2);
       const mc = this.primaryModel === 'claude' ? a.cyan : a.yellow;
       this.scrollWrite(`\n${a.magenta(a.bold('Status'))}\n`);
-      this.scrollWrite(`  ${a.cyan('Model:'.padEnd(14))} ${mc(this.primaryModel)}\n`);
+      const shortId = this.sessionId.replace('keen-', '').slice(-8);
+      this.scrollWrite(`  ${a.cyan('Session:'.padEnd(14))} ${shortId}\n`);
+      this.scrollWrite(`  ${a.cyan('Model:'.padEnd(14))} ${mc(MODELS[this.activeModelKey]?.label || this.primaryModel)}\n`);
       this.scrollWrite(`  ${a.cyan('Spinner:'.padEnd(14))} ${activeSpinnerName} ${SPINNER.join(' ')}\n`);
       this.scrollWrite(`  ${a.cyan('Turns:'.padEnd(14))} ${turns}\n`);
       this.scrollWrite(`  ${a.cyan('History:'.padEnd(14))} ${this.history.length} entries\n`);
@@ -531,6 +731,105 @@ class KeenCLI {
       return;
     }
 
+    if (cmd === '/sessions') {
+      const sessions = this._listSessions();
+      if (sessions.length === 0) {
+        this.scrollWrite(a.dim('  No saved sessions yet.\n'));
+        return;
+      }
+      this.scrollWrite('\n' + a.magenta(a.bold('Sessions')) + '\n\n');
+      const show = sessions.slice(0, 20);
+      for (const s of show) {
+        const d = new Date(s.updated);
+        const date = d.toLocaleDateString();
+        const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const turns = Math.floor((s.history?.length || 0) / 2);
+        const shortId = s.id.replace('keen-', '').slice(-8);
+        const isCurrent = s.id === this.sessionId ? a.green(' *') : '';
+        const preview = (s.preview || '(empty)').slice(0, 50);
+        this.scrollWrite(`  ${a.cyan(shortId)}${isCurrent}  ${a.dim(date + ' ' + time)}  ${a.dim(turns + 't')}  ${preview}\n`);
+      }
+      if (sessions.length > 20) this.scrollWrite(a.dim(`  ... and ${sessions.length - 20} more\n`));
+      this.scrollWrite('\n' + a.dim('  /resume to pick interactively, or /resume <id>') + '\n\n');
+      return;
+    }
+
+    if (cmd === '/resume') {
+      const partialId = parts[1];
+      if (!partialId) {
+        // No args — open interactive session picker
+        this._enterPicker();
+        return;
+      }
+      const session = this.resumeSession(partialId);
+      if (!session) {
+        this.scrollWrite(a.red(`No session matching "${partialId}"\n`));
+        return;
+      }
+      const turns = Math.floor(session.history.length / 2);
+      this.scrollWrite(a.green(`\nResumed session (${turns} turns)\n\n`));
+      // Show recent conversation for context
+      const recent = session.history.slice(-6);
+      for (const turn of recent) {
+        const prefix = turn.role === 'user' ? a.green('\u203A') : a.cyan('\u25C7');
+        const text = turn.content.slice(0, 120) + (turn.content.length > 120 ? '...' : '');
+        this.scrollWrite(`  ${prefix} ${a.dim(text)}\n`);
+      }
+      this.scrollWrite('\n');
+      this.drawHeader();
+      this.drawBottom();
+      return;
+    }
+
+    if (cmd === '/new') {
+      this._saveSession();
+      this.sessionId = `keen-${Date.now()}`;
+      this._sessionCreated = new Date().toISOString();
+      this.conversationHistory = [];
+      this.isFirstClaude = true;
+      this.isFirstCodex = true;
+      this.scrollWrite(a.green('New session started.\n'));
+      this.drawBottom();
+      return;
+    }
+
+    if (cmd === '/verbose') {
+      this._verbose = !this._verbose;
+      this.scrollWrite(this._verbose
+        ? a.magenta('\u2731 Verbose ON — showing tool use + thinking (Ctrl+T to toggle)\n')
+        : a.dim('\u2731 Verbose OFF\n'));
+      this.drawBottom();
+      return;
+    }
+
+    if (cmd === '/pipeline') {
+      if (this._isEscalated) {
+        this.scrollWrite(a.dim('Already in full orchestrator mode.\n'));
+        return;
+      }
+      this._isEscalated = true;
+      this.systemPrompt = this.systemPromptFull;
+      this.isFirstClaude = true;
+      this.isFirstCodex = true;
+      this.scrollWrite(a.magenta('\u2731 Escalated to full orchestrator mode\n'));
+      this.drawBottom();
+      return;
+    }
+
+    if (cmd === '/lite') {
+      if (!this._isEscalated) {
+        this.scrollWrite(a.dim('Already in lite mode.\n'));
+        return;
+      }
+      this._isEscalated = false;
+      this.systemPrompt = this.systemPromptLite;
+      this.isFirstClaude = true;
+      this.isFirstCodex = true;
+      this.scrollWrite(a.cyan('\u2731 Switched to lite mode (faster responses)\n'));
+      this.drawBottom();
+      return;
+    }
+
     // Unknown slash command
     this.scrollWrite(a.red(`Unknown command: ${cmd}`) + a.dim(' — type /help for available commands\n'));
   }
@@ -547,25 +846,259 @@ class KeenCLI {
     }).join('  ');
   }
 
-  setPrimaryModel(model) {
-    this.primaryModel = model;
-    this.conversationHistory = [];  // fresh start on model switch
+  /**
+   * Switch to a model by key (e.g. 'opus', 'sonnet', 'codex-low') or provider ('claude', 'codex').
+   */
+  setPrimaryModel(nameOrKey) {
+    // Resolve aliases
+    let key = MODEL_ALIASES[nameOrKey] || nameOrKey;
+    // Legacy: bare 'claude' / 'codex' without specific model
+    if (nameOrKey === 'claude' && !MODELS[nameOrKey]) key = 'sonnet';
+    if (nameOrKey === 'codex' && !MODELS[nameOrKey]) key = 'codex-low';
 
-    const mc = model === 'claude' ? a.cyan : a.yellow;
-    this.scrollWrite(mc(`\u2731 Switched to ${model}\n`));
+    const modelDef = MODELS[key];
+    if (!modelDef) {
+      this.scrollWrite(a.red(`Unknown model: ${nameOrKey}`) + a.dim(' — type /models to see available\n'));
+      return;
+    }
+
+    this.activeModelKey = key;
+    this.primaryModel = modelDef.provider;
+
+    // History is shared — don't wipe it.
+    if (modelDef.provider === 'claude') this.isFirstClaude = true;
+    else this.isFirstCodex = true;
+
+    const mc = modelDef.provider === 'claude' ? a.cyan : a.yellow;
+    this.scrollWrite(mc(`\u2731 ${modelDef.label}`) + a.dim(` (${modelDef.desc})\n`));
     this.drawHeader();
     this.drawBottom();
   }
 
+  // ── Interactive session picker (/resume) ─────────────────────────────────
+  _enterPicker() {
+    const sessions = this._listSessions().filter(s => s.id !== this.sessionId);
+    if (sessions.length === 0) {
+      this.scrollWrite(a.dim('  No other sessions to resume.\n'));
+      return;
+    }
+    this._pickerActive = true;
+    this._pickerItems = sessions;
+    this._pickerIdx = 0;
+    this._pickerScroll = 0;
+    this._drawPicker();
+  }
+
+  _exitPicker(cancelled) {
+    this._pickerActive = false;
+    // Redraw to clear picker UI
+    this._redrawScrollView();
+    this.drawBottom();
+    if (cancelled) {
+      this.scrollWrite(a.dim('  Cancelled.\n'));
+    }
+  }
+
+  _pickerSelect() {
+    const session = this._pickerItems[this._pickerIdx];
+    this._pickerActive = false;
+    this._redrawScrollView();
+    // Actually resume
+    const resumed = this.resumeSession(session.id.replace('keen-', '').slice(-8));
+    if (!resumed) {
+      this.scrollWrite(a.red(`Failed to resume session.\n`));
+      this.drawBottom();
+      return;
+    }
+    const turns = Math.floor(resumed.history.length / 2);
+    this.scrollWrite(a.green(`\nResumed session (${turns} turns)\n\n`));
+    const recent = resumed.history.slice(-6);
+    for (const turn of recent) {
+      const prefix = turn.role === 'user' ? a.green('\u203A') : a.cyan('\u25C7');
+      const text = turn.content.slice(0, 120) + (turn.content.length > 120 ? '...' : '');
+      this.scrollWrite(`  ${prefix} ${a.dim(text)}\n`);
+    }
+    this.scrollWrite('\n');
+    this.drawHeader();
+    this.drawBottom();
+  }
+
+  _drawPicker() {
+    const viewHeight = this.scrollEnd - this.scrollStart;
+    const maxVisible = Math.max(viewHeight - 4, 3); // leave room for header/footer
+    const items = this._pickerItems;
+
+    // Adjust scroll so selected item is visible
+    if (this._pickerIdx < this._pickerScroll) {
+      this._pickerScroll = this._pickerIdx;
+    } else if (this._pickerIdx >= this._pickerScroll + maxVisible) {
+      this._pickerScroll = this._pickerIdx - maxVisible + 1;
+    }
+
+    this.w(a.hide);
+    // Clear scroll region
+    for (let i = this.scrollStart; i <= this.scrollEnd; i++) {
+      this.w(a.moveTo(i, 1) + a.clearLine);
+    }
+
+    let row = this.scrollStart;
+
+    // Title
+    this.w(a.moveTo(row, 1) + '  ' + a.magenta(a.bold('Resume a session')) + a.dim(`  (${items.length} saved)`));
+    row += 2;
+
+    // Session list
+    const end = Math.min(this._pickerScroll + maxVisible, items.length);
+    for (let i = this._pickerScroll; i < end; i++) {
+      if (row > this.scrollEnd - 2) break;
+      const s = items[i];
+      const d = new Date(s.updated);
+      const date = d.toLocaleDateString();
+      const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const turns = Math.floor((s.history?.length || 0) / 2);
+      const shortId = s.id.replace('keen-', '').slice(-8);
+      const preview = (s.preview || '(empty)').slice(0, Math.max(this.cols - 40, 20));
+
+      const selected = i === this._pickerIdx;
+      const pointer = selected ? a.cyan('\u203A ') : '  ';
+      const idStr = selected ? a.cyan(a.bold(shortId)) : a.dim(shortId);
+      const meta = a.dim(`${date} ${time}  ${turns}t`);
+      const prevStr = selected ? preview : a.dim(preview);
+
+      this.w(a.moveTo(row, 1) + `  ${pointer}${idStr}  ${meta}  ${prevStr}`);
+      row++;
+    }
+
+    // Scroll indicators
+    if (this._pickerScroll > 0) {
+      this.w(a.moveTo(this.scrollStart + 2, this.cols - 3) + a.dim('\u2191'));
+    }
+    if (end < items.length) {
+      this.w(a.moveTo(row, this.cols - 3) + a.dim('\u2193'));
+    }
+
+    // Footer hints
+    const footerRow = Math.min(row + 1, this.scrollEnd);
+    this.w(a.moveTo(footerRow, 1) + '  ' + a.dim('\u2191\u2193 navigate \u00b7 Enter select \u00b7 Esc cancel'));
+
+    this.w(a.show);
+    // Hide main input prompt — park cursor off the input area
+    this.w(a.moveTo(this.rows - 2, 1) + a.clearLine + a.dim('  selecting session...'));
+    this.w(a.moveTo(this.rows, 1) + a.clearLine + a.dim('  \u2191\u2193 navigate \u00b7 Enter select \u00b7 Esc cancel'));
+  }
+
+  _onPickerKey(data) {
+    const key = data.toString();
+    const hex = data.toString('hex');
+
+    // Escape
+    if (key === '\x1b' && hex === '1b') {
+      this._exitPicker(true);
+      return true;
+    }
+    // Ctrl+C
+    if (key === '\x03') {
+      this._exitPicker(true);
+      return true;
+    }
+    // Enter
+    if (key === '\r' || key === '\n') {
+      this._pickerSelect();
+      return true;
+    }
+    // Up arrow
+    if (hex === '1b5b41') {
+      if (this._pickerIdx > 0) {
+        this._pickerIdx--;
+        this._drawPicker();
+      }
+      return true;
+    }
+    // Down arrow
+    if (hex === '1b5b42') {
+      if (this._pickerIdx < this._pickerItems.length - 1) {
+        this._pickerIdx++;
+        this._drawPicker();
+      }
+      return true;
+    }
+    // Page Up (jump 5)
+    if (hex === '1b5b357e') {
+      this._pickerIdx = Math.max(0, this._pickerIdx - 5);
+      this._drawPicker();
+      return true;
+    }
+    // Page Down (jump 5)
+    if (hex === '1b5b367e') {
+      this._pickerIdx = Math.min(this._pickerItems.length - 1, this._pickerIdx + 5);
+      this._drawPicker();
+      return true;
+    }
+    // Consume all other keys (don't leak to main handler)
+    return true;
+  }
+
   // Write text into the scroll region (auto-saves cursor position)
   scrollWrite(text) {
-    // Buffer for replay on resize
+    // Buffer for replay on resize + scrollback
     this._scrollBuffer.push(text);
-    if (this._scrollBuffer.length > 500) this._scrollBuffer = this._scrollBuffer.slice(-250);
+    if (this._scrollBuffer.length > 1000) this._scrollBuffer = this._scrollBuffer.slice(-500);
+
+    if (this._scrollOffset > 0) {
+      // Was scrolled up — snap to bottom with full redraw (text already in buffer)
+      this._scrollOffset = 0;
+      this._redrawScrollView();
+      return;
+    }
 
     this.w(a.hide + a.restore);
     this.w(text);
     this.w(a.save + a.show);
+  }
+
+  // ── Scrollback (Page Up / Page Down) ──────────────────────────────────
+  _getAllDisplayLines() {
+    return this._scrollBuffer.join('').split('\n');
+  }
+
+  _scrollUp(lines) {
+    const allLines = this._getAllDisplayLines();
+    const viewHeight = this.scrollEnd - this.scrollStart;
+    const step = lines || Math.floor(viewHeight / 2);
+    const maxOffset = Math.max(0, allLines.length - viewHeight);
+    this._scrollOffset = Math.min(this._scrollOffset + step, maxOffset);
+    this._redrawScrollView();
+  }
+
+  _scrollDown(lines) {
+    const viewHeight = this.scrollEnd - this.scrollStart;
+    const step = lines || Math.floor(viewHeight / 2);
+    this._scrollOffset = Math.max(0, this._scrollOffset - step);
+    this._redrawScrollView();
+  }
+
+  _redrawScrollView() {
+    const allLines = this._getAllDisplayLines();
+    const viewHeight = this.scrollEnd - this.scrollStart;
+    const endIdx = allLines.length - this._scrollOffset;
+    const startIdx = Math.max(0, endIdx - viewHeight);
+    const visible = allLines.slice(startIdx, endIdx);
+
+    this.w(a.hide);
+    // Clear scroll region
+    for (let i = this.scrollStart; i <= this.scrollEnd; i++) {
+      this.w(a.moveTo(i, 1) + a.clearLine);
+    }
+    // Draw visible lines
+    for (let i = 0; i < visible.length; i++) {
+      this.w(a.moveTo(this.scrollStart + i, 1) + visible[i]);
+    }
+    // Scroll indicator when not at bottom
+    if (this._scrollOffset > 0) {
+      this.w(a.moveTo(this.scrollEnd, this.cols - 12) + a.dim(`\u2191 scroll \u2193`));
+    }
+    this.w(a.save + a.show);
+    this.drawBottom();
   }
 
   // ── Pipeline tag detection ───────────────────────────────────────────
@@ -584,9 +1117,23 @@ class KeenCLI {
     const REJECT = ['TASK_DESCRIPTION', 'your task description here', '...'];
     if (!prompt || prompt.length < 5 || REJECT.includes(prompt)) return null;
 
+    // Parse angles and subtasks (single-quoted JSON to avoid conflicts with double-quote attrs)
+    let angles = null;
+    let subtasks = null;
+    const anglesMatch = attrs.match(/angles='([^']*)'/);
+    const subtasksMatch = attrs.match(/subtasks='([^']*)'/);
+    if (anglesMatch) {
+      try { angles = JSON.parse(anglesMatch[1]); } catch {}
+    }
+    if (subtasksMatch) {
+      try { subtasks = JSON.parse(subtasksMatch[1]); } catch {}
+    }
+
     return {
       prompt,
-      profile: profileMatch ? profileMatch[1] : ''
+      profile: profileMatch ? profileMatch[1] : '',
+      angles,
+      subtasks
     };
   }
 
@@ -624,14 +1171,20 @@ class KeenCLI {
     const procRef = {};
     this._primaryProcRef = procRef;
 
+    // Use fast model for spawns: Sonnet for Claude, low reasoning for Codex
+    const spawnModelDef = cli === 'claude'
+      ? MODELS['sonnet']
+      : MODELS['codex-low'];
+
     try {
       const result = await runTurn(prompt, {
         workdir: this.workdir,
         isFirst: true,
-        systemPrompt: `You are ${cli}. Answer the following request directly and concisely.`,
+        systemPrompt: `You are ${cli}. Answer the following request directly and concisely. You have full access to the filesystem and can create, edit, and delete files.`,
         model: cli,
         conversationHistory: [],
         procRef,
+        modelDef: spawnModelDef,
         onData: (chunk) => {
           this._clearSpinnerLine();
           spawnOutput += chunk;
@@ -656,10 +1209,12 @@ class KeenCLI {
   }
 
   // ── Pipeline dispatch ──────────────────────────────────────────────────
-  async runPipelineFromTag(prompt, profile) {
+  async runPipelineFromTag(prompt, profile, angles, subtasks) {
     const scriptPath = resolve(__dirname, 'pipeline.js');
     const args = [scriptPath, '--prompt', prompt, '--workdir', this.workdir];
     if (profile) args.push('--profile', profile);
+    if (angles) args.push('--angles', JSON.stringify(angles));
+    if (subtasks) args.push('--subtasks', JSON.stringify(subtasks));
 
     this.pipelineRunning = true;
     this._pipelineProfile = profile || 'auto';
@@ -744,6 +1299,7 @@ class KeenCLI {
   }
 
   _drawSpinnerInScroll() {
+    if (this._scrollOffset > 0) return;  // don't overwrite when user is scrolled up
     const frame = SPINNER[this._spinnerFrame % SPINNER.length];
     const elapsed = Math.floor((Date.now() - this._turnStartTime) / 1000);
     const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
@@ -806,21 +1362,107 @@ class KeenCLI {
     // User prompt echo
     this.scrollWrite(`\n${a.green(a.bold('\u203A'))} ${a.bold(text)}\n\n`);
 
+    // ── Direct spawn detection: "ask codex to X", "make claude do X", etc. ──
+    const lowerText = text.toLowerCase();
+    const spawnPatterns = [
+      // "ask codex to say hi", "make codex say hi"
+      { rx: /(?:ask|tell|make|have|call|use)\s+codex\s+(?:to\s+)?(.+)/i, cli: 'codex' },
+      { rx: /(?:ask|tell|make|have|call|use)\s+claude\s+(?:to\s+)?(.+)/i, cli: 'claude' },
+      // "codex, say hi" / "codex: say hi"
+      { rx: /codex[,:]\s*(.+)/i, cli: 'codex' },
+      { rx: /claude[,:]\s*(.+)/i, cli: 'claude' },
+      // "make say hi codex" / "say hi with codex" (codex/claude at end)
+      { rx: /(.+?)\s+(?:with|using|via|in|on)\s+codex\s*$/i, cli: 'codex' },
+      { rx: /(.+?)\s+(?:with|using|via|in|on)\s+claude\s*$/i, cli: 'claude' },
+      { rx: /(?:make|let)\s+(.+?)\s+codex\s*$/i, cli: 'codex' },
+      { rx: /(?:make|let)\s+(.+?)\s+claude\s*$/i, cli: 'claude' },
+    ];
+    for (const { rx, cli } of spawnPatterns) {
+      const m = text.match(rx);
+      if (m && m[1]) {
+        const prompt = m[1].trim();
+        // Don't spawn yourself — only spawn the OTHER model
+        if (cli === this.primaryModel) break;
+        this.conversationHistory.push({ role: 'user', content: text });
+        const spawnResult = await this.runSpawnFromTag(cli, prompt);
+        const modelName = cli === 'claude' ? 'Claude' : 'Codex';
+        this.conversationHistory.push({
+          role: 'assistant',
+          content: `[${modelName} said: ${(spawnResult || '(no output)').slice(0, 500)}]`
+        });
+        if (this.conversationHistory.length > 20) {
+          this.conversationHistory = this.conversationHistory.slice(-20);
+        }
+        this._stopSpinner();
+        this._saveSession();
+        this.busy = false;
+        this.drawBottom();
+        return;
+      }
+    }
+
+    // ── Two-tier prompt: escalate to full orchestrator for pipeline-worthy tasks ──
+    const pipelineSignals = [
+      'run the pipeline', 'launch the pipeline', 'full pipeline', 'start pipeline',
+      'pipeline', 'dual plan', 'use claude and codex', 'multi-agent',
+      'complex profile', 'standard profile', 'simple profile',
+      'build an app', 'build a feature', 'build a module', 'build a website',
+      'implement this', 'implement the'
+    ];
+    const needsFullPrompt = pipelineSignals.some(s => lowerText.includes(s));
+
+    if (needsFullPrompt && !this._isEscalated) {
+      this._isEscalated = true;
+      this.systemPrompt = this.systemPromptFull;
+      this.isFirstClaude = true;
+      this.isFirstCodex = true;
+      this.scrollWrite(a.dim('  [escalated to full orchestrator]\n'));
+    }
+
     // Run primary model — buffer output, display only if no dispatch tags
     const isFirst = this.primaryModel === 'claude' ? this.isFirstClaude : this.isFirstCodex;
+
+    // When resuming a session, give Claude context of the previous conversation
+    let modelInput = text;
+    if (isFirst && this.conversationHistory.length > 0) {
+      // Inject conversation history so the model has full context
+      // (happens on first turn, after model switch, or session resume)
+      const ctx = this.conversationHistory.slice(-14).map(t =>
+        `[${t.role}]: ${t.content.slice(0, 500)}`
+      ).join('\n\n');
+      modelInput = `[Conversation history for context]\n${ctx}\n\n[Current message]\n${text}`;
+    }
+
     try {
-      const result = await runTurn(text, {
+      const onDataBuffer = (chunk) => {
+        this.primaryOutput += chunk;
+        // Buffer everything — display decision happens after model finishes.
+        // Spinner keeps running to show activity.
+      };
+
+      // Lite mode + Claude uses Sonnet for fast responses (~2s vs ~8s Opus)
+      // Pass active model config to the turn runner
+      const modelDef = MODELS[this.activeModelKey];
+
+      const result = await runTurn(modelInput, {
         workdir: this.workdir,
         isFirst,
         systemPrompt: this.systemPrompt,
         model: this.primaryModel,
         conversationHistory: this.conversationHistory,
         procRef: this._primaryProcRef,
-        onData: (chunk) => {
-          this.primaryOutput += chunk;
-          // Buffer everything — display decision happens after model finishes.
-          // Spinner keeps running to show activity.
-        }
+        onData: onDataBuffer,
+        modelDef,
+        onVerbose: this._verbose ? (type, name, preview) => {
+          this._clearSpinnerLine();
+          if (type === 'tool_use') {
+            this.scrollWrite(a.dim(`  \u25B6 ${a.magenta(name)} `) + a.dim(preview) + '\n');
+          } else if (type === 'tool_result') {
+            const short = preview.split('\n')[0].slice(0, 100);
+            this.scrollWrite(a.dim(`    \u2514 ${short}`) + '\n');
+          }
+          this.drawBottom();
+        } : null
       });
 
       // Update isFirst for the primary model
@@ -872,7 +1514,7 @@ class KeenCLI {
       // ── Pipeline tag interception (full multi-stage) ──────────────
       if (pipelineTag) {
         this._clearSpinnerLine();
-        const pipelineResult = await this.runPipelineFromTag(pipelineTag.prompt, pipelineTag.profile);
+        const pipelineResult = await this.runPipelineFromTag(pipelineTag.prompt, pipelineTag.profile, pipelineTag.angles, pipelineTag.subtasks);
 
         // Feed result back to dispatcher for summarization
         const summaryPrompt = pipelineResult.success
@@ -913,6 +1555,7 @@ class KeenCLI {
 
     this._stopSpinner();
     this._primaryProcRef = {};
+    this._saveSession();
     this.busy = false;
     this.drawBottom();
   }
@@ -940,6 +1583,12 @@ class KeenCLI {
 
   // ── Keyboard ───────────────────────────────────────────────────────────
   onKey(data) {
+    // Session picker intercepts all keys when active
+    if (this._pickerActive) {
+      this._onPickerKey(data);
+      return;
+    }
+
     const key = data.toString();
 
     // Ctrl+C: cancel turn if busy, exit if idle
@@ -954,8 +1603,22 @@ class KeenCLI {
       process.exit(0);
     }
 
-    // Ctrl+T — reserved for future use
-    if (key === '\x14') return;
+    // Ctrl+T — toggle verbose mode (show tool use + thinking)
+    if (key === '\x14') {
+      this._verbose = !this._verbose;
+      this.scrollWrite(a.dim(`  [verbose: ${this._verbose ? 'on' : 'off'}]\n`));
+      this.drawBottom();
+      return;
+    }
+
+    // Mouse wheel scroll (SGR mode) — works even while model is generating
+    const sgrMouseMatch = key.match(/\x1b\[<(\d+);\d+;\d+[Mm]/);
+    if (sgrMouseMatch) {
+      const button = parseInt(sgrMouseMatch[1]);
+      if (button === 64) this._scrollUp(3);   // wheel up
+      if (button === 65) this._scrollDown(3);  // wheel down
+      return;
+    }
 
     if (this.busy) return;
 
@@ -1087,6 +1750,14 @@ class KeenCLI {
         }
         return;
       }
+      // Page Up — scroll back through history
+      if (hex === '1b5b357e') { this._scrollUp(); return; }
+      // Page Down — scroll forward
+      if (hex === '1b5b367e') { this._scrollDown(); return; }
+      // Shift+Up — scroll up one line
+      if (hex === '1b5b313b3241') { this._scrollUp(3); return; }
+      // Shift+Down — scroll down one line
+      if (hex === '1b5b313b3242') { this._scrollDown(3); return; }
       return; // silently ignore unknown escape sequences
     }
 
@@ -1127,15 +1798,34 @@ export async function exec(dictionary) {
 // ── Direct invocation ────────────────────────────────────────────────────────
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const args = parseArgs(process.argv.slice(2));
-  let systemPrompt;
+  let systemPrompt, systemPromptLite;
   try {
     systemPrompt = readFileSync(SYSTEM_PROMPT_PATH, 'utf8');
   } catch (err) {
     console.error(`[keen] Cannot read orchestrator prompt: ${err.message}`);
     process.exit(1);
   }
+  try {
+    systemPromptLite = readFileSync(SYSTEM_PROMPT_LITE_PATH, 'utf8');
+  } catch {
+    systemPromptLite = systemPrompt; // fallback to full if lite doesn't exist
+  }
 
-  const cli = new KeenCLI({ workdir: args.workdir, systemPrompt });
+  const cli = new KeenCLI({ workdir: args.workdir, systemPrompt, systemPromptLite });
+
+  // Resume a previous session if --resume was passed
+  if (args.resumeId && args.resumeId !== '__picker__') {
+    const session = cli.resumeSession(args.resumeId);
+    if (session) {
+      const turns = Math.floor(session.history.length / 2);
+      console.log(`[keen] Resumed session (${turns} turns): ${session.preview || '(no preview)'}`);
+    } else {
+      console.error(`[keen] No session matching "${args.resumeId}"`);
+      process.exit(1);
+    }
+  }
+  // --resume with no id: open interactive picker after TUI is set up
+  const _openPickerOnStart = args.resumeId === '__picker__';
 
   const shutdown = () => { cli.cleanup(); process.exit(0); };
   process.on('exit', () => cli.cleanup());
@@ -1151,4 +1841,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   });
 
   cli.setup();
+
+  // Open picker immediately if --resume was passed with no id
+  if (_openPickerOnStart) {
+    cli._enterPicker();
+  }
 }

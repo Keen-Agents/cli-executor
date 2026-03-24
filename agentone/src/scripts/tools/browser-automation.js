@@ -1,12 +1,17 @@
-const BRIDGE_URL = process.env.AGENTONE_BRIDGE_URL || process.env.BRIDGE_URL || 'http://localhost:3222';
-const API_TOKEN = process.env.AGENTONE_API_TOKEN || process.env.BRIDGE_API_TOKEN || '';
+function resolveBridge(dict) {
+    return {
+        url: dict.bridgeUrl || 'http://localhost:3222',
+        token: dict.apiToken || ''
+    };
+}
 
-async function bridgeCall(endpoint, body) {
-  const response = await fetch(`${BRIDGE_URL}${endpoint}`, {
+async function bridgeCall(endpoint, body, config) {
+  const response = await fetch(`${config.url}${endpoint}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-token': API_TOKEN
+      'x-api-token': config.token,
+      'Authorization': `Bearer ${config.token}`
     },
     body: JSON.stringify(body)
   });
@@ -23,6 +28,7 @@ async function bridgeCall(endpoint, body) {
 }
 
 export async function exec(dictionary) {
+  const bridge = resolveBridge(dictionary);
   const mode = dictionary.mode || 'launch';
   const sessionId = dictionary.sessionId;
   const log = typeof dictionary.writeThinking === 'function'
@@ -30,13 +36,37 @@ export async function exec(dictionary) {
     : (msg) => console.log(`[browser-automation] ${msg}`);
 
   try {
-    if (mode === 'launch') {
+    if (mode === 'health-check') {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        const response = await fetch(`${bridge.url}/api/health`, {
+          method: 'GET',
+          headers: { 'x-api-token': bridge.token },
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+        dictionary.response = JSON.stringify({
+          status: response.ok ? 'connected' : 'error',
+          bridge: bridge.url
+        });
+      } catch (err) {
+        dictionary.response = JSON.stringify({
+          status: 'disconnected',
+          bridge: bridge.url,
+          message: 'Browser automation unavailable — no bridge connection.'
+        });
+      }
+      return;
+    }
+
+    else if (mode === 'launch') {
       const result = await bridgeCall('/api/browser/launch', {
         headless: dictionary.headless !== false,
         viewport: dictionary.viewport || { width: 1280, height: 720 },
         timeout: dictionary.timeout || 30000,
         label: dictionary.label || 'agent-browser'
-      });
+      }, bridge);
       dictionary.response = JSON.stringify(result);
       dictionary.browserSessionId = result.sessionId;
       log(`Browser launched: ${result.sessionId}`);
@@ -50,7 +80,7 @@ export async function exec(dictionary) {
         url: dictionary.url,
         waitUntil: dictionary.waitUntil || 'load',
         timeout: dictionary.timeout || 30000
-      });
+      }, bridge);
       dictionary.response = JSON.stringify(result);
       log(`Navigated to ${dictionary.url}`);
     }
@@ -62,7 +92,7 @@ export async function exec(dictionary) {
         sessionId,
         selector: dictionary.selector,
         timeout: dictionary.timeout || 5000
-      });
+      }, bridge);
       dictionary.response = JSON.stringify(result);
       log(`Clicked: ${dictionary.selector}`);
     }
@@ -77,7 +107,7 @@ export async function exec(dictionary) {
         delay: dictionary.delay || 50,
         clearFirst: dictionary.clearFirst || false,
         timeout: dictionary.timeout || 5000
-      });
+      }, bridge);
       dictionary.response = JSON.stringify(result);
       log(`Typed into ${dictionary.selector}`);
     }
@@ -89,7 +119,7 @@ export async function exec(dictionary) {
         fullPage: dictionary.fullPage || false,
         selector: dictionary.selector || null,
         format: dictionary.format || 'png'
-      });
+      }, bridge);
       dictionary.response = JSON.stringify({
         sessionId: result.sessionId,
         format: result.format,
@@ -108,7 +138,7 @@ export async function exec(dictionary) {
         selector: dictionary.selector || null,
         mode: dictionary.contentMode || 'text',
         maxLength: dictionary.maxLength || 100000
-      });
+      }, bridge);
       dictionary.response = result.content;
       log(`Content retrieved: ${result.length} chars`);
     }
@@ -119,14 +149,14 @@ export async function exec(dictionary) {
       const result = await bridgeCall('/api/browser/evaluate', {
         sessionId,
         expression: dictionary.expression
-      });
+      }, bridge);
       dictionary.response = JSON.stringify(result.result);
       log('Evaluated JS expression');
     }
 
     else if (mode === 'close') {
       if (!sessionId) throw new Error("Missing 'sessionId'");
-      const result = await bridgeCall('/api/browser/close', { sessionId });
+      const result = await bridgeCall('/api/browser/close', { sessionId }, bridge);
       dictionary.response = JSON.stringify(result);
       log(`Browser session closed: ${sessionId}`);
     }
@@ -135,8 +165,19 @@ export async function exec(dictionary) {
       throw new Error(`Unknown mode: ${mode}. Use: launch, navigate, click, type, screenshot, content, evaluate, close`);
     }
   } catch (error) {
-    const msg = `Browser Automation Error: ${error.message}`;
-    log(msg);
-    dictionary.response = msg;
+    const msg = error.message || '';
+    const isConnectionError = msg.includes('ECONNREFUSED') || msg.includes('fetch failed')
+        || msg.includes('ETIMEDOUT') || msg.includes('ENOTFOUND');
+    if (isConnectionError) {
+      dictionary.response = JSON.stringify({
+        error: 'BRIDGE_DISCONNECTED',
+        message: `Bridge connection lost: ${msg}`,
+        suggestion: 'Browser automation unavailable. Switch to cloud-only mode.'
+      });
+    } else {
+      const errMsg = `Browser Automation Error: ${msg}`;
+      log(errMsg);
+      dictionary.response = errMsg;
+    }
   }
 }
